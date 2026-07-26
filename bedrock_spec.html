@@ -1,0 +1,1507 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bedrock Obfuscator — Đặc tả kỹ thuật đầy đủ</title>
+<style>
+:root{
+  --bg:#0d1117; --bg2:#161b22; --bg3:#21262d; --border:#30363d;
+  --text:#e6edf3; --text2:#8b949e; --accent:#58a6ff; --accent2:#3fb950;
+  --warn:#d29922; --danger:#f85149; --purple:#bc8cff; --cyan:#39d0d8;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;font-size:15px}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+code{font-family:'Consolas','SF Mono','Fira Code',monospace;background:var(--bg3);padding:2px 6px;border-radius:4px;font-size:13px;color:var(--cyan)}
+pre{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:16px;overflow-x:auto;margin:12px 0}
+pre code{background:none;padding:0;color:var(--text);font-size:13px}
+
+/* layout */
+.layout{display:flex;min-height:100vh}
+.sidebar{width:280px;background:var(--bg2);border-right:1px solid var(--border);position:fixed;height:100vh;overflow-y:auto;padding:20px 0;z-index:100}
+.sidebar h2{font-size:18px;padding:0 20px 16px;border-bottom:1px solid var(--border);margin-bottom:12px}
+.sidebar nav a{display:block;padding:7px 20px;color:var(--text2);font-size:13px;border-left:3px solid transparent;transition:all .15s}
+.sidebar nav a:hover{background:var(--bg3);color:var(--text);text-decoration:none;border-left-color:var(--accent)}
+.sidebar nav a.lvl2{padding-left:36px;font-size:12px}
+.sidebar nav a.section-active{color:var(--accent);border-left-color:var(--accent);background:var(--bg3)}
+.main{margin-left:280px;flex:1;padding:40px 60px;max-width:1100px}
+section{margin-bottom:48px;scroll-margin-top:20px}
+h1{font-size:32px;margin-bottom:8px;background:linear-gradient(135deg,var(--accent),var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+h2{font-size:24px;margin:32px 0 16px;padding-bottom:8px;border-bottom:2px solid var(--border);color:var(--accent)}
+h3{font-size:19px;margin:24px 0 12px;color:var(--purple)}
+h4{font-size:16px;margin:16px 0 8px;color:var(--warn)}
+p{margin:8px 0}
+
+/* tables */
+table{width:100%;border-collapse:collapse;margin:16px 0;font-size:13px}
+th{background:var(--bg3);text-align:left;padding:10px 12px;border-bottom:2px solid var(--border);font-weight:600;color:var(--accent);position:sticky;top:0}
+td{padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+tr:hover td{background:var(--bg2)}
+table.compact td,table.compact th{padding:6px 8px;font-size:12px}
+.tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
+.tag-on{background:#1a3a2a;color:var(--accent2)}
+.tag-off{background:#3a1a1a;color:var(--danger)}
+.tag-auto{background:#2a2a1a;color:var(--warn)}
+.tag-info{background:#1a2a3a;color:var(--accent)}
+
+/* badges */
+.badge{display:inline-block;padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;margin:2px}
+.p1{background:#1b3a5e;color:#58a6ff}.p2{background:#1b4a3a;color:#3fb950}
+.p3{background:#4a3a1b;color:#d29922}.p4{background:#4a1b3a;color:#f85149}
+.p5{background:#3a1b4a;color:#bc8cff}
+
+/* cards */
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin:16px 0}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:18px}
+.card h4{margin-top:0}
+.card .num{font-size:28px;font-weight:700;color:var(--accent)}
+.card .lbl{font-size:12px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px}
+
+/* callouts */
+.callout{border-left:4px solid;border-radius:0 8px 8px 0;padding:12px 18px;margin:16px 0}
+.callout-warn{border-color:var(--warn);background:rgba(210,153,34,.08)}
+.callout-danger{border-color:var(--danger);background:rgba(248,81,73,.08)}
+.callout-info{border-color:var(--accent);background:rgba(88,166,255,.08)}
+.callout-ok{border-color:var(--accent2);background:rgba(63,185,80,.08)}
+
+/* details */
+details{background:var(--bg2);border:1px solid var(--border);border-radius:8px;margin:12px 0;padding:0}
+summary{padding:12px 18px;cursor:pointer;font-weight:600;color:var(--accent);user-select:none}
+summary:hover{background:var(--bg3);border-radius:8px}
+details[open] summary{border-bottom:1px solid var(--border)}
+details .content{padding:16px 18px}
+
+/* hero */
+.hero{background:linear-gradient(135deg,#161b22,#0d1117);border:1px solid var(--border);border-radius:16px;padding:36px;margin-bottom:40px}
+.hero p{font-size:16px;color:var(--text2);max-width:700px}
+.stats{display:flex;gap:32px;margin-top:24px;flex-wrap:wrap}
+.stat .v{font-size:36px;font-weight:700;color:var(--accent)}
+.stat .l{font-size:12px;color:var(--text2);text-transform:uppercase}
+
+/* misc */
+.kbd{font-family:monospace;background:var(--bg3);border:1px solid var(--border);border-bottom-width:2px;border-radius:4px;padding:2px 6px;font-size:12px}
+hr{border:none;border-top:1px solid var(--border);margin:24px 0}
+.toc-num{color:var(--text2);font-size:12px;margin-right:8px}
+.mono{font-family:monospace}
+.fmt{color:var(--text2)}
+
+/* === VISUAL ENHANCEMENTS === */
+
+/* Hero v2 — animated gradient + glow */
+.hero-v2{position:relative;background:linear-gradient(135deg,#161b22 0%,#0d1117 50%,#161b22 100%);border:1px solid var(--border);border-radius:16px;padding:40px;margin-bottom:40px;overflow:hidden}
+.hero-v2::before{content:'';position:absolute;top:-50%;left:-50%;width:200%;height:200%;background:radial-gradient(ellipse at 30% 40%,rgba(88,166,255,.08) 0%,transparent 50%),radial-gradient(ellipse at 70% 60%,rgba(188,140,255,.06) 0%,transparent 50%);animation:heroGlow 8s ease-in-out infinite alternate;z-index:0}
+@keyframes heroGlow{0%{transform:translate(0,0) scale(1);opacity:.6}100%{transform:translate(20px,-10px) scale(1.05);opacity:1}}
+.hero-v2>*{position:relative;z-index:1}
+.hero-v2 .shield{font-size:64px;filter:drop-shadow(0 0 20px rgba(88,166,255,.4));animation:shieldPulse 3s ease-in-out infinite}
+@keyframes shieldPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}
+.hero-v2 .title{font-size:36px;font-weight:800;margin:8px 0 4px;background:linear-gradient(135deg,var(--accent),var(--purple),var(--cyan));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-size:200% auto;animation:titleShift 6s linear infinite}
+@keyframes titleShift{0%{background-position:0% center}100%{background-position:200% center}}
+.hero-v2 .subtitle{font-size:15px;color:var(--text2);max-width:720px}
+.stats-v2{display:flex;gap:28px;margin-top:28px;flex-wrap:wrap}
+.stat-v2{text-align:center}
+.stat-v2 .v{font-size:40px;font-weight:800;font-variant-numeric:tabular-nums;background:linear-gradient(180deg,var(--accent),var(--purple));-webkit-background-clip:text;-webkit-text-fill-color:transparent;line-height:1}
+.stat-v2 .l{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+
+/* Flow diagram — horizontal connected boxes */
+.flow-diagram{display:flex;flex-wrap:wrap;align-items:center;gap:0;margin:20px 0;padding:20px;background:var(--bg2);border:1px solid var(--border);border-radius:12px}
+.flow-box{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px 16px;font-size:13px;white-space:nowrap;transition:transform .2s,box-shadow .2s;cursor:default}
+.flow-box:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(88,166,255,.2)}
+.flow-box.p1{border-color:#58a6ff;background:rgba(88,166,255,.08)}
+.flow-box.p2{border-color:#3fb950;background:rgba(63,185,80,.08)}
+.flow-box.p3{border-color:#d29922;background:rgba(210,153,34,.08)}
+.flow-box.p4{border-color:#f85149;background:rgba(248,81,73,.08)}
+.flow-box.p5{border-color:#bc8cff;background:rgba(188,140,255,.08)}
+.flow-box.base{border-color:#39d0d8;background:rgba(57,208,216,.08)}
+.flow-arrow{color:var(--text2);font-size:18px;margin:0 4px;flex-shrink:0}
+.flow-output{border:2px dashed var(--accent2);background:rgba(63,185,80,.05)}
+.flow-sidecar{font-size:11px;color:var(--text2);border-style:dashed;opacity:.8}
+
+/* Phase timeline — horizontal progress bar */
+.phase-timeline{display:flex;align-items:stretch;margin:20px 0;gap:2px;height:56px;border-radius:8px;overflow:hidden}
+.phase-node{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#fff;font-size:12px;font-weight:600;transition:flex .3s;cursor:pointer;position:relative;overflow:hidden}
+.phase-node:hover{flex:1.3}
+.phase-node .pn-badge{font-size:18px;font-weight:800}
+.phase-node .pn-name{font-size:10px;opacity:.85;margin-top:2px}
+.phase-node.p1{background:linear-gradient(135deg,#1b3a5e,#58a6ff)}
+.phase-node.p2{background:linear-gradient(135deg,#1b4a3a,#3fb950)}
+.phase-node.p3{background:linear-gradient(135deg,#4a3a1b,#d29922)}
+.phase-node.p4{background:linear-gradient(135deg,#4a1b3a,#f85149)}
+.phase-node.p5{background:linear-gradient(135deg,#3a1b4a,#bc8cff)}
+.phase-node::after{content:'';position:absolute;top:0;left:0;width:100%;height:100%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.15),transparent);transform:translateX(-100%);transition:transform .5s}
+.phase-node:hover::after{transform:translateX(100%)}
+
+/* Before/After showcase — tabbed side-by-side */
+.showcase-tabs{display:flex;gap:0;margin:16px 0 0;border-bottom:2px solid var(--border)}
+.showcase-tab{padding:10px 20px;cursor:pointer;font-size:13px;font-weight:600;color:var(--text2);border-bottom:3px solid transparent;transition:all .2s;background:none;border-top:none;border-left:none;border-right:none}
+.showcase-tab:hover{color:var(--text);background:var(--bg2)}
+.showcase-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
+.showcase-panel{display:none;padding:0}
+.showcase-panel.active{display:block;animation:fadeIn .3s}
+.ba-container{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0}
+.ba-panel{border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.ba-panel .ba-header{padding:8px 14px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border)}
+.ba-panel.input .ba-header{background:rgba(63,185,80,.1);color:var(--accent2)}
+.ba-panel.output .ba-header{background:rgba(248,81,73,.1);color:var(--danger)}
+.ba-panel pre{margin:0;border:none;border-radius:0;font-size:12px;max-height:340px}
+.ba-annotation{padding:10px 14px;background:var(--bg2);font-size:12px;color:var(--text2);border-top:1px solid var(--border)}
+
+/* Threat flow diagram — vertical chain */
+.threat-flow{margin:16px 0;padding:20px;background:var(--bg2);border:1px solid var(--border);border-radius:12px}
+.threat-node{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px 16px;margin:0 auto;max-width:500px;font-size:13px;position:relative;transition:all .2s}
+.threat-node:hover{border-color:var(--danger);box-shadow:0 0 12px rgba(248,81,73,.2)}
+.threat-node.cascade{border-color:var(--warn)}
+.threat-node.cascade:hover{box-shadow:0 0 12px rgba(210,153,34,.2)}
+.threat-node.final{border-color:var(--danger);background:rgba(248,81,73,.05)}
+.threat-arrow{text-align:center;color:var(--danger);font-size:20px;margin:4px 0;animation:threatPulse 2s ease-in-out infinite}
+@keyframes threatPulse{0%,100%{opacity:.5}50%{opacity:1}}
+.threat-label{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;margin-left:8px}
+.threat-label.tamper{background:rgba(248,81,73,.15);color:var(--danger)}
+.threat-label.corrupt{background:rgba(210,153,34,.15);color:var(--warn)}
+
+/* Crypto diagram — OFB cipher flow */
+.crypto-diagram{display:flex;flex-direction:column;gap:0;margin:16px 0;padding:24px;background:var(--bg2);border:1px solid var(--border);border-radius:12px;align-items:center}
+.crypto-row{display:flex;align-items:center;gap:12px;margin:2px 0}
+.crypto-box{padding:8px 16px;border:1px solid var(--border);border-radius:6px;font-size:12px;font-family:monospace;background:var(--bg3)}
+.crypto-box.key{border-color:var(--warn);color:var(--warn)}
+.crypto-box.state{border-color:var(--purple);color:var(--purple)}
+.crypto-box.xor{border-color:var(--danger);color:var(--danger);font-weight:700}
+.crypto-box.ct{border-color:var(--accent2);color:var(--accent2);font-family:monospace}
+.crypto-arrow{color:var(--text2);font-size:14px}
+.key-compare{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:16px 0}
+.key-compare .kc-panel{padding:16px;border:1px solid var(--border);border-radius:8px;background:var(--bg2)}
+.kc-panel.const-pool{border-left:4px solid var(--accent)}
+.kc-panel.names-blob{border-left:4px solid var(--purple)}
+.kc-panel h4{margin:0 0 8px}
+
+/* Integrity hash cross-reference diagram */
+.hash-diagram{margin:16px 0;padding:24px;background:var(--bg2);border:1px solid var(--border);border-radius:12px;text-align:center}
+.hash-circle{display:inline-flex;flex-direction:column;gap:8px}
+.hash-node{padding:8px 16px;border:1px solid var(--border);border-radius:6px;font-family:monospace;font-size:12px;background:var(--bg3);display:inline-block}
+.hash-node.file-hash{border-color:var(--accent);color:var(--accent)}
+.hash-node.int-hash{border-color:var(--purple);color:var(--purple)}
+.hash-node.ext-hash{border-color:var(--accent2);color:var(--accent2)}
+.hash-mask{display:inline-block;padding:4px 12px;border-radius:4px;font-size:11px;background:var(--bg3);color:var(--text2);margin:0 4px}
+.hash-arrow{color:var(--text2);font-size:14px;display:inline-block;margin:0 8px}
+
+/* .pyd integrity check flow */
+.pyd-flow{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin:16px 0;justify-content:center}
+.pyd-step{padding:8px 14px;border:1px solid var(--border);border-radius:6px;font-size:12px;background:var(--bg3)}
+.pyd-step.sentinel{border-color:var(--warn);color:var(--warn)}
+.pyd-step.patch{border-color:var(--accent);color:var(--accent)}
+.pyd-step.verify{border-color:var(--purple);color:var(--purple)}
+.pyd-step.pass{border-color:var(--accent2);color:var(--accent2)}
+.pyd-step.fail{border-color:var(--danger);color:var(--danger)}
+.pyd-step.poison{border-color:var(--danger);background:rgba(248,81,73,.1);color:var(--danger)}
+
+/* Performance bar chart */
+.perf-chart{margin:20px 0;padding:24px;background:var(--bg2);border:1px solid var(--border);border-radius:12px}
+.perf-bar-row{display:flex;align-items:center;gap:12px;margin:8px 0}
+.perf-bar-label{width:140px;font-size:13px;text-align:right;color:var(--text2)}
+.perf-bar-track{flex:1;height:28px;background:var(--bg3);border-radius:4px;overflow:hidden;position:relative}
+.perf-bar-fill{height:100%;border-radius:4px;display:flex;align-items:center;justify-content:flex-end;padding-right:8px;font-size:12px;font-weight:600;color:#fff;transition:width 1.2s cubic-bezier(.4,0,.2,1);width:0}
+.perf-bar-fill.plain{background:linear-gradient(90deg,#3fb950,#39d0d8)}
+.perf-bar-fill.c-interp{background:linear-gradient(90deg,#58a6ff,#bc8cff)}
+.perf-bar-fill.ref-interp{background:linear-gradient(90deg,#d29922,#f85149)}
+
+/* Verification checklist */
+.checklist{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:8px;margin:16px 0}
+.checklist-item{display:flex;align-items:center;gap:8px;padding:10px 14px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;font-size:13px}
+.checklist-item .check-icon{font-size:16px}
+.checklist-item .check-label{flex:1}
+.checklist-item .check-result{font-weight:700;color:var(--accent2)}
+
+/* Flag search */
+.flag-search{width:100%;padding:10px 14px;margin:8px 0;background:var(--bg2);border:1px solid var(--border);border-radius:8px;color:var(--text);font-size:14px;outline:none}
+.flag-search:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.1)}
+.flag-table tr{transition:opacity .2s}
+.flag-table tr.hidden{display:none}
+
+/* Reveal on scroll */
+.reveal{opacity:0;transform:translateY(30px);transition:opacity .6s ease-out,transform .6s ease-out}
+.reveal.visible{opacity:1;transform:translateY(0)}
+
+/* Profile matrix */
+.profile-matrix{margin:16px 0;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.profile-matrix th{cursor:pointer;transition:background .2s}
+.profile-matrix th:hover{background:var(--bg3)}
+.profile-matrix td.highlight-col{background:rgba(88,166,255,.06)}
+
+/* VM compilation flow */
+.vm-flow{display:flex;flex-wrap:wrap;align-items:center;gap:4px;justify-content:center;margin:16px 0}
+.vm-step{padding:10px 16px;border:1px solid var(--border);border-radius:8px;font-size:13px;background:var(--bg3);text-align:center;min-width:120px}
+.vm-step .vs-title{font-weight:600;color:var(--text)}
+.vm-step .vs-sub{font-size:11px;color:var(--text2);margin-top:2px}
+.vm-step.python{border-color:var(--accent2);background:rgba(63,185,80,.05)}
+.vm-step.cpython{border-color:var(--cyan);background:rgba(57,208,216,.05)}
+.vm-step.bedrockvm{border-color:var(--accent);background:rgba(88,166,255,.05)}
+.vm-step.blob{border-color:var(--purple);background:rgba(188,140,255,.05)}
+.vm-step.c-interp{border-color:var(--warn);background:rgba(210,153,34,.05)}
+
+/* Misc visual */
+.section-divider{height:1px;background:linear-gradient(90deg,transparent,var(--border),transparent);margin:8px 0}
+.nav-group-label{padding:8px 20px 4px;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--text2);opacity:.6;border-bottom:1px solid var(--border);margin-bottom:4px}
+.tag-counter{position:fixed;bottom:20px;right:20px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:8px 14px;font-size:12px;color:var(--text2);z-index:200;transition:opacity .3s}
+
+/* Reduced motion */
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<!-- SIDEBAR -->
+<aside class="sidebar">
+<h2>🛡️ Bedrock Spec</h2>
+<nav id="nav">
+<div class="nav-group-label">Overview</div>
+<a href="#overview">1. Tổng quan</a>
+<a href="#arch">2. Kiến trúc</a>
+<a href="#cli">3. CLI flags</a>
+<a href="#profiles">4. Profiles</a>
+<a href="#pipeline">5. Pipeline</a>
+<a href="#passes">6. Obfuscation passes</a>
+<div class="nav-group-label">Phases</div>
+<a href="#phase1">7. Phase 1 — Capsule</a>
+<a href="#phase2">8. Phase 2 — Chain</a>
+<a href="#phase3">9. Phase 3 — Poison+Meta</a>
+<a href="#phase4">10. Phase 4 — Anti-meta</a>
+<a href="#phase5">11. Phase 5 — Native VM</a>
+<a href="#showcase">11½. Before/After</a>
+<div class="nav-group-label">VM internals</div>
+<a href="#vm-isa">12. BedrockVM ISA</a>
+<a href="#vm-blob">13. Blob format</a>
+<a href="#crypto">14. Crypto</a>
+<div class="nav-group-label">Defense</div>
+<a href="#anti-debug">15. Anti-debug</a>
+<a href="#tamper">16. Tamper modes</a>
+<a href="#integrity">17. Integrity</a>
+<a href="#traps">18. Decompiler traps</a>
+<div class="nav-group-label">Operations</div>
+<a href="#deploy">19. Deployment</a>
+<a href="#perf">20. Performance</a>
+</nav>
+</aside>
+
+<!-- MAIN -->
+<main class="main">
+
+<!-- HERO -->
+<section id="overview">
+<div class="hero-v2 reveal">
+<div class="shield">🛡️</div>
+<h1 class="title">Bedrock Obfuscator</h1>
+<p class="subtitle">Đặc tả kỹ thuật đầy đủ mọi tính năng obfuscation, anti-debug, anti-tamper, và native VM protection — multi-phase Python obfuscator với custom bytecode VM chạy bằng C extension.</p>
+<div class="stats-v2">
+<div class="stat-v2"><div class="v" data-count="87">0</div><div class="l">CLI flags</div></div>
+<div class="stat-v2"><div class="v" data-count="14">0</div><div class="l">Obf passes</div></div>
+<div class="stat-v2"><div class="v" data-count="30" data-suffix="+">0</div><div class="l">Security checks</div></div>
+<div class="stat-v2"><div class="v" data-count="100" data-prefix="~">0</div><div class="l">VM opcodes</div></div>
+<div class="stat-v2"><div class="v" data-count="5">0</div><div class="l">Phases</div></div>
+<div class="stat-v2"><div class="v" data-count="4">0</div><div class="l">Tamper modes</div></div>
+</div>
+</div>
+
+<h2>Lệnh cơ bản</h2>
+<pre><code>python "bedrock_obfuscator.py" -f input.py -o output.py \
+    --profile extreme --native-vm --anti-meta --adv-requests off
+# extreme auto-sets --vm-fallback off: tampered .pyd → poison+abort (fail-closed)</code></pre>
+
+<div class="callout callout-info">
+<strong>Target:</strong> CPython 3.10–3.12 (band <code>3.10-3.12</code>). VM native binary đã test trên <strong>Windows x64 + Python 3.11</strong>. Các platform khác dùng reference interpreter fallback (pure-Python, chậm hơn 73x).
+</div>
+</section>
+
+<!-- ARCH -->
+<section id="arch">
+<h2>2. Kiến trúc tổng thể</h2>
+<p>Bedrock là một <strong>multi-pass AST obfuscator</strong> kết hợp <strong>runtime capsule encryption</strong>, <strong>HMAC integrity chain</strong>, và <strong>custom bytecode VM</strong>. Input Python → pipeline transforms → output file (obfuscated Python + sidecar .pyd/.py).</p>
+
+<h3>Pipeline flow</h3>
+<div class="flow-diagram reveal">
+<div class="flow-box base">input.py</div>
+<span class="flow-arrow">→</span>
+<div class="flow-box base">obf_vars</div>
+<span class="flow-arrow">→</span>
+<div class="flow-box p5">VM compile</div>
+<span class="flow-arrow">→</span>
+<div class="flow-box p1">capsule</div>
+<span class="flow-arrow">→</span>
+<div class="flow-box p2">chain</div>
+<span class="flow-arrow">→</span>
+<div class="flow-box p3">poison</div>
+<span class="flow-arrow">→</span>
+<div class="flow-box p4">debrand</div>
+<span class="flow-arrow">→</span>
+<div class="flow-box base">marshal</div>
+<span class="flow-arrow">→</span>
+<div class="flow-box flow-output">payload.py</div>
+</div>
+<div class="flow-diagram" style="margin-top:0;border:none;padding:0 20px 0 20px;background:none">
+<div class="flow-box flow-sidecar" style="border-style:dashed">+ _xvm.pyd (C interpreter)</div>
+<div class="flow-box flow-sidecar" style="border-style:dashed">+ _bedrock_vm_ref.py (fallback)</div>
+</div>
+
+<div class="grid">
+<div class="card"><div class="num">14</div><div class="lbl">AST passes</div><p style="font-size:13px;color:var(--text2)">Mỗi pass biến đổi cây AST độc lập, fail-safe (lỗi → skip, không crash build)</p></div>
+<div class="card"><div class="num">2</div><div class="lbl">Runtimes</div><p style="font-size:13px;color:var(--text2)">Capsule (decrypt-on-call) + BedrockVM (native C interpreter) — function đi vào 1 trong 2, không cả hai</p></div>
+<div class="card"><div class="num">5</div><div class="lbl">Shards</div><p style="font-size:13px;color:var(--text2)">Chain tách secret thành 5 shard functions — không 1 scope nào giữ toàn bộ key</p></div>
+<div class="card"><div class="num">4</div><div class="lbl">Profiles</div><p style="font-size:13px;color:var(--text2)">fast / balanced / paranoid / extreme — preset cài đặt tất cả flags</p></div>
+</div>
+
+<h3>Layered defense</h3>
+<table>
+<tr><th>Layer</th><th>Phase</th><th>Bảo vệ gì</th><th>Flag</th></tr>
+<tr><td>Identifier renaming</td><td>base</td><td>Tên biến → CJK tokens</td><td><code>obf_vars</code> (luôn on)</td></tr>
+<tr><td>Builtin indirection</td><td>base</td><td><code>print</code> → <code>baobg_vars["print"]</code></td><td><code>obf_builtins</code></td></tr>
+<tr><td>String obfuscation</td><td>base</td><td>XOR lambdas, base85 blobs, fragmentation</td><td><code>obf_strings</code>, <code>str_frag2</code>, <code>str_cipher</code></td></tr>
+<tr><td>Control-flow</td><td>ext</td><td>CFF flattening, decompiler traps, junk code</td><td><code>cff</code>, <code>dec_trap</code>, <code>junk</code></td></tr>
+<tr><td>Data obfuscation</td><td>ext</td><td>Num obf, bool obf, var-split, homoglyph</td><td><code>num_obf</code>, <code>bool_obf</code>, <code>var_split</code>, <code>homoglyph</code></td></tr>
+<tr><td>Capsule runtime</td><td><span class="badge p1">P1</span></td><td>Decrypt <code>__code__</code> only on call, wipe on return</td><td><code>runtime_dec</code></td></tr>
+<tr><td>Integrity chain</td><td><span class="badge p2">P2</span></td><td>HMAC ring — tamper 1 capsule → corrupt all downstream</td><td><code>chain</code></td></tr>
+<tr><td>Debug poisoning</td><td><span class="badge p3">P3</span></td><td>Debugger detected → silent inert (poison state)</td><td><code>debug_poison</code></td></tr>
+<tr><td>Metamorphic</td><td><span class="badge p3">P3</span></td><td>File self-rewrite mỗi run (different bytes)</td><td><code>metamorphic</code></td></tr>
+<tr><td>Anti-meta debrand</td><td><span class="badge p4">P4</span></td><td>Xóa mọi literal <code>bedrock</code> → random tokens</td><td><code>anti_meta</code></td></tr>
+<tr><td>Native VM</td><td><span class="badge p5">P5</span></td><td>Compile function → custom bytecode → C interpreter</td><td><code>native_vm</code></td></tr>
+</table>
+</section>
+
+<!-- CLI -->
+<section id="cli">
+<h2>3. CLI flags (87 flags)</h2>
+<input type="text" class="flag-search" id="flag-search" placeholder="🔎 Search flags... (e.g. --native-vm, chain, integrity)">
+
+<h3>Core I/O</h3>
+<table class="compact flag-table">
+<tr><th>Flag</th><th>dest</th><th>Default</th><th>Mô tả</th></tr>
+<tr><td><code>-f</code> / <code>--file</code></td><td>file</td><td>None</td><td>File Python cần obfuscate</td></tr>
+<tr><td><code>-o</code> / <code>--output</code></td><td>output</td><td>None</td><td>File output</td></tr>
+<tr><td><code>--profile</code></td><td>profile</td><td>balanced</td><td>Preset: fast/balanced/paranoid/extreme</td></tr>
+<tr><td><code>--runtime-mode</code></td><td>runtime_mode</td><td>main</td><td>main (capsule) hoặc legacy</td></tr>
+</table>
+
+<h3>Protection policy</h3>
+<table class="compact flag-table">
+<tr><th>Flag</th><th>Choices</th><th>Default</th><th>Mô tả</th></tr>
+<tr><td><code>--anti-debug</code></td><td>strict/compat/off</td><td>strict</td><td>Chính sách anti-debug</td></tr>
+<tr><td><code>--anti-hook</code></td><td>strict/compat/off</td><td>strict</td><td>Chính sách anti-hook</td></tr>
+<tr><td><code>--integrity</code></td><td>on/off</td><td>on</td><td>SHA-256 self-check trong loader</td></tr>
+<tr><td><code>--tamper</code></td><td>self-destruct/fail-closed/warn/poison</td><td>self-destruct</td><td>Phản ứng khi phát hiện tamper</td></tr>
+<tr><td><code>--python-band</code></td><td>3.10-3.12 / 3.12-only</td><td>3.10-3.12</td><td>Target Python band</td></tr>
+<tr><td><code>--anti-vm</code></td><td>strict/compat/off</td><td>off</td><td>Anti-VM/sandbox check</td></tr>
+<tr><td><code>--anti-debugger-v2</code></td><td>on/off</td><td>off</td><td>Passive anti-debugger v2 (Linux /proc)</td></tr>
+</table>
+
+<h3>Obfuscation flags</h3>
+<table class="compact flag-table">
+<tr><th>Flag</th><th>Default</th><th>Mô tả</th></tr>
+<tr><td><code>--cff</code> / <code>--no-cff</code></td><td>off</td><td>Control-flow flattening</td></tr>
+<tr><td><code>--bc-mutate</code> + <code>--no-bc-nop/dead/consts</code></td><td>off (sub: on)</td><td>Bytecode mutation (NOP padding, dead branches, const decoys)</td></tr>
+<tr><td><code>--junk</code> / <code>--junk-level N</code></td><td>off / 2</td><td>Junk code + opaque predicates (density 1-5)</td></tr>
+<tr><td><code>--import-obf</code> / <code>--import-blob</code></td><td>off</td><td>Obfuscate imports / pool thành zlib blob</td></tr>
+<tr><td><code>--homoglyph</code> / <code>--homoglyph-seed N</code></td><td>off</td><td>Unicode homoglyph renaming</td></tr>
+<tr><td><code>--num-obf</code> / <code>--num-obf-depth N</code></td><td>off / 1</td><td>Integer literal obfuscation (depth 1-5)</td></tr>
+<tr><td><code>--bool-obf</code></td><td>off</td><td>Rewrite True/False/None thành opaque expr</td></tr>
+<tr><td><code>--str-frag2</code> / <code>--str-frag2-vm</code></td><td>off</td><td>String fragmentation v2 / per-entry XOR pool</td></tr>
+<tr><td><code>--str-cipher</code></td><td>off</td><td>SHA-256 chained stream cipher cho strings</td></tr>
+<tr><td><code>--lambda-enc</code> / <code>--lambda-enc-y</code></td><td>off</td><td>def → lambda assign / Y-combinator self-recursive</td></tr>
+<tr><td><code>--dec-trap</code> / <code>--dectrap-density P</code></td><td>off / 0.5</td><td>Decompiler traps (crash uncompyle6/decompyle3)</td></tr>
+<tr><td><code>--var-split</code></td><td>off</td><td>XOR secret-sharing: <code>v</code> → <code>v1 ^ v2</code></td></tr>
+<tr><td><code>--env-key</code></td><td>off</td><td>Lock output vào hardware fingerprint</td></tr>
+<tr><td><code>--spoof-meta</code></td><td>off</td><td>Spoof co_filename/co_qualname → stdlib paths</td></tr>
+<tr><td><code>--anti-timing</code></td><td>off</td><td>Wall-clock probe (abort trên single-step drift)</td></tr>
+</table>
+
+<h3>Runtime / Chain / Native VM</h3>
+<table class="compact flag-table">
+<tr><th>Flag</th><th>Default</th><th>Mô tả</th></tr>
+<tr><td><code>--runtime-dec</code></td><td>off</td><td>Capsule runtime: encrypt <code>__code__</code>, decrypt-on-call</td></tr>
+<tr><td><code>--chain</code></td><td>off</td><td>HMAC integrity chain + ring verify + 5 shards</td></tr>
+<tr><td><code>--debug-poison</code></td><td>off</td><td>Debugger → poison state (silent inert) thay vì exit. Auto-enable chain.</td></tr>
+<tr><td><code>--metamorphic</code></td><td>off</td><td>File self-rewrite mỗi run. Auto-enable chain.</td></tr>
+<tr><td><code>--anti-meta</code></td><td>off</td><td>Debrand mọi <code>bedrock</code> literal → random tokens</td></tr>
+<tr><td><code>--native-vm</code></td><td>off</td><td>Compile eligible functions → BedrockVM bytecode</td></tr>
+<tr><td><code>--vm-fallback</code></td><td>auto</td><td>Policy khi <code>_xvm</code> native ext missing/tampered: <code>auto</code>=warn+reference, <code>dev</code>=silent reference, <code>off</code>=fail-closed (extreme auto-sets <code>off</code>)</td></tr>
+</table>
+
+<h3>Misc</h3>
+<table class="compact flag-table">
+<tr><th>Flag</th><th>Default</th><th>Mô tả</th></tr>
+<tr><td><code>--report PATH</code></td><td>—</td><td>JSON run-report</td></tr>
+<tr><td><code>--non-interactive</code></td><td>off</td><td>Disable prompts</td></tr>
+<tr><td><code>--overwrite</code></td><td>off</td><td>Overwrite output</td></tr>
+<tr><td><code>--quiet</code></td><td>off</td><td>Giảm logging</td></tr>
+<tr><td><code>--json</code></td><td>off</td><td>Machine-readable output</td></tr>
+<tr><td><code>--cache</code> / <code>--no-cache</code></td><td>on</td><td>Incremental build cache</td></tr>
+<tr><td><code>--plugins DIR</code></td><td>[]</td><td>Plugin directory (repeatable)</td></tr>
+<tr><td><code>--tui</code></td><td>off</td><td>Textual TUI</td></tr>
+<tr><td><code>--project DIR</code> / <code>--output-dir</code></td><td>—</td><td>Build cả project tree</td></tr>
+</table>
+
+<div class="callout callout-info">
+<strong>Hidden flags</strong> (help=SUPPRESS, backward-compat): <code>--type</code>, <code>--bind-mode</code>, <code>--legacy-loader</code>, <code>--vm-profile</code>, <code>--vm-carrier</code>, <code>--vm-compat</code>, <code>--adv-requests</code>, <code>--vm-opcode-remap</code>, <code>--vm-extended</code>.
+</div>
+</section>
+
+<!-- PROFILES -->
+<section id="profiles">
+<h2>4. Profiles (4 presets)</h2>
+<p>Mỗi profile cài đặt sẵn một bộ flags. <code>--profile extreme</code> bật gần như tất cả. Explicit <code>--no-*</code> luôn override preset.</p>
+
+<table class="compact">
+<tr><th>Flag</th><th>fast</th><th>balanced</th><th>paranoid</th><th>extreme</th></tr>
+<tr><td>anti_debug</td><td>off</td><td>compat</td><td>strict</td><td><strong>strict</strong></td></tr>
+<tr><td>anti_hook</td><td>off</td><td>compat</td><td>strict</td><td><strong>strict</strong></td></tr>
+<tr><td>anti_vm</td><td>—</td><td>—</td><td>strict</td><td><strong>strict</strong></td></tr>
+<tr><td>anti_debugger_v2</td><td>—</td><td>—</td><td>on</td><td><strong>on</strong></td></tr>
+<tr><td>tamper</td><td>warn</td><td>fail-closed</td><td>self-destruct</td><td><strong>self-destruct</strong></td></tr>
+<tr><td>obf_vars</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
+<tr><td>obf_builtins</td><td>❌</td><td>✅</td><td>✅</td><td>✅</td></tr>
+<tr><td>obf_strings</td><td>❌</td><td>✅</td><td>✅</td><td>✅</td></tr>
+<tr><td>str_frag2</td><td>—</td><td>—</td><td>—</td><td><strong>✅</strong></td></tr>
+<tr><td>str_cipher</td><td>—</td><td>—</td><td>✅</td><td>✅</td></tr>
+<tr><td>cff</td><td>❌</td><td>❌</td><td>✅</td><td>✅</td></tr>
+<tr><td>bc_mutate</td><td>❌</td><td>❌</td><td>❌</td><td><strong>✅</strong></td></tr>
+<tr><td>dec_trap</td><td>—</td><td>—</td><td>✅</td><td>✅</td></tr>
+<tr><td>var_split</td><td>—</td><td>—</td><td>—</td><td><strong>✅</strong></td></tr>
+<tr><td>spoof_meta</td><td>—</td><td>—</td><td>✅</td><td>✅</td></tr>
+<tr><td>anti_timing</td><td>—</td><td>—</td><td>✅</td><td>✅</td></tr>
+<tr><td>runtime_dec</td><td>—</td><td>—</td><td>—</td><td><strong>✅</strong></td></tr>
+<tr><td>chain</td><td>—</td><td>—</td><td>—</td><td><strong>✅</strong></td></tr>
+<tr><td>debug_poison</td><td>—</td><td>—</td><td>—</td><td><strong>✅</strong></td></tr>
+<tr><td>metamorphic</td><td>—</td><td>—</td><td>—</td><td><strong>✅</strong></td></tr>
+<tr><td>anti_meta</td><td>—</td><td>—</td><td>—</td><td><strong>✅</strong></td></tr>
+<tr><td>native_vm</td><td>—</td><td>—</td><td>—</td><td><strong>✅</strong></td></tr>
+<tr><td>vm_fallback</td><td>auto</td><td>auto</td><td>auto</td><td><strong>off</strong></td></tr>
+</table>
+
+<h3><code>_apply_extreme_overrides</code></h3>
+<p>Boost <code>extreme</code> preset → bật thêm: <code>cff, bc_mutate, num_obf, import_obf, str_frag2, vm_extended, dec_trap, var_split, spoof_meta, anti_timing, homoglyph, runtime_dec, chain, debug_poison, metamorphic, anti_meta, native_vm, junk, bool_obf, lambda_enc, str_cipher</code> + escalate <code>anti_vm=strict</code>, <code>anti_debugger_v2=on</code>, <code>vm_fallback=off</code> (fail-closed native VM — missing/tampered <code>.pyd</code> → poison+abort, không silent reference fallback).</p>
+<div class="callout callout-warn">
+<strong>Cascade:</strong> <code>--debug-poison</code> và <code>--metamorphic</code> auto-enable <code>--chain</code> (poison state lives trong integrity shard). Mọi auto-enable honour explicit <code>--no-*</code>.
+</div>
+</section>
+
+<!-- PIPELINE -->
+<section id="pipeline">
+<h2>5. Pipeline order</h2>
+<p>Passes được đăng ký qua <code>_insert_after_obf_vars</code> — <strong>reverse stack</strong>: pass khai báo LATER chạy EARLIER. Order thực tế (normal mode):</p>
+<pre><code>1. obf_vars              ← identifier renaming (anchor)
+2. strfrag2              ← string fragmentation v2
+3. import_obf            ← import obfuscation
+4. native_vm             ← Phase 5: BedrockVM compile (claim functions FIRST)
+5. runtime_dec           ← Phase 1: capsule runtime (skip VM-claimed funcs)
+6. var_split             ← XOR secret-sharing
+7. dec_trap              ← decompiler traps
+8. junk                  ← junk code + opaque predicates
+9. boolobf               ← True/False/None obfuscation
+10. numobf               ← integer literal obfuscation
+11. lambda_enc           ← def → lambda
+12. homoglyph            ← Unicode homoglyph renaming
+13. cff                  ← control-flow flattening (LAST ext pass)
+14. plugins:after_rename
+15. vm_strings           ← VM string encoding
+16. obf_builtins         ← builtin indirection
+17. obf_strings          ← string obfuscation
+18. plugins:pre_compile
+19. Compile.Obfuscate    ← marshal + integrity hash + anti-pycdc</code></pre>
+<div class="callout callout-danger">
+<strong>Critical fix (P7.8):</strong> <code>apply_native_vm</code> marks wrappers với <code>_bedrock_vm_claimed = True</code>; <code>_runtimedec_collect_targets</code> skip các function có mark này → tránh capsule-wrap VM wrapper (deadlock khi chain shard re-install <code>__code__</code> trong khi VM đang chạy).
+</div>
+</section>
+
+<!-- PASSES -->
+<section id="passes">
+<h2>6. Obfuscation passes (chi tiết)</h2>
+
+<details open><summary>📋 14 apply_* functions + base passes</summary>
+<div class="content">
+<table>
+<tr><th>Pass</th><th>Line</th><th>Flag</th><th>Mô tả</th></tr>
+<tr><td><code>apply_cff</code></td><td>6735</td><td><code>--cff</code></td><td>Control-flow flattening qua <code>_flatten_function</code></td></tr>
+<tr><td><code>apply_dectrap</code></td><td>6851</td><td><code>--dec-trap</code></td><td>Wrap function body trong nested opaque-if (crash uncompyle6/decompyle3)</td></tr>
+<tr><td><code>apply_junk</code></td><td>8464</td><td><code>--junk</code></td><td>Junk code + opaque predicates (density 1-5)</td></tr>
+<tr><td><code>apply_import_obf</code></td><td>8732</td><td><code>--import-obf</code></td><td>Mã hóa import names (8-byte XOR), pool zlib blob</td></tr>
+<tr><td><code>apply_homoglyph</code></td><td>9056</td><td><code>--homoglyph</code></td><td>Rename locals → Unicode homoglyphs (Cyrillic/Greek/Cherokee)</td></tr>
+<tr><td><code>apply_numobf</code></td><td>9385</td><td><code>--num-obf</code></td><td>Integer literal → 3 strategies (arith/bitwise/chained), depth 1-5</td></tr>
+<tr><td><code>apply_varsplit</code></td><td>9613</td><td><code>--var-split</code></td><td><code>v = int</code> → <code>v1 = rand; v2 = expr ^ v1</code>, load → <code>v1 ^ v2</code></td></tr>
+<tr><td><code>apply_native_vm</code></td><td>9762</td><td><code>--native-vm</code></td><td><strong>Phase 5:</strong> compile eligible functions → BedrockVM bytecode</td></tr>
+<tr><td><code>apply_runtimedec</code></td><td>10107</td><td><code>--runtime-dec</code></td><td><strong>Phase 1:</strong> capsule runtime + 5-shard chain</td></tr>
+<tr><td><code>apply_boolobf</code></td><td>10723</td><td><code>--bool-obf</code></td><td>True/False/None → opaque expressions</td></tr>
+<tr><td><code>apply_strfrag2</code></td><td>10957</td><td><code>--str-frag2</code></td><td>String pool + split 2-5 chunks + XOR + decoys</td></tr>
+<tr><td><code>apply_lambda_enc</code></td><td>11933</td><td><code>--lambda-enc</code></td><td>def → lambda assign; Y-combinator cho self-recursive</td></tr>
+</table>
+<p><strong>Base passes</strong> (không phải apply_*): <code>Methods.obf_vars</code> (identifier renamer), <code>Methods.obf_builtins</code> (builtin indirection), <code>Methods.vm_strings</code>, <code>Methods.obf_strings</code>, <code>Compile.Obfuscate</code> (marshal + integrity + anti-pycdc).</p>
+</div>
+</details>
+</section>
+
+<!-- PHASE 1 -->
+<section id="phase1">
+<h2>7. <span class="badge p1">P1</span> Phase 1 — Capsule Runtime</h2>
+
+<h3>Phase timeline</h3>
+<div class="phase-timeline reveal">
+<div class="phase-node p1"><div class="pn-badge">P1</div><div class="pn-name">Capsule</div></div>
+<div class="phase-node p2"><div class="pn-badge">P2</div><div class="pn-name">Chain</div></div>
+<div class="phase-node p3"><div class="pn-badge">P3</div><div class="pn-name">Poison+Meta</div></div>
+<div class="phase-node p4"><div class="pn-badge">P4</div><div class="pn-name">Debrand</div></div>
+<div class="phase-node p5"><div class="pn-badge">P5</div><div class="pn-name">Native VM</div></div>
+</div>
+
+<p><code>--runtime-dec</code> | auto-on cho extreme</p>
+<h3>Cơ chế</h3>
+<ol>
+<li>Capture <code>__code__</code> thật của mỗi eligible function (<code>_real</code>)</li>
+<li>Marshal + encrypt với per-capsule 32-byte key (SHA-256 OFB stream cipher)</li>
+<li>Install no-op stub (<code>_stub</code>) làm <code>__code__</code></li>
+<li>Wrap <code>globals()[name]</code> với wrapper <code>_w</code>: mỗi call → decrypt <code>_enc</code> → swap <code>__code__</code> → run → restore stub trong <code>finally</code></li>
+</ol>
+<div class="callout callout-info">
+<strong>RAM window:</strong> Bytecode decrypt chỉ tồn tại trong RAM <em>trong lúc gọi</em>. Static memory dump giữa 2 call chỉ thấy no-op stub.
+</div>
+<h3>Eligibility</h3>
+<ul>
+<li>Top-level <code>def</code> only (không nested, không async, không <code>yield</code>/<code>await</code>)</li>
+<li>Skip dunders (<code>__init__</code>, etc.)</li>
+<li>Skip entry guard (function body có <code>__name__</code> / <code>"__main__"</code>)</li>
+<li><strong>Skip VM-claimed functions</strong> (có <code>_bedrock_vm_claimed</code> — fix P7.8)</li>
+<li>Fail-safe: lỗi per-function → <code>__code__</code> giữ nguyên</li>
+</ul>
+</section>
+
+<!-- PHASE 2 -->
+<section id="phase2">
+<h2>8. <span class="badge p2">P2</span> Phase 2 — Chain Runtime</h2>
+<p><code>--chain</code> | auto-on cho extreme, debug-poison, metamorphic</p>
+<h3>5 Shards</h3>
+<table>
+<tr><th>Shard</th><th>Chứa gì</th><th>Tamper effect</th></tr>
+<tr><td><code>_br_int_shard</code></td><td>Poison state <code>__h_poison_state__</code> + <code>__h_poison(tag, weight)</code> + <code>__h_poisoned()</code></td><td>Monotonic, never resets. <code>(state<<5) ^ mix ^ (weight*0x45D9F3B)</code></td></tr>
+<tr><td><code>_br_key_shard</code></td><td>32-byte master key + <code>__h_chain_key(label, prev) = sha256(prev + master + label)</code></td><td>Nếu <code>__h_poisoned()</code> ≠ 0 → key XOR-masked → decrypt ra garbage</td></tr>
+<tr><td><code>_br_cap_shard</code></td><td>SHA-256 OFB decryptor <code>_br_decrypt(blob, key)</code></td><td>—</td></tr>
+<tr><td><code>_br_flow_shard</code></td><td>Walk chain sorted-target order: derive <code>key_n</code>, encrypt, compute <code>base_tag_n = HMAC(key_n, prev + enc_n)</code>, ring tag <code>final_tag_n = HMAC(key_n, base_tag_n + base_tag_{n+1})</code>, install wrappers</td><td>Tamper 1 capsule → own + neighbor's tag change → next key corrupt → all downstream decrypt to garbage</td></tr>
+<tr><td><code>_br_meta_shard</code></td><td>Metamorphic rewrite (see Phase 3)</td><td>—</td></tr>
+</table>
+<h3>Tamper propagation</h3>
+<div class="threat-flow reveal">
+<div class="threat-node"><strong>Capsule A tampered</strong> <span class="threat-label tamper">TAMPER</span><br>A's <code>base_tag</code> changes</div>
+<div class="threat-arrow">↓</div>
+<div class="threat-node cascade"><strong>A's final_tag + B's (neighbor) final_tag change</strong> <span class="threat-label corrupt">CASCADE</span></div>
+<div class="threat-arrow">↓</div>
+<div class="threat-node cascade"><strong>B's key_n changes</strong> <span class="threat-label corrupt">KEY CORRUPT</span><br>(depends on A's base_tag)</div>
+<div class="threat-arrow">↓</div>
+<div class="threat-node final"><strong>B, C, D, ... all decrypt to garbage</strong> <span class="threat-label tamper">SILENT INERT</span><br>Program still runs but produces wrong results</div>
+</div>
+<pre><code>Capsule A tampered
+  → A's base_tag changes
+  → A's final_tag AND B's (neighbor) final_tag change
+  → B's key_n changes (depends on A's base_tag)
+  → B, C, D, ... all decrypt to garbage (silent inert)
+  → Program still runs but produces wrong results</code></pre>
+<div class="callout callout-warn">
+<strong>Key derivation:</strong> <code>key_n = sha256(prev_tag + master + label_n)</code>. <code>label</code> = function name. Khi <code>--env-key</code>: master XOR-blinded bởi <code>__BedrockEnvKey__</code> (32-byte HW fingerprint digest).
+</div>
+</section>
+
+<!-- PHASE 3 -->
+<section id="phase3">
+<h2>9. <span class="badge p3">P3</span> Phase 3 — Debug Poison + Metamorphic</h2>
+
+<h3>Debug Poisoning (<code>--debug-poison</code>)</h3>
+<ul>
+<li>Anti-dbg/anti-vm/tamper reactions route qua <code>__h_poison(tag, weight)</code> thay vì <code>sys.exit</code></li>
+<li>Force <code>tamper_mode = 'poison'</code></li>
+<li>Auto-enable <code>--chain</code> (poison state lives trong integrity shard)</li>
+<li><strong>Net effect:</strong> debugger detected → program vẫn chạy nhưng mọi downstream capsule decrypt ra garbage (silent inert). Attacker có "working" program nhưng output sai.</li>
+</ul>
+
+<h3>Metamorphic (<code>--metamorphic</code>)</h3>
+<ul>
+<li>5th shard <code>_br_meta_shard</code> re-read <code>__file__</code> mỗi import</li>
+<li>Insert fresh <code># meta<48 hex></code> comment sau <code>__H_FILE_HASH__</code> line</li>
+<li>Re-mask cả file hash + integrity hash → 64 dots, recompute với salt <code>|fh</code> / <code>|int</code></li>
+<li>Atomic <code>os.replace</code> qua <code>.meta</code> temp file</li>
+<li><strong>On-disk artifact khác bytes mỗi run</strong>, logic payload byte-for-byte identical</li>
+<li>Fail-safe: lỗi → <code>__h_poison('meta_fail', 7)</code>, không crash</li>
+</ul>
+</section>
+
+<!-- PHASE 4 -->
+<section id="phase4">
+<h2>10. <span class="badge p4">P4</span> Phase 4 — Anti-meta Debrand</h2>
+<p><code>--anti-meta</code> | auto-on cho extreme</p>
+<ul>
+<li><code>_init_debrand</code> generate per-build random tokens (alphabet <code>fhijlmnpqstuvwxyz</code>, excludes fingerprint letters)</li>
+<li><code>_debrand(str)</code> replace mọi literal <code>bedrock</code>/<code>Bedrock</code>/<code>BEDROCK</code>/<code>baobg</code>/<code>Baobg</code>/<code>BAOBG</code> → per-build random token</li>
+<li>Chạy ở BUILD TIME trước mọi emit site</li>
+<li><strong>Kết quả:</strong> <code>grep -ic bedrock</code> trên output = <strong>0</strong> (verified)</li>
+<li>Identity/no-op khi off</li>
+</ul>
+</section>
+
+<!-- PHASE 5 -->
+<section id="phase5">
+<h2>11. <span class="badge p5">P5</span> Phase 5 — Native BedrockVM</h2>
+<p><code>--native-vm</code> | auto-on cho extreme</p>
+
+<h3>Overview</h3>
+<p>Compile eligible user functions → <strong>BedrockVM bytecode</strong> (custom stack-machine ISA, ~100 opcodes, 2-byte instructions). Bytecode được interpret bởi <strong>compiled C extension</strong> (<code>_xvm.pyd</code>/<code>.so</code>) qua CPython C-API. Logic user không còn tồn tại như Python source HAY CPython bytecode — nó là opaque bytes chạy bằng native machine code.</p>
+
+<h3>VM compilation flow</h3>
+<div class="vm-flow reveal">
+<div class="vm-step python"><div class="vs-title">Python source</div><div class="vs-sub">def add(a,b):</div></div>
+<span class="flow-arrow">→</span>
+<div class="vm-step cpython"><div class="vs-title">CPython bytecode</div><div class="vs-sub">co_code + co_consts</div></div>
+<span class="flow-arrow">→</span>
+<div class="vm-step bedrockvm"><div class="vs-title">BedrockVM opcode</div><div class="vs-sub">~100 canonical ops</div></div>
+<span class="flow-arrow">→</span>
+<div class="vm-step blob"><div class="vs-title">Encrypted blob</div><div class="vs-sub">OFB + per-build perm</div></div>
+<span class="flow-arrow">→</span>
+<div class="vm-step c-interp"><div class="vs-title">C interpreter</div><div class="vs-sub">_xvm.pyd native</div></div>
+</div>
+
+<div class="grid">
+<div class="card"><div class="lbl">Reversing yêu cầu</div><p style="font-size:13px">1. RE C interpreter (IDA/Ghidra)<br>2. Re-derive per-build opcode table<br>3. Decrypt const pool + names blob (SHA-256 OFB, distinct keys)</p></div>
+<div class="card"><div class="lbl">Output files</div><p style="font-size:13px"><code>payload.py</code> (loader)<br><code>_xvm.cp311-win_amd64.pyd</code> (C interp)<br><code>_bedrock_vm_ref.py</code> (fallback)</p></div>
+<div class="card"><div class="lbl">Coexist với capsule</div><p style="font-size:13px">Function → VM <strong>HOẶC</strong> capsule, không cả hai. VM claim trước (pipeline order), capsule skip VM-claimed.</p></div>
+</div>
+
+<h3>Eligibility (VM-compiled)</h3>
+<table>
+<tr><th>✅ Eligible</th><th>❌ Skipped (UnsupportedOpcode → fallback)</th></tr>
+<tr><td>Top-level def, sync, no try/except/with</td><td>Async functions (coroutine/async-gen)</td></tr>
+<tr><td>Arithmetic, control-flow, loops, comprehensions</td><td>try/except (3.11 <code>co_exceptiontable</code> present)</td></tr>
+<tr><td>f-strings, attribute access, subscript, stack ops</td><td>with-statements (<code>BEFORE_WITH</code>/<code>SETUP_WITH</code>)</td></tr>
+<tr><td>Generators (compile, delegate to ref at runtime)</td><td>Code nesting > 64 deep</td></tr>
+<tr><td>Closures (<code>co_freevars</code> non-empty, untested)</td><td>Unknown BINARY_OP sub-op</td></tr>
+<tr><td>List comprehensions (synthetic list local)</td><td>LIST_APPEND outside comprehension</td></tr>
+</table>
+<div class="callout callout-danger">
+<strong>Safety gate (silent wrong output prevention):</strong> try/except/with detection là cố ý — C interpreter không wire exception-table unwinding. Compile những function này → SILENT WRONG OUTPUT (nguy hiểm nhất). Skip → fallback capsule runtime (vẫn obfuscated bởi Phase 1-4).
+</div>
+
+<h3>Components</h3>
+<table class="compact">
+<tr><th>File</th><th>Lines</th><th>Vai trò</th></tr>
+<tr><td><code>bedrock_native/_bedrock_vm_ref.py</code></td><td>~850</td><td>Pure-Python reference interpreter (executable spec/oracle)</td></tr>
+<tr><td><code>bedrock_native/_native_vm_compiler.py</code></td><td>~640</td><td>CPython opcode → BedrockVM opcode translator</td></tr>
+<tr><td><code>bedrock_native/_bedrock_vm.c</code></td><td>~1610</td><td>C interpreter (CPython extension <code>_xvm</code>)</td></tr>
+<tr><td><code>bedrock_native/_build_system.py</code></td><td>~343</td><td>Compiler detection, build, ship, loader snippet</td></tr>
+<tr><td><code>bedrock_native/VM_SPEC.md</code></td><td>—</td><td>Bytecode spec document</td></tr>
+</table>
+
+<h3>.pyd integrity + fallback policy</h3>
+<p>Production hardening: shipped <code>_xvm.pyd</code> được SHA-256 hash. Loader verify tại runtime, policy bởi <code>--vm-fallback</code>:</p>
+<table class="compact">
+<tr><th>Component</th><th>Vai trò</th></tr>
+<tr><td><code>__VM_EXTHASH__</code> (plaintext header)</td><td>64-char sentinel patched post-ship → real SHA-256. Masked trong integrity check (length-preserving, giữ file hash ổn định).</td></tr>
+<tr><td><code>get_loader_snippet(vm_fallback=)</code></td><td>Emit import + hash-verify + fallback/poison/abort logic theo policy</td></tr>
+<tr><td><code>_build_native_and_ship</code></td><td>Compute <code>ext_hash = sha256(.pyd bytes)</code>, return trong ship dict</td></tr>
+</table>
+<div class="callout callout-ok">
+<strong>Fail-closed default cho extreme:</strong> <code>--profile extreme</code> auto-sets <code>--vm-fallback off</code> → missing/tampered <code>.pyd</code> → poison + SystemExit (không silent reference degradation). Explicit <code>--vm-fallback auto/dev</code> override.
+</div>
+<div class="callout callout-warn">
+<strong>Backward compat:</strong> <code>--no-native-vm</code> → không ship <code>.pyd</code>, không hash, không fallback logic. Reference-mode build (no compiler) → <code>ext_hash=None</code>, sentinel stays, loader skip hash check (import là <code>.py</code>).
+</div>
+</section>
+
+<!-- SHOWCASE -->
+<section id="showcase">
+<h2>11½. Before / After Showcase</h2>
+<p>Cùng một function <code>add(a, b): return a + b</code> qua 4 mức obfuscation. Click tab để switch level. Output lấy từ <strong>real obfuscator build</strong> (không fabricated).</p>
+
+<div class="showcase-tabs">
+<button class="showcase-tab active" data-showcase="l1">Level 1 — Fast (renaming)</button>
+<button class="showcase-tab" data-showcase="l2">Level 2 — Balanced (+strings)</button>
+<button class="showcase-tab" data-showcase="l3">Level 3 — Extreme (full)</button>
+<button class="showcase-tab" data-showcase="l4">Level 4 — VM bytecode blob</button>
+</div>
+
+<div class="showcase-panel active" id="sc-l1">
+<div class="ba-container">
+<div class="ba-panel input">
+<div class="ba-header">📥 Input (28 lines, 3 functions)</div>
+<pre><code>def add(a, b):
+    """Add two numbers."""
+    return a + b
+
+def greet(name, greeting="Hello"):
+    """Greet with custom greeting."""
+    message = f"{greeting}, {name}!"
+    print(message)
+    return message
+
+def main():
+    x = 7
+    y = 13
+    z = add(x, y)
+    greeting = greet("World", greeting="Hi")
+    print(f"Result: {z}, {greeting}")
+    return z + 42</code></pre>
+</div>
+<div class="ba-panel output">
+<div class="ba-header">📤 Level 1 output (173 lines, 232 XOR lambdas)</div>
+<pre><code>def 奇三世月世法二三(a, b, _s=46600, _l=4):
+    try:
+        _b = globals().get('__builtins__')
+        if isinstance(_b, dict):
+            _sum = _b.get('sum')
+            _map = _b.get('map')
+            _ord = _b.get('ord')
+            _len = _b.get('len')
+        else:
+            _sum = _b.sum
+            _map = _b.map
+            _ord = _b.ord
+            _len = _b.len
+        if ((_len(a) * 12345) ^ (_len(a) * 12345)) != 0:
+            return 0
+        return ((_sum(_map(_ord, a)) ^ _sum(_map(_ord, b))
+                 ^ _s) % _l)
+    except Exception:
+        return 0
+
+# Strings → XOR lambda byte construction:
+雷地玄火 = bytes([(lambda x,k=1: x ^ k)(100),
+    (lambda x,k=170: x ^ k)(220), (lambda x,k=32: x ^ k)(65),
+    (lambda x,k=24: x ^ k)(116)]).decode('utf-8')
+# ↑ "Hello" rebuilt from XOR byte pairs at runtime
+
+# Identifiers → CJK tokens:
+#   add      → 奇三世月世法二三
+#   greet    → 荒文梦荒幻水字八
+#   main     → 世一八七文雪影法
+#   message  → 音火一影九精月洪</code></pre>
+</div>
+</div>
+<div class="ba-annotation">
+<strong>What changed:</strong> All identifiers → CJK Unicode tokens. String literals → XOR-lambda byte construction. Builtin access → indirect <code>globals().get('__builtins__')</code>. Code structure still recognizable — functions visible, control flow readable.
+</div>
+</div>
+
+<div class="showcase-panel" id="sc-l2">
+<div class="ba-container">
+<div class="ba-panel input">
+<div class="ba-header">📥 Input (same function)</div>
+<pre><code>def greet(name, greeting="Hello"):
+    """Greet with custom greeting."""
+    message = f"{greeting}, {name}!"
+    print(message)
+    return message</code></pre>
+</div>
+<div class="ba-panel output">
+<div class="ba-header">📤 Level 2 output (178 lines, 254 XOR lambdas)</div>
+<pre><code># Builtin indirection: print → baobg_qtekoyew["print"]
+# String access via XOR-decoded byte arrays:
+baobg_qtekoyew[bytes([
+    (lambda x,k=252: x ^ k)(163),
+    (lambda x,k=121: x ^ k)(38),
+    (lambda x,k=147: x ^ k)(250),
+    (lambda x,k=208: x ^ k)(247),
+    (lambda x,k=193: x ^ k)(177),
+    (lambda x,k=132: x ^ k)(218)
+]).decode('utf-8')](
+    baobg_qtekoyew[bytes([
+        (lambda x,k=160: x ^ k)(255),
+        (lambda x,k=151: x ^ k)(200),
+        (lambda x,k=116: x ^ k)(233),
+        ...
+    ]).decode('utf-8')]
+)
+
+# Every string now reconstructs at runtime from XOR byte
+# pairs. No plaintext string literal survives static analysis.
+# "Hello" → 5 lambda XOR expressions → bytes().decode()</code></pre>
+</div>
+</div>
+<div class="ba-annotation">
+<strong>What changed (vs L1):</strong> + String fragmentation (XOR lambdas). + Builtin indirection (<code>baobg_qtekoyew["print"]</code> instead of bare <code>print</code>). + Marshal/pickle wrapping. Code structure heavily obscured — function bodies become opaque expression chains.
+</div>
+</div>
+
+<div class="showcase-panel" id="sc-l3">
+<div class="ba-container">
+<div class="ba-panel input">
+<div class="ba-header">📥 Input (same function)</div>
+<pre><code>def add(a, b):
+    """Add two numbers."""
+    return a + b
+
+# Header before:
+# __OBFBy__ = 'baobg'
+# __OBFType__ = "MAIN - BedrockSieuVip"</code></pre>
+</div>
+<div class="ba-panel output">
+<div class="ba-header">📤 Level 3 output (164 lines, debranded, full chain)</div>
+<pre><code># Header: NO bedrock/baobg literals (debranded):
+月魂雪五清法 = 'y570p6wqy2'     # was __OBFBy__
+月字文魂五龍 = 'w03hwh89jv2'   # was __OBFBot__
+幻六二罗道地魔一 = "__WILLTQT_LCAN_..."  # debranded
+
+# .pyd integrity hash (post-ship injected, real SHA-256):
+__VM_EXTHASH__ = "ad12175200ee255d5bb56c54e765
+    cf6de6664d130c9c17172dba25d4f1cd3ac8"
+
+# Builtin scope: debranded token
+willtqt_lhvnencu = (__willtqt_builtin_scope__
+    if isinstance(__willtqt_builtin_scope__, dict)
+    else vars(__willtqt_builtin_scope__))
+
+# Chain preamble + 5 shards + HMAC ring + poison
+# + capsule encryption (decrypt-on-call)
+# + metamorphic self-rewrite
+# + anti-debug (30+ checks) + anti-VM + anti-hook
+# grep -ic bedrock = 0 (anti-meta verified)</code></pre>
+</div>
+</div>
+<div class="ba-annotation">
+<strong>What changed (vs L2):</strong> + <code>--anti-meta</code>: all <code>bedrock</code>/<code>baobg</code> literals → random tokens (<code>willtqt</code>). + Chain runtime: 5 shards, HMAC ring, poison state. + Capsule encryption: <code>__code__</code> encrypted, decrypt-on-call. + Metamorphic: file self-rewrite mỗi run. + <code>--vm-fallback off</code>: .pyd tampered → poison+abort. + <code>__VM_EXTHASH__</code> real hash (not sentinel).
+</div>
+</div>
+
+<div class="showcase-panel" id="sc-l4">
+<div class="ba-container">
+<div class="ba-panel input">
+<div class="ba-header">📥 Input (Python source)</div>
+<pre><code>def add(a, b):
+    return a + b
+
+def main():
+    x = 7
+    y = 13
+    z = add(x, y)
+    print(f"Result: {z}")
+    return z + 42</code></pre>
+</div>
+<div class="ba-panel output">
+<div class="ba-header">📤 Level 4 — VM bytecode blob (base85-encoded, ~397KB)</div>
+<pre><code># Python source is GONE. What remains is an opaque
+# base85-encoded blob interpreted by native C code:
+
+AnhOiDungCoDec(
+    b'&@twFu<%i%hd$0GTKG8TSpakAuf-'
+    b'`dWQ5x;r+58~(LZQIVVk#@j#f}'
+    b'DPGGV$H8x9Ps;qnO^aP&D...'
+    # ↑ ~397,000 bytes of base85-encoded BedrockVM bytecode
+    # Contains: BVM1 magic + header + encrypted const_pool
+    #   + scrambled bytecode + encrypted names_blob
+    b'4wAAAAAAAAAAAAAAAAQAAAA'
+    b'DAAAA83ICAACHBIcFhwaHB5'
+    b'cAdAEAAAAAAAAAAAAApgAAA...'
+    # ↑ Raw binary: BVM1 header → opcode permutation →
+    #   OFB-encrypted pickle consts → 2-byte opcodes →
+    #   sha256(key|names)-encrypted names blob
+)
+
+# The C interpreter (_xvm.pyd) executes this:
+# 1. Decode base85 → raw blob
+# 2. Parse BVM1 header (flags, argcount, nlocals)
+# 3. OFB-decrypt const pool with key
+# 4. OFB-decrypt names_blob with sha256(key|names)
+# 5. De-scramble opcodes via per-build permutation table
+# 6. Execute stack-machine bytecode via C dispatch loop
+#
+# Reversing requires:
+#   1. RE the C interpreter (IDA/Ghidra)
+#   2. Re-derive per-build opcode permutation table
+#   3. Recover key (chain/env-key/embedded)
+#   4. OFB-decrypt const pool + names_blob
+#   5. Disassemble BedrockVM bytecode → understand logic</code></pre>
+</div>
+</div>
+<div class="ba-annotation">
+<strong>What changed (vs L3):</strong> User functions compiled to BedrockVM bytecode (opaque bytes). No Python source, no CPython bytecode — pure native execution via <code>_xvm.pyd</code>. Const pool + names_blob both OFB-encrypted with distinct keys. Per-build opcode permutation. This is the hardest layer: attacker must reverse-engineer C extension + crypto + ISA.
+</div>
+</div>
+
+</section>
+
+<!-- VM ISA -->
+<section id="vm-isa">
+<h2>12. BedrockVM ISA (~100 opcodes)</h2>
+<p>Stack-machine. 2-byte instructions: <code>[opcode][arg_lo]</code>. <code>EXTENDED_ARG</code> (canonical 144, fixed — không permute) shift arg trái 8 bits. Jumps absolute, tính bằng instruction-units.</p>
+
+<details><summary>📐 Stack / control (canonical 0-31)</summary>
+<div class="content">
+<table class="compact">
+<tr><th>val</th><th>name</th><th>arg</th><th>stack effect</th><th>semantics</th></tr>
+<tr><td>0</td><td>NOP</td><td>—</td><td>—</td><td>no-op</td></tr>
+<tr><td>1</td><td>POP_TOP</td><td>—</td><td>TOS →</td><td>discard top</td></tr>
+<tr><td>2</td><td>DUP_TOP</td><td>—</td><td>TOS → TOS TOS</td><td>duplicate</td></tr>
+<tr><td>3</td><td>ROT_TWO</td><td>—</td><td>a b → b a</td><td>swap top 2</td></tr>
+<tr><td>4</td><td>ROT_THREE</td><td>—</td><td>a b c → c a b</td><td>rotate 3</td></tr>
+<tr><td>7</td><td>JUMP</td><td>target</td><td>—</td><td>absolute jump</td></tr>
+<tr><td>8</td><td>JUMP_IF_FALSE</td><td>target</td><td>TOS →</td><td>pop; jump if falsy</td></tr>
+<tr><td>9</td><td>JUMP_IF_TRUE</td><td>target</td><td>TOS →</td><td>pop; jump if truthy</td></tr>
+<tr><td>10</td><td>JUMP_IF_NONE</td><td>target</td><td>TOS →</td><td>pop; jump if None</td></tr>
+<tr><td>11</td><td>JUMP_IF_NOT_NONE</td><td>target</td><td>TOS →</td><td>pop; jump if not None</td></tr>
+<tr><td>12</td><td>FOR_ITER</td><td>target</td><td>iter → value</td><td>advance; jump on StopIter</td></tr>
+<tr><td>13</td><td>GET_ITER</td><td>—</td><td>iterable → iterator</td><td><code>iter()</code></td></tr>
+<tr><td>14</td><td>RETURN_VALUE</td><td>—</td><td>TOS → return</td><td>pop + return</td></tr>
+<tr><td>15</td><td>RETURN_CONST</td><td>idx</td><td>→ return</td><td>return consts[idx]</td></tr>
+<tr><td>16</td><td>YIELD_VALUE</td><td>—</td><td>TOS → yield</td><td>generator yield</td></tr>
+<tr><td>17</td><td>RETURN_GENERATOR</td><td>—</td><td>—</td><td>mark generator; early return</td></tr>
+<tr><td>18</td><td>RAISE_VARARGS</td><td>argc</td><td>exc → raise</td><td>0/1/2 args</td></tr>
+<tr><td>30</td><td>SETUP_FINALLY</td><td>target</td><td>—</td><td>try-block (no-op in C)</td></tr>
+<tr><td>31</td><td>SETUP_WITH</td><td>target</td><td>mgr → exit_fn</td><td>with-block (no-op in C)</td></tr>
+</table>
+</div>
+</details>
+
+<details><summary>📐 Load / store (canonical 32-63)</summary>
+<div class="content">
+<table class="compact">
+<tr><th>val</th><th>name</th><th>arg</th><th>semantics</th></tr>
+<tr><td>32</td><td>LOAD_CONST</td><td>idx</td><td>push consts[idx]</td></tr>
+<tr><td>33</td><td>LOAD_FAST</td><td>idx</td><td>push locals[idx]</td></tr>
+<tr><td>35</td><td>LOAD_GLOBAL</td><td>name_idx</td><td>push globals[names[idx]] (NULL normalized)</td></tr>
+<tr><td>36</td><td>LOAD_DEREF</td><td>idx</td><td>push closure[idx]</td></tr>
+<tr><td>38</td><td>LOAD_ATTR</td><td>name_idx</td><td><code>getattr(obj, names[idx])</code></td></tr>
+<tr><td>40</td><td>STORE_FAST</td><td>idx</td><td>locals[idx] = pop</td></tr>
+<tr><td>41</td><td>STORE_GLOBAL</td><td>name_idx</td><td>globals[names[idx]] = pop</td></tr>
+<tr><td>46</td><td>COPY</td><td>depth</td><td>push stack[-depth-1]</td></tr>
+<tr><td>47</td><td>SWAP</td><td>depth</td><td>swap top & stack[-depth]</td></tr>
+<tr><td>53</td><td>UNPACK_SEQUENCE</td><td>count</td><td>seq → seq[0]..seq[count-1]</td></tr>
+<tr><td>55</td><td>STORE_ATTR</td><td>name_idx</td><td><code>setattr(obj, names[idx], pop)</code></td></tr>
+<tr><td>57</td><td>STORE_SUBSCR</td><td>—</td><td><code>obj[key] = pop</code></td></tr>
+<tr><td>59</td><td>BINARY_SUBSCR</td><td>—</td><td><code>obj[key]</code></td></tr>
+<tr><td>60</td><td>FORMAT_VALUE</td><td>flags</td><td>TOS → str (0=str,1=repr,2=ascii,0x4=has spec)</td></tr>
+<tr><td>61</td><td>BUILD_STRING</td><td>count</td><td>f-string join</td></tr>
+<tr><td>62</td><td>IMPORT_NAME</td><td>name_idx</td><td><code>__import__</code></td></tr>
+</table>
+</div>
+</details>
+
+<details><summary>📐 Building / function (canonical 64-95)</summary>
+<div class="content">
+<table class="compact">
+<tr><th>val</th><th>name</th><th>arg</th><th>semantics</th></tr>
+<tr><td>64</td><td>BUILD_TUPLE</td><td>count</td><td>→ tuple</td></tr>
+<tr><td>65</td><td>BUILD_LIST</td><td>count</td><td>→ list</td></tr>
+<tr><td>66</td><td>BUILD_SET</td><td>count</td><td>→ set</td></tr>
+<tr><td>67</td><td>BUILD_MAP</td><td>count</td><td>→ dict (2*count pairs)</td></tr>
+<tr><td>71</td><td>LIST_APPEND</td><td>idx</td><td>comprehension append (reads locals[idx])</td></tr>
+<tr><td>75</td><td>BUILD_SLICE</td><td>count</td><td>2 or 3 args → slice</td></tr>
+<tr><td>77</td><td>MAKE_FUNCTION</td><td>flags</td><td>code_obj → func (bit0=closure, bit1=defaults, bit2=kwdefaults)</td></tr>
+<tr><td>78</td><td>CALL</td><td>argc</td><td>callable, args → result</td></tr>
+<tr><td>79</td><td>CALL_KW</td><td>(argc<<8)|nkw</td><td>kwarg names from KW_NAMES</td></tr>
+<tr><td>80</td><td>CALL_FUNCTION_EX</td><td>flags</td><td>callable, args_tuple[, kwargs]</td></tr>
+<tr><td>81</td><td>KW_NAMES</td><td>const_idx</td><td>record kwarg names cho next CALL_KW</td></tr>
+</table>
+</div>
+</details>
+
+<details><summary>📐 Binary / unary / compare (canonical 96-127)</summary>
+<div class="content">
+<table class="compact">
+<tr><th>val</th><th>name</th><th>arg</th><th>semantics</th></tr>
+<tr><td>96</td><td>BINARY_OP</td><td>sub_op</td><td>a, b → (a OP b). Sub-ops: 0+,1-,2*,3/,4%,5//,6**,7<<,8>>,9&,10|,11^,25@</td></tr>
+<tr><td>97</td><td>UNARY_NEGATIVE</td><td>—</td><td>a → -a</td></tr>
+<tr><td>98</td><td>UNARY_NOT</td><td>—</td><td>a → not a</td></tr>
+<tr><td>99</td><td>UNARY_INVERT</td><td>—</td><td>a → ~a</td></tr>
+<tr><td>100</td><td>COMPARE_OP</td><td>cmp_op</td><td>0<,1<=,2==,3!=,4>,5>=,6 in,7 not in,8 is,9 is not</td></tr>
+<tr><td>101</td><td>IS_OP</td><td>invert</td><td>a is b (invert → is not)</td></tr>
+<tr><td>102</td><td>CONTAINS_OP</td><td>invert</td><td>b in a (invert → not in)</td></tr>
+<tr><td>104</td><td>BINARY_OP_INPLACE</td><td>sub_op</td><td>augmented assign (compute fresh)</td></tr>
+<tr><td>110</td><td>FORMAT_SIMPLE</td><td>—</td><td>TOS → str()</td></tr>
+<tr><td>111</td><td>FORMAT_WITH_SPEC</td><td>—</td><td>value, spec → format(value, spec)</td></tr>
+<tr><td>118</td><td>BEFORE_WITH</td><td>—</td><td>mgr → exit_fn (with-enter)</td></tr>
+<tr><td>125</td><td>UNARY_POSITIVE</td><td>—</td><td>a → +a</td></tr>
+</table>
+</div>
+</details>
+
+<h3>Per-build opcode permutation</h3>
+<p>Mỗi build generate bijection <code>perm: scrambled_byte → canonical_byte</code>. Blob chứa <strong>scrambled</strong> opcodes; interpreter de-scramble trên dispatch. Perm table <strong>không</strong> ở trong blob — nó ride trong <code>.py</code> loader như Python dict, passed riêng cho <code>run()</code>. <code>EXTENDED_ARG</code> (canonical 144) là fixed — scrambled byte <code>perm_ext</code> baked vào cả perm table lẫn interpreter.</p>
+<div class="callout callout-info">
+<strong>Consequence:</strong> 2 builds cùng source produce khác opcode bytes → static signature của build A không match build B. De-scramble cần perm, riêng biệt khỏi blob.
+</div>
+</section>
+
+<!-- BLOB -->
+<section id="vm-blob">
+<h2>13. Bytecode blob format</h2>
+<p>Little-endian. Base85-encoded vào output <code>.py</code> loader.</p>
+<table class="compact">
+<tr><th>Offset</th><th>Size</th><th>Field</th><th>Notes</th></tr>
+<tr><td>0</td><td>4</td><td>magic</td><td><code>b'BVM1'</code></td></tr>
+<tr><td>4</td><td>1</td><td>version</td><td><code>1</code></td></tr>
+<tr><td>5</td><td>4</td><td>flags</td><td>bit0: has_closure, bit1: is_generator, bit2: is_async</td></tr>
+<tr><td>9</td><td>4</td><td>argcount</td><td>số positional params</td></tr>
+<tr><td>13</td><td>4</td><td>kwonly_count</td><td>số keyword-only params</td></tr>
+<tr><td>17</td><td>4</td><td>nlocals</td><td>frame size (args + locals + cells)</td></tr>
+<tr><td>21</td><td>4</td><td>nconst</td><td>số constants (unused — consts from pickle)</td></tr>
+<tr><td>25</td><td>4</td><td>const_len</td><td>byte length of encrypted const pool</td></tr>
+<tr><td>29</td><td>const_len</td><td>const_pool</td><td>encrypted (SHA-256 OFB); pickle → tuple</td></tr>
+<tr><td>29+c</td><td>4</td><td>code_len</td><td>instruction count (patched bởi <code>_fix_code_len</code>)</td></tr>
+<tr><td>33+c</td><td>2*code_len</td><td>code</td><td>scrambled bytecode</td></tr>
+<tr><td>...</td><td>4</td><td>n_names</td><td>số global/cell names</td></tr>
+<tr><td>...</td><td>4</td><td>names_len</td><td>byte length of pickled names</td></tr>
+<tr><td>...</td><td>names_len</td><td>names_blob</td><td>pickle → 4-tuple (global_names, varnames, freevars, cellvars). <strong>Encrypted</strong> với <code>names_key = sha256(key + b'|names')</code> (SHA-256 OFB, length-preserving).</td></tr>
+</table>
+</section>
+
+<!-- CRYPTO -->
+<section id="crypto">
+<h2>14. Encryption — SHA-256 OFB</h2>
+<p>Symmetric (encrypt == decrypt). Reuses obfuscator's <code>_br_decrypt</code>. Áp dụng cho <strong>cả const pool VÀ names blob</strong>, nhưng với <strong>key khác nhau</strong> để tránh two-time pad.</p>
+<pre><code>state_0 = sha256(key).digest()
+state_n = sha256(state_{n-1} + key + bytes([offset & 255])).digest()
+ciphertext[i] = plaintext[i] ^ state_n[i % 32]</code></pre>
+<p><code>offset</code> = byte offset vào pool ở start của 32-byte keystream block. Mỗi block advance offset 32.</p>
+
+<div class="callout callout-warn">
+<strong>Two-time pad avoidance:</strong> const pool và names blob đều bắt đầu ở OFB offset 0. Nếu dùng cùng <code>key</code>, XOR hai ciphertext → <code>const_pickle XOR names_pickle</code> (exploitable vì names là structured pickle). Nên names blob dùng <strong>derived key</strong>:
+<pre style="margin-top:6px"><code>names_key = sha256(key + b'|names').digest()</code></pre>
+OFB length-preserving → <code>len(encrypted) == len(plaintext_pickle)</code>, nên <code>names_len</code> trong blob header không đổi. <code>key=b''</code> (test blobs): names stored plaintext (backward compat).
+</div>
+
+<h3>OFB cipher flow (visual)</h3>
+<div class="crypto-diagram reveal">
+<div class="crypto-row">
+<div class="crypto-box key">key (32 bytes)</div>
+<span class="crypto-arrow">→</span>
+<div class="crypto-box state">sha256</div>
+<span class="crypto-arrow">→</span>
+<div class="crypto-box state">state₀</div>
+<span class="crypto-arrow">⊕</span>
+<div class="crypto-box">plaintext[0:32]</div>
+<span class="crypto-arrow">=</span>
+<div class="crypto-box ct">ciphertext[0:32]</div>
+</div>
+<div class="crypto-arrow">↓</div>
+<div class="crypto-row">
+<div class="crypto-box state">sha256(state₀ + key + offset)</div>
+<span class="crypto-arrow">→</span>
+<div class="crypto-box state">state₁</div>
+<span class="crypto-arrow">⊕</span>
+<div class="crypto-box">plaintext[32:64]</div>
+<span class="crypto-arrow">=</span>
+<div class="crypto-box ct">ciphertext[32:64]</div>
+</div>
+<div class="crypto-arrow">↓</div>
+<div class="crypto-row"><div class="crypto-box" style="opacity:.6">... continues for each 32-byte block</div></div>
+</div>
+
+<div class="key-compare reveal">
+<div class="kc-panel const-pool">
+<h4>🔒 Const pool key</h4>
+<pre><code>const_key = key  # raw 32 bytes
+# Used for: consts tuple (pickle)
+# Keystream: state₀ = sha256(key)
+#            stateₙ = sha256(stateₙ₋₁ + key + offset)</code></pre>
+</div>
+<div class="kc-panel names-blob">
+<h4>🔒 Names blob key</h4>
+<pre><code>names_key = sha256(key + b'|names')
+# Used for: names tuple (pickle)
+# Keystream: state₀ = sha256(names_key)
+#            stateₙ = sha256(stateₙ₋₁ + names_key + offset)
+# DISTINCT keystream → no two-time pad</code></pre>
+</div>
+</div>
+
+<h3>Key derivation (32 bytes)</h3>
+<table>
+<tr><th>Mode</th><th>Formula</th><th>Notes</th></tr>
+<tr><td>Plain</td><td>random 32 bytes</td><td>Embedded trong C ext / passed as param. Never in blob.</td></tr>
+<tr><td>Chain</td><td><code>key = sha256(prev_tag + master + label).digest()</code></td><td>Tamper 1 VM func → corrupt tag + downstream keys</td></tr>
+<tr><td>Env-key</td><td><code>key ^= env32</code> (XOR-blind)</td><td><code>env32</code> = 32-byte HW fingerprint digest <code>__BedrockEnvKey__</code></td></tr>
+</table>
+
+<h3>Env-key XOR coupling</h3>
+<pre><code># Loader runtime:
+def _vm_derive_key(_raw):
+    _env = _vm_globals().get('__BedrockEnvKey__', b'')
+    if not _env:
+        return _raw  # no env-key → plain
+    _env32 = bytes((_env[i % len(_env)] if _env else 0) for i in range(32))
+    return bytes((a ^ b) for a, b in zip(_raw, _env32))</code></pre>
+<p>Build time: blob encrypted với <code>raw_key XOR hw_digest</code>. Raw key embedded trong <code>.py</code>. Runtime: loader re-XOR với live <code>__BedrockEnvKey__</code> → recover effective key. <strong>Mismatch HW → inert payload.</strong></p>
+</section>
+
+<!-- ANTI-DEBUG -->
+<section id="anti-debug">
+<h2>15. Anti-debug checks (30+ checks)</h2>
+<p>Mỗi check chạy trong isolated <code>try/except</code>, thứ tự (lines 2976-3085):</p>
+
+<details><summary>🔍 Integrity / injection detection</summary>
+<div class="content">
+<table class="compact">
+<tr><th>Check</th><th>Phát hiện</th><th>Reaction</th></tr>
+<tr><td><code>{integrity_fn}</code></td><td>Self-integrity: sha256(data + "|int") ≠ stored</td><td>self_destruct</td></tr>
+<tr><td><code>__h_check_self_integrity</code></td><td>File hash: sha256(masked + "|fh") ≠ __H_FILE_HASH__</td><td>self_destruct</td></tr>
+<tr><td><code>check_prepend</code></td><td>Head-of-file injection (import frida, settrace, marshal.loads, ...)</td><td>self_destruct</td></tr>
+<tr><td><code>check_append</code></td><td>Tail injection sau marker line</td><td>self_destruct</td></tr>
+<tr><td><code>check_loader_shape</code></td><td>Loader canary count + no one-liner</td><td>self_destruct</td></tr>
+</table>
+</div>
+</details>
+
+<details><summary>🔍 Debugger / trace detection</summary>
+<div class="content">
+<table class="compact">
+<tr><th>Check</th><th>Phát hiện</th><th>Reaction</th></tr>
+<tr><td><code>lock_trace</code></td><td>Neutralize trace/profile (install no-op, pinned by id() for identity re-verify)</td><td>pre-emptive</td></tr>
+<tr><td><code>check_debug</code></td><td>gettrace/getprofile module, imported dbg modules (pydevd/frida/debugpy/pdb/...), env vars (PYTHONINSPECT/BREAKPOINT), builtins.eval/exec hooked</td><td>abort</td></tr>
+<tr><td><code>check_stack</code></td><td>inspect.stack() filenames (pycdc/frida/ida/ghidra/gdb/...), depth > 96, ≥6 foreign frames</td><td>abort</td></tr>
+<tr><td><code>check_call_frames</code></td><td>stack frames: frida/pydevd/debugpy/mitmproxy/pyrasite/pyinjector/pydbg/winappdbg</td><td>abort</td></tr>
+<tr><td><code>check_stack_depth</code></td><td>sys._getframe() chain depth > 64</td><td>abort</td></tr>
+<tr><td><code>anti_inject_advanced</code></td><td>meta_path finder hooks (token-based + id()-snapshot verify), trace/profile re-verify by identity (not __name__), threading._trace_hook/_profile_hook re-verify, loader-layer sys.modules __name__ pre-filter, inspect.getsource guard, PYTHONSTARTUP/PYTHONPATH/sitecustomize scan, audit-hook (PEP 578) blocking frida/pydevd imports, late builtins re-verify</td><td>abort</td></tr>
+</table>
+</div>
+</details>
+
+<details><summary>🔍 Module / builtins / callable hooks</summary>
+<div class="content">
+<table class="compact">
+<tr><th>Check</th><th>Phát hiện</th><th>Reaction</th></tr>
+<tr><td><code>pin_callable</code></td><td>marshal.loads / zlib.decompress: not callable, wrong __module__, has __wrapped__</td><td>abort</td></tr>
+<tr><td><code>guard_marshal</code></td><td>marshal.loads hooked → seal fresh marshal module</td><td>abort</td></tr>
+<tr><td><code>check_builtins</code></td><td>__builtins__ replaced, 26 builtins not BuiltinFunctionType, 15 types not type</td><td>abort</td></tr>
+<tr><td><code>snapshot_builtins</code></td><td>Capture id() của 24 critical builtins</td><td>snapshot</td></tr>
+<tr><td><code>verify_builtins_snapshot</code></td><td>Re-read id() → mismatch = replacement</td><td>abort</td></tr>
+<tr><td><code>check_module_str</code></td><td>sys/os __name__ swapped, builtins.open not BuiltinFunctionType</td><td>abort</td></tr>
+<tr><td><code>snapshot_modules</code></td><td>Capture id() của 19 critical stdlib modules (sys/os/builtins/types/marshal/gc/hashlib/zlib/...)</td><td>snapshot</td></tr>
+<tr><td><code>verify_modules_snapshot</code></td><td>id() mismatch = module swap + authenticity: marshal.loads/zlib.decompress/binascii.a2b_base64/hashlib.sha256/time.time/gc.collect must be BuiltinFunctionType → catches Python-level trojan module</td><td>abort</td></tr>
+<tr><td><code>snapshot_metapath</code></td><td>Capture id()+type của sys.meta_path finders (post-defense baseline, includes bedrock's _HFinder)</td><td>snapshot</td></tr>
+<tr><td><code>verify_metapath_snapshot</code></td><td>New finder injected after baseline (id not in snapshot set) = layer-hijack attempt</td><td>abort</td></tr>
+</table>
+</div>
+</details>
+
+<details><summary>🔍 Network / MITM / proxy (Windows-focused)</summary>
+<div class="content">
+<table class="compact">
+<tr><th>Check</th><th>Phát hiện</th><th>Reaction</th></tr>
+<tr><td><code>check_net_modules</code></td><td>ssl/socket/urllib __file__ outside stdlib</td><td>abort</td></tr>
+<tr><td><code>seal_socket</code></td><td>socket.create_connection hooked</td><td>abort</td></tr>
+<tr><td><code>check_process_tools</code></td><td>tasklist: wireshark/fiddler/burp/charles/httptoolkit</td><td>abort</td></tr>
+<tr><td><code>check_sniffer</code></td><td>tasklist: wireshark/tcpdump/npcap/mitmproxy/ettercap</td><td>abort</td></tr>
+<tr><td><code>check_registry_proxy</code></td><td>HKCU ProxyEnable + ProxyServer (fiddler/burp/...)</td><td>abort</td></tr>
+<tr><td><code>check_http_toolkit</code></td><td>HTTP_TOOLKIT_ACTIVE, SSL_CERT_FILE, proxy env, localhost:8001 probe</td><td>abort</td></tr>
+<tr><td><code>check_requests</code></td><td>Deep: root path, id() sig, bytecode fingerprint (co_code|consts|names|varnames|freevars|exceptiontable), AST scan, __BedrockSession guard</td><td>abort</td></tr>
+<tr><td><code>install_embedded_net</code></td><td>Install XOR-keyed copy of requests+socket via custom meta_path finder</td><td>defense</td></tr>
+</table>
+</div>
+</details>
+
+<details><summary>🔍 Anti-VM / Anti-debugger v2 (separate snippets)</summary>
+<div class="content">
+<table class="compact">
+<tr><th>Check</th><th>Phát hiện</th><th>Reaction</th></tr>
+<tr><td><code>__bedrock_av_run</code></td><td>/proc/cpuinfo (vmware/qemu/hypervisor), DMI (virtualbox/kvm), MAC OUI (0x000569/000C29/...), hostname (cuckoo/sandbox), disk < 20GB, RAM < 1.5GB</td><td>warn/poison/self-destruct/fail-closed</td></tr>
+<tr><td><code>__bedrock_ad2_main</code></td><td>/proc/self/status TracerPid, parent comm (gdb/lldb/strace), gettrace()/getprofile(), PEP 669 sys.monitoring, TCP 127.0.0.1:27042 (frida-server), /proc/self/task/*/comm (gum-js-loop/gmain/linjector/frida)</td><td>warn/poison/self-destruct/fail-closed</td></tr>
+</table>
+</div>
+</details>
+</section>
+
+<!-- TAMPER -->
+<section id="tamper">
+<h2>16. Tamper modes (4 modes)</h2>
+<table>
+<tr><th>Mode</th><th><code>__bedrock_abort__</code></th><th><code>__bedrock_self_destruct__</code></th></tr>
+<tr><td><strong>warn</strong></td><td>Print msg, return (program keeps running)</td><td>Print msg, return</td></tr>
+<tr><td><strong>poison</strong></td><td>Print + <code>__h_poison('abort:...', 7)</code> + XOR state 0xCAFEBABE, return</td><td><code>__h_poison('destruct:...', 9)</code> + XOR 0xDEADBEEF, return</td></tr>
+<tr><td><strong>fail-closed</strong></td><td>Print + <code>raise SystemExit(1)</code></td><td><code>raise SystemExit(1)</code></td></tr>
+<tr><td><strong>self-destruct</strong> (default)</td><td>Print + <code>time.sleep(5)</code> + <code>os._exit(1)</code></td><td><strong>Overwrite <code>__file__</code> với no-op stub</strong> via os.replace, then <code>os._exit(1)</code></td></tr>
+</table>
+<div class="callout callout-warn">
+<strong><code>--debug-poison</code></strong> force <code>tamper_mode='poison'</code>: tất cả reactions route qua <code>__h_poison</code> (silent inert) thay vì exit. Artifact stays runnable, mọi downstream capsule decrypt to garbage.
+</div>
+</section>
+
+<!-- INTEGRITY -->
+<section id="integrity">
+<h2>17. Integrity / file-hash mechanism</h2>
+<p>2 hash tự tham chiếu, resolve ở build time bằng cách mask cả 2 → 64 dots trước khi compute. <code>__VM_EXTHASH__</code> (native-VM extension hash) cũng được mask để giữ file hash ổn định qua post-ship injection.</p>
+
+<h3>Hash cross-reference (visual)</h3>
+<div class="hash-diagram reveal">
+<div class="hash-circle">
+<div>
+<span class="hash-node file-hash">__H_FILE_HASH__</span>
+<span class="hash-mask">mask → 64 dots</span>
+<span class="hash-arrow">←→</span>
+<span class="hash-mask">mask → 64 dots</span>
+<span class="hash-node int-hash">integrity_var</span>
+</div>
+<div style="margin:8px 0">
+<span class="hash-arrow">↑</span>
+<span style="margin:0 20px">sha256(masked + "|fh")</span>
+<span class="hash-arrow">↑</span>
+<span style="margin:0 20px">sha256(masked + "|int")</span>
+</div>
+<div>
+<span class="hash-node ext-hash">__VM_EXTHASH__</span>
+<span class="hash-mask">mask → 64 dots</span>
+<span style="font-size:12px;color:var(--text2);margin-left:8px">(length-preserving: sentinel 64 chars → real hash 64 chars → file hash stays valid)</span>
+</div>
+</div>
+</div>
+
+<h3>Build time</h3>
+<pre><code>_masked = code.replace(integrity_placeholder, "."*64).replace(file_hash_placeholder, "."*64)
+_masked = _masked.replace(_vm_exthash_sentinel, "."*64)  # 64-char sentinel → dots
+integrity_hash = sha256((_masked + "|int").encode())   # salt "|int"
+file_hash    = sha256((_masked + "|fh").encode())      # salt "|fh"
+code = code.replace(integrity_placeholder, integrity_hash).replace(file_hash_placeholder, file_hash)</code></pre>
+<h3>Runtime</h3>
+<ul>
+<li><code>{integrity_fn}</code>: read <code>__file__</code>, mask integrity_var + <code>__H_FILE_HASH__</code> + <code>__VM_EXTHASH__</code> → 64 dots, check <code>sha256(data + "|int") == integrity_var_value</code></li>
+<li><code>__h_check_self_integrity</code>: mask <code>__H_FILE_HASH__</code> + integrity_var + <code>__VM_EXTHASH__</code> → dots, check <code>sha256(masked + "|fh") == __H_FILE_HASH__</code></li>
+</ul>
+<div class="callout callout-info">
+<strong>Cross-reference circle broken:</strong> vì cả 2 hash đều mask về dots trước khi compute, không hash nào depend vào literal value của hash kia.
+</div>
+<h3>.pyd integrity check (<code>--vm-fallback</code>)</h3>
+<p>Native mode ship <code>_xvm.pyd</code> alongside output. Post-ship, obfuscator patch plaintext header constant <code>__VM_EXTHASH__</code> (64-char sentinel → real SHA-256) trong <strong>binary mode</strong> (text mode sẽ convert <code>\n</code>→<code>\r\n</code> trên Windows, invalidate file hash). Loader verify tại runtime:</p>
+<pre><code>_vm_exthash = _vm_globals().get('__VM_EXTHASH__', '')
+if _vm_mod.__file__ endswith .pyd/.so and _vm_exthash is valid 64-hex:
+    _vm_actual = sha256(open(_vm_fp,'rb').read()).hexdigest()
+    _vm_verified = (_vm_actual == _vm_exthash)</code></pre>
+
+<h4>Integrity check flow (visual)</h4>
+<div class="pyd-flow reveal">
+<div class="pyd-step sentinel">Sentinel<br>(64 chars, compile time)</div>
+<span class="flow-arrow">→</span>
+<div class="pyd-step patch">Build .pyd<br>compute SHA-256</div>
+<span class="flow-arrow">→</span>
+<div class="pyd-step patch">Patch header<br>(binary mode)</div>
+<span class="flow-arrow">→</span>
+<div class="pyd-step verify">Runtime:<br>sha256(.pyd) ?</div>
+</div>
+<div class="pyd-flow" style="margin-top:4px">
+<span class="flow-arrow">↘</span>
+<div class="pyd-step pass">✅ Match → run via _xvm</div>
+<span style="margin:0 20px"></span>
+<div class="pyd-step fail">❌ Mismatch / missing</div>
+<span class="flow-arrow">↘</span>
+<div class="pyd-step poison">off: poison+abort<br>auto: warn+ref<br>dev: silent ref</div>
+</div>
+<table class="compact">
+<tr><th>Policy</th><th>.pyd missing/import-fail</th><th>Hash mismatch (tampered)</th><th>Reference .py import</th></tr>
+<tr><td><code>auto</code> (default)</td><td>warn + reference fallback</td><td>warn + reference fallback</td><td>skip check (✅)</td></tr>
+<tr><td><code>dev</code></td><td>silent reference fallback</td><td>silent reference fallback</td><td>skip check (✅)</td></tr>
+<tr><td><code>off</code> (extreme default)</td><td><strong>poison + SystemExit</strong> (fail-closed)</td><td><strong>poison + SystemExit</strong></td><td>skip check (✅)</td></tr>
+</table>
+<div class="callout callout-danger">
+<strong>Attacker không thể ép fallback Python:</strong> với <code>--vm-fallback off</code>, xóa/tamper <code>_xvm.pyd</code> → <code>__h_poison('vm_ext_tamper', 9)</code> + <code>raise SystemExit('VM extension integrity check failed')</code>. Payload abort thay vì degrade sang pure-Python reference interpreter.
+</div>
+</section>
+
+<!-- TRAPS -->
+<section id="traps">
+<h2>18. Anti-decompiler traps</h2>
+<table>
+<tr><th>Trap</th><th>Mô tả</th></tr>
+<tr><td><strong>ANTI_PYCDC block</strong></td><td>try/except/else/finally scaffold + XOR-decoded <code>__thesmartdog__</code> + self-calling echo × 140-320 + <code>dis.COMPILER_FLAG_NAMES</code> + <code>types.CodeType</code> references → bloat decompiler symbol table</td></tr>
+<tr><td><strong>N1 — var scaffolding</strong></td><td><code>try:(1/0, len+1, [][99], int("a",99), ...)\nexcept:0</code> × 1000 — crash pycdc expression recovery</td></tr>
+<tr><td><strong>N2 — opcode minefield</strong></td><td>Marshal 2 code objects (try/except, try/except* group) compile thành <code>PUSH_EXC_INFO</code>/<code>RERAISE</code>/<code>CHECK_EXC_MATCH</code> — pycdc aborts (zrax/pycdc #519, #514)</td></tr>
+<tr><td><strong>Spam generators</strong></td><td>9 templates (math/b64/xor/marshal/hash/mix/dyn/jail/vm). <code>jail</code> embeds JAILBREAK_PROMPTS. <code>vm</code> emits fake VM loop. <code>build_spam_block</code> packs ~MB decoys around payload</td></tr>
+<tr><td><strong>Random exception types</strong></td><td><code>_rand_spam_exc</code> picks từ 11 exception types (trước đây luôn MemoryError) → randomize fingerprint</td></tr>
+</table>
+</section>
+
+<!-- DEPLOY -->
+<section id="deploy">
+<h2>19. Deployment</h2>
+<h3>Build system (<code>_build_system.py</code>)</h3>
+<table>
+<tr><th>Function</th><th>Mô tả</th></tr>
+<tr><td><code>detect_build_capability()</code></td><td>Probe compiler (msvc via vswhere / gcc / clang), Python.h, setuptools → <code>{compiler, python_h, setuptools, can_build}</code></td></tr>
+<tr><td><code>build_and_ship(out_dir)</code></td><td>Build native → ship .pyd + ref.py. Fallback ref nếu no compiler / build fails. Return dict thêm <code>ext_hash</code> (SHA-256 của shipped .pyd, native mode) / <code>None</code> (reference mode)</td></tr>
+<tr><td><code>get_loader_snippet(..., vm_fallback=)</code></td><td>Emit loader source: path setup, module import + <strong>.pyd hash verify</strong> + fallback/poison/abort policy, <code>_vm_b85decode</code>, <code>bind_builtins</code>, <code>_vm_derive_key</code>, <code>_vm_bind</code>, <code>_vm_g</code>, <code>_vm_run</code></td></tr>
+</table>
+
+<h3>Loader snippet components</h3>
+<table class="compact">
+<tr><th>Component</th><th>Vai trò</th></tr>
+<tr><td><code>_vm_derive_key(_raw)</code></td><td>Env-key XOR blinding (or identity when off)</td></tr>
+<tr><td><code>_vm_bind(args, kw, varnames)</code></td><td>Bind kwargs vào positional tuple (C run() không nhận kw dict)</td></tr>
+<tr><td><code>_vm_g()</code></td><td>Build globals dict: <code>dict(globals()) + __builtins__</code> (VM LOAD_GLOBAL has no builtins fallback)</td></tr>
+<tr><td><code>_vm_run(blob, perm, key, args, g, pext)</code></td><td>Thin wrapper: <code>_vm_mod.run(...)</code>. debug-poison: try/except → poison</td></tr>
+<tr><td><code>bind_builtins</code></td><td>Bind range/bytes/zip/globals/len/max/tuple/enumerate từ __builtins__ → _vm_* (survive obf_builtins)</td></tr>
+<tr><td><code>_vm_fallback</code> + <code>_vm_exthash</code></td><td>.pyd integrity: import native → verify SHA-256 vs <code>__VM_EXTHASH__</code> header constant. <code>off</code>=poison+abort, <code>auto</code>=warn+ref, <code>dev</code>=silent ref</td></tr>
+</table>
+
+<h3>Output layout</h3>
+<pre><code>output_dir/
+├── payload.py                    # Obfuscated Python (loader + bytecode blobs)
+│   ├── __VM_EXTHASH__ = "..."    # 64-char .pyd SHA-256 (post-ship injected)
+│   └── _vm_exthash = _vm_globals().get('__VM_EXTHASH__', '')  # loader
+├── _xvm.cp311-win_amd64.pyd      # C interpreter (native mode)
+├── _bedrock_vm_ref.py            # Reference fallback (original name)
+└── _qmusyui_vm_ref.py            # Reference fallback (debranded name, anti-meta)
+
+# build_and_ship() return dict:
+{
+    'mode': 'native' | 'reference',
+    'module_name': '_xvm' | '_bedrock_vm_ref',
+    'module_path': '...',
+    'ext_hash': '64-hex' | None,  # SHA-256 of shipped .pyd (native only)
+    'detail': '...'
+}</code></pre>
+</section>
+
+<!-- PERF -->
+<section id="perf">
+<h2>20. Performance</h2>
+<div class="grid">
+<div class="card"><div class="num">3.6×</div><div class="lbl">C interpreter (vs plain Python)</div><p style="font-size:13px">14µs/call (fib(20) × 10k). Chấp nhận cho IP protection.</p></div>
+<div class="card"><div class="num">73×</div><div class="lbl">Reference interpreter</div><p style="font-size:13px">291µs/call. Fallback only — không cho hot paths.</p></div>
+<div class="card"><div class="num">4µs</div><div class="lbl">Plain Python baseline</div><p style="font-size:13px">fib(20) × 10k calls</p></div>
+</div>
+
+<h3>Call latency comparison (visual)</h3>
+<div class="perf-chart reveal">
+<div class="perf-bar-row">
+<div class="perf-bar-label">Plain Python</div>
+<div class="perf-bar-track"><div class="perf-bar-fill plain" data-width="1.4">4µs</div></div>
+</div>
+<div class="perf-bar-row">
+<div class="perf-bar-label">C interpreter</div>
+<div class="perf-bar-track"><div class="perf-bar-fill c-interp" data-width="4.8">14µs (3.6×)</div></div>
+</div>
+<div class="perf-bar-row">
+<div class="perf-bar-label">Reference interp.</div>
+<div class="perf-bar-track"><div class="perf-bar-fill ref-interp" data-width="100">291µs (73×)</div></div>
+</div>
+</div>
+
+<div class="callout callout-warn">
+<strong>Recommendation:</strong> VM-compile chỉ low-call-frequency entry points. Hot paths → capsule runtime (decrypt-on-call, ~no overhead).
+</div>
+
+<h3>Verification gates</h3>
+<div class="checklist reveal">
+<div class="checklist-item"><span class="check-icon">✅</span><span class="check-label">Oracle bytecodes</span><span class="check-result">10/10</span></div>
+<div class="checklist-item"><span class="check-icon">✅</span><span class="check-label">C interpreter vs reference</span><span class="check-result">10/10</span></div>
+<div class="checklist-item"><span class="check-icon">✅</span><span class="check-label">Compiler vs reference</span><span class="check-result">17/17</span></div>
+<div class="checklist-item"><span class="check-icon">✅</span><span class="check-label">Integration (compiler → C)</span><span class="check-result">17/17</span></div>
+<div class="checklist-item"><span class="check-icon">✅</span><span class="check-label">Build system</span><span class="check-result">11/11</span></div>
+<div class="checklist-item"><span class="check-icon">✅</span><span class="check-label">Phase 5 harness</span><span class="check-result">16/16</span></div>
+<div class="checklist-item"><span class="check-icon">✅</span><span class="check-label">VM-fallback + integrity</span><span class="check-result">9/9</span></div>
+<div class="checklist-item"><span class="check-icon">✅</span><span class="check-label">Real-world test</span><span class="check-result">9/9</span></div>
+</div>
+
+<hr>
+<p style="color:var(--text2);font-size:13px;text-align:center">
+Bedrock Obfuscator — Special technical spec. Generated from source analysis (~14.000 lines, 87 flags, 14 passes, 30+ checks).<br>
+Last updated: Phase 7.8 (VM-chain deadlock fix). Target: CPython 3.10-3.12, Windows x64 tested.
+</p>
+</section>
+
+</main>
+</div>
+
+<script>
+// === Active nav highlighting ===
+const sections = document.querySelectorAll('section');
+const navLinks = document.querySelectorAll('#nav a');
+window.addEventListener('scroll', () => {
+  let current = '';
+  sections.forEach(s => {
+    if (window.scrollY >= s.offsetTop - 100) current = s.id;
+  });
+  navLinks.forEach(a => {
+    a.classList.remove('section-active');
+    if (a.getAttribute('href') === '#' + current) a.classList.add('section-active');
+  });
+});
+
+// === Smooth scroll for nav links ===
+document.querySelectorAll('#nav a').forEach(a => {
+  a.addEventListener('click', e => {
+    e.preventDefault();
+    const target = document.querySelector(a.getAttribute('href'));
+    if (target) target.scrollIntoView({behavior:'smooth', block:'start'});
+  });
+});
+
+// === Counter animation (count-up on load) ===
+function animateCounter(el) {
+  const target = parseInt(el.dataset.count);
+  const prefix = el.dataset.prefix || '';
+  const suffix = el.dataset.suffix || '';
+  const duration = 1200;
+  const start = performance.now();
+  function tick(now) {
+    const elapsed = now - start;
+    const progress = Math.min(elapsed / duration, 1);
+    const eased = 1 - Math.pow(1 - progress, 3); // ease-out cubic
+    const value = Math.floor(target * eased);
+    el.textContent = prefix + value + suffix;
+    if (progress < 1) requestAnimationFrame(tick);
+    else el.textContent = prefix + target + suffix;
+  }
+  requestAnimationFrame(tick);
+}
+
+// === Reveal on scroll (IntersectionObserver) ===
+const revealObserver = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      entry.target.classList.add('visible');
+      // Trigger counters when hero is visible
+      entry.target.querySelectorAll('[data-count]').forEach(el => {
+        if (!el.dataset.animated) { el.dataset.animated = '1'; animateCounter(el); }
+      });
+      // Trigger bar chart fills when perf chart visible
+      entry.target.querySelectorAll('.perf-bar-fill').forEach(bar => {
+        bar.style.width = bar.dataset.width + '%';
+      });
+      revealObserver.unobserve(entry.target);
+    }
+  });
+}, {threshold:0.15});
+document.querySelectorAll('.reveal').forEach(el => revealObserver.observe(el));
+
+// Also trigger counters on the hero immediately (it's at top)
+document.querySelectorAll('.hero-v2 [data-count]').forEach(el => {
+  if (!el.dataset.animated) { el.dataset.animated = '1'; animateCounter(el); }
+});
+
+// === Showcase tab switching ===
+document.querySelectorAll('.showcase-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.showcase-tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.showcase-panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    const panel = document.getElementById('sc-' + tab.dataset.showcase);
+    if (panel) panel.classList.add('active');
+  });
+});
+
+// === Flag table search filter ===
+const flagSearch = document.getElementById('flag-search');
+if (flagSearch) {
+  flagSearch.addEventListener('input', () => {
+    const q = flagSearch.value.toLowerCase();
+    document.querySelectorAll('.flag-table tbody tr, .flag-table tr').forEach(row => {
+      if (row.querySelector('th')) return; // skip header
+      const text = row.textContent.toLowerCase();
+      row.classList.toggle('hidden', !text.includes(q));
+    });
+  });
+}
+
+// === Profile matrix column highlight ===
+document.querySelectorAll('.profile-matrix th').forEach((th, colIdx) => {
+  th.addEventListener('mouseenter', () => {
+    document.querySelectorAll('.profile-matrix tr').forEach(row => {
+      const cell = row.children[colIdx];
+      if (cell) cell.classList.add('highlight-col');
+    });
+  });
+  th.addEventListener('mouseleave', () => {
+    document.querySelectorAll('.profile-matrix td').forEach(cell => cell.classList.remove('highlight-col'));
+  });
+});
+</script>
+</body>
+</html>

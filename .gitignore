@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Cython generated C
+*.c.bak
+# (keep generated .c only if checked in; by default ignore)
+obf.c
+_test_realworld.c
+_test_*.c
+
+# Build / output artifacts (generated, not source)
+_ch_balanced/
+_ch_ext/
+_ch_ext2/
+_demo_rw/
+bedrock_challenge/
+challenge_v2_out/
+
+# Bundles / archives
+*.zip
+!bedrock_obfuscator.zip  # keep released bundles if desired
+
+# SaaS temp
+bedrock_saas/
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Backups (replaced by git history)
+*.bak.py
+*.pre*.bak.py

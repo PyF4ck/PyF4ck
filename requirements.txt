@@ -1,0 +1,10 @@
+fastapi>=0.100
+uvicorn>=0.40
+python-multipart>=0.0.6
+# Phase G (Layer 3) server key-release: X25519 ECDH + Ed25519 EdDSA JWT +
+# AES-GCM (cache + key wrapping). License-clean (Apache-2.0/BSD).
+cryptography>=41
+# OPTIONAL (never a hard dep): tiered TPM2 attestation. Importable only when
+# present; the system degrades gracefully to software HWID attestation when
+# absent. Install with: pip install tpm2-pytss
+#   tpm2-pytss
