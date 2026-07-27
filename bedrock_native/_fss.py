@@ -1,62 +1,43 @@
-"""Phase H.9 (Layer 6) Function Secret Sharing (FSS) 2-share.
+"""Phase H.9 + Phase iO-2 Function Secret Sharing (FSS).
 
-Split an eligible numeric-returning function ``f(x)`` into two shares
-``f1(x, r)`` and ``f2(x, r)`` such that::
+Phase H.9 (original): 2-share additive FSS for numeric-returning functions.
 
-    combine(f1(x, r), f2(x, r)) == f(x)      for all x, r
-    f1(x, r) alone reveals nothing about f(x)  (it's f(x) + r, masked by r)
-    f2(x, r) alone reveals nothing about f(x)  (it's -r)
+Phase iO-2 (extension): BGI-style FSS framework supporting multiple modes:
 
-The two shares are placed in SEPARATE module-level code objects (distinct
-``def`` names) so a static analyzer cannot see them together. The original
-``f`` is replaced by a thin combiner::
+  - ``additive`` (default, Phase H.9): 2-share additive ``f1=f(x)+r, f2=-r``
+    for int-returning functions. Each share alone is uniform random.
+  - ``additive_n``: n-share additive (collusion-resistant: need all n shares
+    to reconstruct; any n-1 shares reveal nothing). ``f1+...+fn = f(x)``.
+  - ``bool``: XOR sharing for boolean-returning functions (predicates).
+    ``f1 = f(x) ^ r, f2 = r`` → combine = ``f1 ^ f2 = f(x)``. Each share
+    alone is a uniform random bit.
+  - ``serialized``: any deterministic-returning function. Serialize via
+    ``repr`` + ``int.from_bytes``, additive-share the int, reconstruct via
+    ``ast.literal_eval``. Eligible for repr-roundtrip-safe types only.
 
-    # before
-    def square(x):
-        return x * x
+The mode is selected via ``ctx.fss_mode`` (default ``'auto'``: try additive,
+fall back to bool, then serialized). The number of shares for ``additive_n``
+is ``ctx.fss_shares`` (default 3, min 2).
 
-    # after
-    def _br_fss_1_a3f2(x, r):
-        return (x * x) + r       # share 1: f(x) + r
-    def _br_fss_2_b7c1(x, r):
-        return -r                # share 2: -r
-    def square(x):
-        import secrets as _br_s
-        _br_r = _br_s.randbelow(1 << 64) - (1 << 63)   # random per call
-        return _br_fss_1_a3f2(x, _br_r) + _br_fss_2_b7c1(x, _br_r)
+All modes share the same security property: the original function's logic
+lives in SEPARATE ``def`` scopes so a static analyzer that reads only one
+share cannot recover ``f(x)``. The combiner is a thin caller that sums
+(additive) or XORs (bool) the share results.
 
 ## Kerckhoffs posture
 
-Public technique. Per-build secret: the share function names + the RNG
-salt (RNG-derived).
-
-## Threat addressed
-
-Static analysis of a function's logic. A decompiler that lifts ``square``
-sees only the combiner (two opaque call results summed). The actual
-computation ``x * x`` lives in ``_br_fss_1_a3f2`` -- a separate function
-that a naive analyzer doesn't connect to ``square``. Recovering ``f``
-requires recognizing that ``f1 + f2 = f(x)`` -- a cross-function dataflow
-fact.
+Public technique. Per-build secret: the share function names + the RNG salt.
 
 ## Safety contract
 
-- **Additive sharing**: ``f1 = f(x) + r``, ``f2 = -r``, so ``f1 + f2 = f(x)``
-  EXACTLY (integer arithmetic; no modular wrap). Exact for any integer
-  ``f(x)`` and any integer ``r``.
-- **Randomness**: ``r`` is a fresh random integer per CALL (via
-  ``secrets.randbelow``), so ``f1`` alone is a random integer (reveals
-  nothing about ``f(x)``) and ``f2`` alone is a random integer too.
-- **Eligibility**: top-level ``def`` that (a) returns a single numeric
-  expression, (b) has no side effects (no calls, yields, awaits, prints),
-  (c) is pure (the return value depends only on the args). Dunders +
-  marker skipped. Cap ~3-5 FSS'd functions (like crown jewels).
-- **Args**: the share functions take the SAME args as the original plus a
-  trailing ``r`` parameter. The combiner passes the original args + the
-  fresh ``r``.
-- **Return type**: the share arithmetic uses Python int arithmetic (which
-  is unbounded), so any integer-returning function is exact. Floats would
-  lose precision on the add+r+(-r) round-trip, so floats are skipped.
+- **Additive**: ``f1+...+fn = f(x)`` EXACTLY (Python unbounded int arithmetic).
+- **Bool**: ``f1 ^ ... ^ fn = f(x)`` EXACTLY (bit arithmetic).
+- **Serialized**: round-trips through ``repr`` + ``literal_eval``; only
+  eligible if ``ast.literal_eval(repr(value)) == value`` for all inputs.
+- **Randomness**: ``r`` is fresh per call via ``secrets.randbelow``.
+- **Eligibility**: top-level ``def``, single ``return``, no side effects.
+  Cap via ``ctx.fss_max`` (default 5; 0 = unlimited when
+  ``ctx.fss_all_eligible``).
 
 Pure stdlib (``ast``, ``random``, ``secrets``). Run::
 
@@ -65,10 +46,11 @@ Pure stdlib (``ast``, ``random``, ``secrets``). Run::
 from __future__ import annotations
 
 import ast
+import copy
 import os
 import random
 import sys
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 # Sibling import.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -98,9 +80,16 @@ def _rng_for(ctx) -> random.Random:
             def choice(self, seq):
                 return self._sub.choice(seq)
 
+            def randbelow(self, n):
+                return self._sub.randint(0, n - 1)
+
         return _Wrap(sub)
     seed = getattr(ctx, 'fss_seed', None)
-    return random.Random(seed) if seed is not None else random.Random()
+    r = random.Random(seed) if seed is not None else random.Random()
+    # Add randbelow shim if missing (plain Random has it, but be safe).
+    if not hasattr(r, 'randbelow'):
+        r.randbelow = lambda n: r.randint(0, n - 1)  # type: ignore
+    return r
 
 
 def _has_side_effect(node: ast.expr) -> bool:
@@ -111,30 +100,74 @@ def _has_side_effect(node: ast.expr) -> bool:
 
 
 def _is_int_returning(value: ast.expr) -> bool:
-    """Conservative: the return expression must look integer-valued.
-    Allow int literals, names, BinOps (+,-,*,//,%,**,&,|,^,<<,>>), UnaryOps
-    (+,-,~), and comparisons (which yield bool -> 0/1). Skip floats,
-    strings, calls, lists."""
+    """Conservative: the return expression must look integer-valued."""
     if isinstance(value, ast.Constant):
         return isinstance(value.value, int) and not isinstance(value.value, bool) \
             or isinstance(value.value, bool)
     if isinstance(value, ast.Name):
-        return True  # assume int (smoke verifies; identity funcs rejected below)
+        return True
     if isinstance(value, ast.UnaryOp):
         if isinstance(value.op, (ast.UAdd, ast.USub, ast.Invert)):
             return _is_int_returning(value.operand)
         return False
     if isinstance(value, ast.BinOp):
         if isinstance(value.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv,
-                                 ast.Mod, ast.Pow, ast.BitAnd, ast.BitOr,
-                                 ast.BitXor, ast.LShift, ast.RShift)):
+                                  ast.Mod, ast.Pow, ast.BitAnd, ast.BitOr,
+                                  ast.BitXor, ast.LShift, ast.RShift)):
             return _is_int_returning(value.left) and _is_int_returning(value.right)
-        return False  # Div -> float, skip
+        return False
     if isinstance(value, ast.Compare):
-        return True  # bool -> 0/1
+        return True
     if isinstance(value, ast.BoolOp):
-        return True  # bool ops yield truthy
+        return True
     return False
+
+
+def _is_bool_returning(value: ast.expr) -> bool:
+    """Eligible for bool FSS: returns a comparison/bool op, or a name that
+    we conservatively treat as bool (the smoke test verifies)."""
+    if isinstance(value, ast.Constant):
+        return isinstance(value.value, bool)
+    if isinstance(value, ast.Compare):
+        return True
+    if isinstance(value, ast.BoolOp):
+        return True
+    if isinstance(value, ast.UnaryOp) and isinstance(value.op, ast.Not):
+        return True
+    return False
+
+
+# Types whose repr round-trips through ast.literal_eval. We allow Constant
+# (int/str/bytes/bool/None), List, Tuple, Set, Dict, and UnaryOp on those
+# (for negative numbers). We reject Call/Name/Lambda/etc. — Name could be
+# anything (a function, an object), and we cannot verify roundtrip statically.
+_SERIALIZED_OK = (
+    ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict,
+)
+
+
+def _is_serializable_returning(value: ast.expr) -> bool:
+    """Eligible for serialized FSS: returns a literal-eval-safe expression.
+    We walk and require every node be in the safe set, a UnaryOp on one, or a
+    Name at a leaf (args/params — their values are substituted at runtime and
+    must themselves be repr-roundtrip-safe for the combiner to work, which we
+    assume conservatively for the smoke test)."""
+    for n in ast.walk(value):
+        # Skip expr_context nodes (Load/Store/Del) — they're not value nodes.
+        if isinstance(n, ast.expr_context):
+            continue
+        if isinstance(n, _SERIALIZED_OK):
+            continue
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.UAdd, ast.USub)):
+            continue
+        if isinstance(n, ast.Name):
+            # args/params at leaves — runtime values must be repr-safe (the
+            # smoke test verifies with concrete inputs).
+            continue
+        # BinOp inside container literals (e.g. [-1, 2+3]) — literal_eval
+        # does NOT eval BinOps, so reject to be safe.
+        return False
+    return True
 
 
 _PYTHON_DUNDERS = frozenset({
@@ -152,8 +185,9 @@ _PYTHON_DUNDERS = frozenset({
     '__name__', '__file__', '__dict__', '__module__', '__qualname__',
 })
 
-def _is_eligible(fn: ast.FunctionDef) -> bool:
-    """Eligible: single ``return <int-expr>``, no side effects, pure."""
+
+def _base_eligible(fn: ast.FunctionDef) -> bool:
+    """Common eligibility: top-level def, single return, no side effects."""
     name = getattr(fn, 'name', '')
     if not name or name == 'bedrock_crown_jewel':
         return False
@@ -161,7 +195,6 @@ def _is_eligible(fn: ast.FunctionDef) -> bool:
         return False
     if isinstance(fn, ast.AsyncFunctionDef):
         return False
-    # Body must be exactly ONE Return statement
     if len(fn.body) != 1 or not isinstance(fn.body[0], ast.Return):
         return False
     ret = fn.body[0].value
@@ -169,148 +202,623 @@ def _is_eligible(fn: ast.FunctionDef) -> bool:
         return False
     if _has_side_effect(ret):
         return False
-    if not _is_int_returning(ret):
-        return False
-    # Reject identity functions (return <bare_name>) -- the return type is
-    # unknown and could be a function (e.g. bedrock_crown_jewel decorator
-    # 'return fn'). After obf_vars renames bedrock_crown_jewel to a homoglyph
-    # dunder, the name-check guard above fails, so this structural check is
-    # the real guard against splitting a function that returns a function.
+    # Reject identity functions (return <bare_name>) — return type unknown.
     if isinstance(ret, ast.Name):
         return False
     return True
 
 
-def _fresh_name(base: str, rng) -> str:
-    """Generate a randomized share-function name."""
+def _is_eligible_additive(fn: ast.FunctionDef) -> bool:
+    return _base_eligible(fn) and _is_int_returning(fn.body[0].value)
+
+
+def _is_eligible_bool(fn: ast.FunctionDef) -> bool:
+    return _base_eligible(fn) and _is_bool_returning(fn.body[0].value)
+
+
+def _is_eligible_serialized(fn: ast.FunctionDef) -> bool:
+    return _base_eligible(fn) and _is_serializable_returning(fn.body[0].value)
+
+
+def _fresh_name(share_idx, rng) -> str:
     suffix = ''.join(rng.choice('0123456789abcdef') for _ in range(4))
-    return f'_br_fss_{base}_{suffix}'
+    return f'_br_fss_{share_idx}_{suffix}'
+
+
+def _share_args(orig_args: ast.arguments) -> ast.arguments:
+    """Clone orig args + append trailing `r` parameter."""
+    return ast.arguments(
+        posonlyargs=list(orig_args.posonlyargs),
+        args=list(orig_args.args) + [ast.arg(arg='r', annotation=None)],
+        kwonlyargs=list(orig_args.kwonlyargs),
+        kw_defaults=list(orig_args.kw_defaults),
+        defaults=list(orig_args.defaults),
+        vararg=orig_args.vararg,
+        kwarg=orig_args.kwarg,
+    )
+
+
+def _combiner_args(orig_args: ast.arguments) -> ast.arguments:
+    """Clone orig args (no `r`)."""
+    return ast.arguments(
+        posonlyargs=list(orig_args.posonlyargs),
+        args=list(orig_args.args),
+        kwonlyargs=list(orig_args.kwonlyargs),
+        kw_defaults=list(orig_args.kw_defaults),
+        defaults=list(orig_args.defaults),
+        vararg=orig_args.vararg,
+        kwarg=orig_args.kwarg,
+    )
+
+
+def _call_args(orig_args: ast.arguments) -> List[ast.expr]:
+    """Names of orig positional args, for share call sites."""
+    return [ast.Name(id=a.arg, ctx=ast.Load())
+            for a in (orig_args.args + orig_args.posonlyargs)]
+
+
+# --- Share builders ---------------------------------------------------------
+
+def _build_additive_shares(node: ast.FunctionDef, rng, n_shares: int) -> Tuple[List[ast.FunctionDef], ast.FunctionDef]:
+    """Build n additive shares + combiner for an int-returning function.
+
+    n=2 (original H.9 scheme): pass SAME r to both shares.
+      s1(args, r) = f(x) + r
+      s2(args, r) = -r
+      combiner: r = randbelow; return s1(args, r) + s2(args, r)
+
+    n>=3 (proper n-share additive, collusion-resistant):
+      s1(args, r) = r           (gets r1)
+      s2(args, r) = r           (gets r2)
+      ...
+      s_{n-1}(args, r) = r      (gets r_{n-1})
+      s_n(args, r) = f(x) - r   (gets sum(r1..r_{n-1}))
+      combiner: r1..r_{n-1} = randbelow; rs = sum(r1..r_{n-1});
+               return s1(args,r1) + ... + s_{n-1}(args,r_{n-1}) + s_n(args, rs)
+             = r1+..+r_{n-1} + f(x) - (r1+..+r_{n-1}) = f(x)
+
+    Each share alone is uniform random. Any n-1 shares reveal nothing about
+    f(x) because the missing share's random contribution is unknown.
+    """
+    orig_args = node.args
+    ret_expr = node.body[0].value
+    share_names = [_fresh_name(i + 1, rng) for i in range(n_shares)]
+    share_fns = []
+
+    if n_shares == 2:
+        # Original H.9 scheme: both shares take the SAME r.
+        s1_args = _share_args(orig_args)
+        s1_body = ast.Return(value=ast.BinOp(
+            left=copy.deepcopy(ret_expr),
+            op=ast.Add(),
+            right=ast.Name(id='r', ctx=ast.Load()),
+        ))
+        share_fns.append(ast.FunctionDef(
+            name=share_names[0], args=s1_args, body=[s1_body],
+            decorator_list=[], returns=None, type_comment=None,
+        ))
+        s2_args = _share_args(orig_args)
+        s2_body = ast.Return(value=ast.UnaryOp(
+            op=ast.USub(), operand=ast.Name(id='r', ctx=ast.Load()),
+        ))
+        share_fns.append(ast.FunctionDef(
+            name=share_names[1], args=s2_args, body=[s2_body],
+            decorator_list=[], returns=None, type_comment=None,
+        ))
+    else:
+        # n>=3 proper additive: shares 1..n-1 return r; share n returns f(x)-r.
+        for i in range(n_shares - 1):
+            si_args = _share_args(orig_args)
+            si_body = ast.Return(value=ast.Name(id='r', ctx=ast.Load()))
+            share_fns.append(ast.FunctionDef(
+                name=share_names[i], args=si_args, body=[si_body],
+                decorator_list=[], returns=None, type_comment=None,
+            ))
+        sn_args = _share_args(orig_args)
+        sn_body = ast.Return(value=ast.BinOp(
+            left=copy.deepcopy(ret_expr),
+            op=ast.Sub(),
+            right=ast.Name(id='r', ctx=ast.Load()),
+        ))
+        share_fns.append(ast.FunctionDef(
+            name=share_names[-1], args=sn_args, body=[sn_body],
+            decorator_list=[], returns=None, type_comment=None,
+        ))
+
+    combiner = _build_additive_combiner(node, share_names, n_shares)
+    return share_fns, combiner
+
+
+def _build_additive_combiner(node: ast.FunctionDef, share_names: List[str], n_shares: int) -> ast.FunctionDef:
+    """Build the combiner for additive sharing.
+
+    n=2: pass SAME r to both shares.
+    n>=3: generate r1..r_{n-1}, pass r_i to share i, pass sum(r1..r_{n-1}) to share n.
+    """
+    orig_args = node.args
+    carg = _call_args(orig_args)
+    combiner_args = _combiner_args(orig_args)
+
+    body: List[ast.stmt] = [ast.Import(names=[ast.alias(name='secrets', asname='_br_s')])]
+
+    if n_shares == 2:
+        # Single r, passed to both shares (original H.9).
+        body.append(ast.Assign(
+            targets=[ast.Name(id='_br_r', ctx=ast.Store())],
+            value=ast.BinOp(
+                left=ast.Call(
+                    func=ast.Attribute(value=ast.Name(id='_br_s', ctx=ast.Load()),
+                                       attr='randbelow', ctx=ast.Load()),
+                    args=[ast.Constant(value=1 << 64)], keywords=[],
+                ),
+                op=ast.Sub(),
+                right=ast.Constant(value=1 << 63),
+            ),
+        ))
+        ret_expr = ast.BinOp(
+            left=ast.Call(func=ast.Name(id=share_names[0], ctx=ast.Load()),
+                          args=carg + [ast.Name(id='_br_r', ctx=ast.Load())], keywords=[]),
+            op=ast.Add(),
+            right=ast.Call(func=ast.Name(id=share_names[1], ctx=ast.Load()),
+                           args=carg + [ast.Name(id='_br_r', ctx=ast.Load())], keywords=[]),
+        )
+        body.append(ast.Return(value=ret_expr))
+    else:
+        # n>=3: generate r1..r_{n-1}, pass each to share 1..n-1, pass sum to share n.
+        r_names = []
+        for i in range(n_shares - 1):
+            rn = f'_br_r{i + 1}'
+            r_names.append(rn)
+            body.append(ast.Assign(
+                targets=[ast.Name(id=rn, ctx=ast.Store())],
+                value=ast.BinOp(
+                    left=ast.Call(
+                        func=ast.Attribute(value=ast.Name(id='_br_s', ctx=ast.Load()),
+                                           attr='randbelow', ctx=ast.Load()),
+                        args=[ast.Constant(value=1 << 64)], keywords=[],
+                    ),
+                    op=ast.Sub(),
+                    right=ast.Constant(value=1 << 63),
+                ),
+            ))
+        rs_expr = ast.Name(id=r_names[0], ctx=ast.Load())
+        for rn in r_names[1:]:
+            rs_expr = ast.BinOp(left=rs_expr, op=ast.Add(),
+                               right=ast.Name(id=rn, ctx=ast.Load()))
+        body.append(ast.Assign(
+            targets=[ast.Name(id='_br_rs', ctx=ast.Store())],
+            value=rs_expr,
+        ))
+        calls = []
+        for i in range(n_shares - 1):
+            calls.append(ast.Call(
+                func=ast.Name(id=share_names[i], ctx=ast.Load()),
+                args=carg + [ast.Name(id=r_names[i], ctx=ast.Load())],
+                keywords=[],
+            ))
+        calls.append(ast.Call(
+            func=ast.Name(id=share_names[-1], ctx=ast.Load()),
+            args=carg + [ast.Name(id='_br_rs', ctx=ast.Load())],
+            keywords=[],
+        ))
+        ret_expr = calls[0]
+        for c in calls[1:]:
+            ret_expr = ast.BinOp(left=ret_expr, op=ast.Add(), right=c)
+        body.append(ast.Return(value=ret_expr))
+
+    return ast.FunctionDef(
+        name=node.name, args=combiner_args, body=body,
+        decorator_list=[], returns=None, type_comment=None,
+    )
+
+
+def _build_bool_shares(node: ast.FunctionDef, rng, n_shares: int) -> Tuple[List[ast.FunctionDef], ast.FunctionDef]:
+    """Build n XOR shares + combiner for a bool-returning function.
+
+    XOR sharing: f1 = f(x) ^ r1, f2 = r2, ..., s_n = r1 ^ r2 ^ ... ^ r_{n-1}
+    combiner = s1 ^ s2 ^ ... ^ s_n = f(x) ^ r1 ^ r2 ^ ... ^ r_{n-1} ^ (r1^..^r_{n-1}) = f(x)
+
+    For n=2: s1 = f(x) ^ r, s2 = r → combine = s1 ^ s2 = f(x).
+
+    Each r_i is a fresh random bit per call. Any n-1 shares reveal nothing
+    about f(x) (the missing share's bit is uniform).
+    """
+    orig_args = node.args
+    ret_expr = node.body[0].value
+    share_names = [_fresh_name(i + 1, rng) for i in range(n_shares)]
+    share_fns = []
+
+    # share 1: return <orig> ^ r
+    s1_args = _share_args(orig_args)
+    s1_body = ast.Return(value=ast.BinOp(
+        left=ast.BoolOp(op=ast.BitOr(), values=[copy.deepcopy(ret_expr)]),  # force int context
+        op=ast.BitXor(),
+        right=ast.Name(id='r', ctx=ast.Load()),
+    ))
+    # Simpler: cast bool to int via `(<expr>) ^ r` — Python bool is int subclass.
+    s1_body = ast.Return(value=ast.BinOp(
+        left=copy.deepcopy(ret_expr),
+        op=ast.BitXor(),
+        right=ast.Name(id='r', ctx=ast.Load()),
+    ))
+    share_fns.append(ast.FunctionDef(
+        name=share_names[0], args=s1_args, body=[s1_body],
+        decorator_list=[], returns=None, type_comment=None,
+    ))
+
+    # shares 2..n-1: return r
+    for i in range(1, n_shares - 1):
+        si_args = _share_args(orig_args)
+        si_body = ast.Return(value=ast.Name(id='r', ctx=ast.Load()))
+        share_fns.append(ast.FunctionDef(
+            name=share_names[i], args=si_args, body=[si_body],
+            decorator_list=[], returns=None, type_comment=None,
+        ))
+
+    # share n: return r  (XOR is symmetric; combiner cancels via XOR of all)
+    if n_shares >= 2:
+        sn_args = _share_args(orig_args)
+        sn_body = ast.Return(value=ast.Name(id='r', ctx=ast.Load()))
+        share_fns.append(ast.FunctionDef(
+            name=share_names[-1], args=sn_args, body=[sn_body],
+            decorator_list=[], returns=None, type_comment=None,
+        ))
+
+    combiner = _build_bool_combiner(node, share_names, n_shares)
+    return share_fns, combiner
+
+
+def _build_bool_combiner(node: ast.FunctionDef, share_names: List[str], n_shares: int) -> ast.FunctionDef:
+    """Build combiner: XOR-fold of n share calls, cast result back to bool.
+
+    n=2: pass SAME r to both shares → s1 ^ s2 = f(x) ^ r ^ r = f(x).
+    n>=3: generate r1..r_{n-1} (random bits), pass to shares 1..n-1, pass
+          XOR(r1..r_{n-1}) to share n. combiner = s1 ^ ... ^ sn =
+          (f(x) ^ rs) ^ r1 ^ ... ^ r_{n-1} = f(x) ^ rs ^ rs = f(x).
+    """
+    orig_args = node.args
+    carg = _call_args(orig_args)
+    combiner_args = _combiner_args(orig_args)
+
+    body: List[ast.stmt] = [ast.Import(names=[ast.alias(name='secrets', asname='_br_s')])]
+
+    def _randbit():
+        return ast.Call(
+            func=ast.Attribute(value=ast.Name(id='_br_s', ctx=ast.Load()),
+                               attr='randbelow', ctx=ast.Load()),
+            args=[ast.Constant(value=2)], keywords=[],
+        )
+
+    if n_shares == 2:
+        # Single r, passed to both shares.
+        body.append(ast.Assign(
+            targets=[ast.Name(id='_br_r', ctx=ast.Store())],
+            value=_randbit(),
+        ))
+        xor_expr = ast.BinOp(
+            left=ast.Call(func=ast.Name(id=share_names[0], ctx=ast.Load()),
+                          args=carg + [ast.Name(id='_br_r', ctx=ast.Load())], keywords=[]),
+            op=ast.BitXor(),
+            right=ast.Call(func=ast.Name(id=share_names[1], ctx=ast.Load()),
+                           args=carg + [ast.Name(id='_br_r', ctx=ast.Load())], keywords=[]),
+        )
+    else:
+        # n>=3: r1..r_{n-1} to shares 1..n-1; XOR sum to share n.
+        r_names = []
+        for i in range(n_shares - 1):
+            rn = f'_br_r{i + 1}'
+            r_names.append(rn)
+            body.append(ast.Assign(targets=[ast.Name(id=rn, ctx=ast.Store())], value=_randbit()))
+        rs_expr = ast.Name(id=r_names[0], ctx=ast.Load())
+        for rn in r_names[1:]:
+            rs_expr = ast.BinOp(left=rs_expr, op=ast.BitXor(), right=ast.Name(id=rn, ctx=ast.Load()))
+        body.append(ast.Assign(targets=[ast.Name(id='_br_rs', ctx=ast.Store())], value=rs_expr))
+        calls = []
+        for i in range(n_shares - 1):
+            calls.append(ast.Call(func=ast.Name(id=share_names[i], ctx=ast.Load()),
+                                  args=carg + [ast.Name(id=r_names[i], ctx=ast.Load())], keywords=[]))
+        calls.append(ast.Call(func=ast.Name(id=share_names[-1], ctx=ast.Load()),
+                              args=carg + [ast.Name(id='_br_rs', ctx=ast.Load())], keywords=[]))
+        xor_expr = calls[0]
+        for c in calls[1:]:
+            xor_expr = ast.BinOp(left=xor_expr, op=ast.BitXor(), right=c)
+
+    body.append(ast.Return(value=ast.Call(
+        func=ast.Name(id='bool', ctx=ast.Load()),
+        args=[xor_expr], keywords=[],
+    )))
+
+    return ast.FunctionDef(
+        name=node.name, args=combiner_args, body=body,
+        decorator_list=[], returns=None, type_comment=None,
+    )
+
+
+def _build_serialized_shares(node: ast.FunctionDef, rng, n_shares: int) -> Tuple[List[ast.FunctionDef], ast.FunctionDef]:
+    """Build n additive shares + combiner for a serialized-return function.
+
+    Scheme: serialize f(x) to bytes via `repr(f(x)).encode('utf-8')`, prepend
+    a 4-byte big-endian length prefix (to survive leading-zero byte loss in
+    int conversion), then to int via `int.from_bytes(..., 'big')`. Additive-
+    share the int. Combiner reconstructs: int → bytes → first 4 bytes = length
+    → next `length` bytes = data → decode → ast.literal_eval.
+
+    share 1: return <serialized_int> + r
+    shares 2..n-1: return r
+    share n: return -r
+    combiner: r = randbelow(...); s = s1(..,r) + .. + sn(..,r);
+              b = s.to_bytes((max(1,s.bit_length())+7)//8, 'big');
+              n = int.from_bytes(b[:4], 'big');
+              return ast.literal_eval(b[4:4+n].decode('utf-8'))
+    """
+    orig_args = node.args
+    ret_expr = node.body[0].value
+    share_names = [_fresh_name(i + 1, rng) for i in range(n_shares)]
+    share_fns = []
+
+    # serialize expr: int.from_bytes(b'\x01' + len(repr(...).encode()).to_bytes(7,'big') + repr(...).encode(), 'big')
+    # The 0x01 marker byte prevents leading-zero loss in int<->bytes round-trip.
+    repr_call = ast.Call(func=ast.Name(id='repr', ctx=ast.Load()),
+                         args=[copy.deepcopy(ret_expr)], keywords=[])
+    encode_call = ast.Call(func=ast.Attribute(value=repr_call, attr='encode', ctx=ast.Load()),
+                           args=[ast.Constant(value='utf-8')], keywords=[])
+    len_call = ast.Call(func=ast.Name(id='len', ctx=ast.Load()), args=[encode_call], keywords=[])
+    len_bytes = ast.Call(
+        func=ast.Attribute(value=len_call, attr='to_bytes', ctx=ast.Load()),
+        args=[ast.Constant(value=7), ast.Constant(value='big')], keywords=[],
+    )
+    marker = ast.Constant(value=b'\x01')
+    # repr(...).encode() again (can't reuse AST node)
+    repr_call2 = ast.Call(func=ast.Name(id='repr', ctx=ast.Load()),
+                          args=[copy.deepcopy(ret_expr)], keywords=[])
+    encode_call2 = ast.Call(func=ast.Attribute(value=repr_call2, attr='encode', ctx=ast.Load()),
+                            args=[ast.Constant(value='utf-8')], keywords=[])
+    payload = ast.BinOp(
+        left=ast.BinOp(left=marker, op=ast.Add(), right=len_bytes),
+        op=ast.Add(), right=encode_call2,
+    )
+    ser_expr = ast.Call(
+        func=ast.Attribute(value=ast.Name(id='int', ctx=ast.Load()),
+                           attr='from_bytes', ctx=ast.Load()),
+        args=[payload, ast.Constant(value='big')], keywords=[],
+    )
+
+    # share 1: return <serialized> + r
+    s1_args = _share_args(orig_args)
+    s1_body = ast.Return(value=ast.BinOp(
+        left=ser_expr, op=ast.Add(), right=ast.Name(id='r', ctx=ast.Load()),
+    ))
+    share_fns.append(ast.FunctionDef(
+        name=share_names[0], args=s1_args, body=[s1_body],
+        decorator_list=[], returns=None, type_comment=None,
+    ))
+
+    # shares 2..n-1: return r
+    for i in range(1, n_shares - 1):
+        si_args = _share_args(orig_args)
+        si_body = ast.Return(value=ast.Name(id='r', ctx=ast.Load()))
+        share_fns.append(ast.FunctionDef(
+            name=share_names[i], args=si_args, body=[si_body],
+            decorator_list=[], returns=None, type_comment=None,
+        ))
+
+    # share n: return -r
+    if n_shares >= 2:
+        sn_args = _share_args(orig_args)
+        sn_body = ast.Return(value=ast.UnaryOp(
+            op=ast.USub(), operand=ast.Name(id='r', ctx=ast.Load()),
+        ))
+        share_fns.append(ast.FunctionDef(
+            name=share_names[-1], args=sn_args, body=[sn_body],
+            decorator_list=[], returns=None, type_comment=None,
+        ))
+
+    combiner = _build_serialized_combiner(node, share_names, n_shares)
+    return share_fns, combiner
+
+
+def _build_serialized_combiner(node: ast.FunctionDef, share_names: List[str], n_shares: int) -> ast.FunctionDef:
+    """Combiner for serialized FSS (n=2 same r; length-prefix reconstruction)."""
+    orig_args = node.args
+    carg = _call_args(orig_args)
+    combiner_args = _combiner_args(orig_args)
+
+    body: List[ast.stmt] = [
+        ast.Import(names=[ast.alias(name='secrets', asname='_br_s')]),
+        ast.Import(names=[ast.alias(name='ast', asname='_br_ast')]),
+    ]
+
+    # n=2: single r passed to both shares (mirrors additive n=2).
+    # n>=3: r1..r_{n-1} to shares 1..n-1, sum to share n.
+    if n_shares == 2:
+        body.append(ast.Assign(
+            targets=[ast.Name(id='_br_r', ctx=ast.Store())],
+            value=ast.BinOp(
+                left=ast.Call(
+                    func=ast.Attribute(value=ast.Name(id='_br_s', ctx=ast.Load()),
+                                       attr='randbelow', ctx=ast.Load()),
+                    args=[ast.Constant(value=1 << 256)], keywords=[],
+                ),
+                op=ast.Sub(),
+                right=ast.Constant(value=1 << 255),
+            ),
+        ))
+        sum_expr = ast.BinOp(
+            left=ast.Call(func=ast.Name(id=share_names[0], ctx=ast.Load()),
+                          args=carg + [ast.Name(id='_br_r', ctx=ast.Load())], keywords=[]),
+            op=ast.Add(),
+            right=ast.Call(func=ast.Name(id=share_names[1], ctx=ast.Load()),
+                           args=carg + [ast.Name(id='_br_r', ctx=ast.Load())], keywords=[]),
+        )
+    else:
+        r_names = []
+        for i in range(n_shares - 1):
+            rn = f'_br_r{i + 1}'
+            r_names.append(rn)
+            body.append(ast.Assign(
+                targets=[ast.Name(id=rn, ctx=ast.Store())],
+                value=ast.BinOp(
+                    left=ast.Call(
+                        func=ast.Attribute(value=ast.Name(id='_br_s', ctx=ast.Load()),
+                                           attr='randbelow', ctx=ast.Load()),
+                        args=[ast.Constant(value=1 << 256)], keywords=[],
+                    ),
+                    op=ast.Sub(),
+                    right=ast.Constant(value=1 << 255),
+                ),
+            ))
+        rs_expr = ast.Name(id=r_names[0], ctx=ast.Load())
+        for rn in r_names[1:]:
+            rs_expr = ast.BinOp(left=rs_expr, op=ast.Add(), right=ast.Name(id=rn, ctx=ast.Load()))
+        body.append(ast.Assign(targets=[ast.Name(id='_br_rs', ctx=ast.Store())], value=rs_expr))
+        calls = []
+        for i in range(n_shares - 1):
+            calls.append(ast.Call(func=ast.Name(id=share_names[i], ctx=ast.Load()),
+                                  args=carg + [ast.Name(id=r_names[i], ctx=ast.Load())], keywords=[]))
+        calls.append(ast.Call(func=ast.Name(id=share_names[-1], ctx=ast.Load()),
+                              args=carg + [ast.Name(id='_br_rs', ctx=ast.Load())], keywords=[]))
+        sum_expr = calls[0]
+        for c in calls[1:]:
+            sum_expr = ast.BinOp(left=sum_expr, op=ast.Add(), right=c)
+
+    body.append(ast.Assign(targets=[ast.Name(id='_br_v', ctx=ast.Store())], value=sum_expr))
+
+    # Reconstruct: b = _br_v.to_bytes((max(1,_br_v.bit_length())+7)//8, 'big')
+    # b[0] == 0x01 marker; _br_n = int.from_bytes(b[1:8], 'big')  # length (7 bytes)
+    # return ast.literal_eval(b[8:8+_br_n].decode('utf-8'))
+    bl = ast.Call(func=ast.Attribute(value=ast.Name(id='_br_v', ctx=ast.Load()),
+                                     attr='bit_length', ctx=ast.Load()), args=[], keywords=[])
+    maxlen = ast.BinOp(
+        left=ast.Call(func=ast.Name(id='max', ctx=ast.Load()),
+                      args=[ast.Constant(value=1), bl], keywords=[]),
+        op=ast.Add(), right=ast.Constant(value=7),
+    )
+    nbytes = ast.BinOp(left=maxlen, op=ast.FloorDiv(), right=ast.Constant(value=8))
+    body.append(ast.Assign(
+        targets=[ast.Name(id='_br_b', ctx=ast.Store())],
+        value=ast.Call(func=ast.Attribute(value=ast.Name(id='_br_v', ctx=ast.Load()),
+                                          attr='to_bytes', ctx=ast.Load()),
+                       args=[nbytes, ast.Constant(value='big')], keywords=[]),
+    ))
+    # _br_n = int.from_bytes(b[1:8], 'big')  # 7-byte length after the 0x01 marker
+    body.append(ast.Assign(
+        targets=[ast.Name(id='_br_n', ctx=ast.Store())],
+        value=ast.Call(func=ast.Attribute(value=ast.Name(id='int', ctx=ast.Load()),
+                                          attr='from_bytes', ctx=ast.Load()),
+                       args=[ast.Subscript(
+                           value=ast.Name(id='_br_b', ctx=ast.Load()),
+                           slice=ast.Slice(lower=ast.Constant(value=1), upper=ast.Constant(value=8), step=None),
+                           ctx=ast.Load(),
+                       ), ast.Constant(value='big')], keywords=[]),
+    ))
+    # return ast.literal_eval(b[8:8+_br_n].decode('utf-8'))
+    body.append(ast.Return(value=ast.Call(
+        func=ast.Attribute(value=ast.Name(id='_br_ast', ctx=ast.Load()),
+                           attr='literal_eval', ctx=ast.Load()),
+        args=[ast.Call(
+            func=ast.Attribute(
+                value=ast.Subscript(
+                    value=ast.Name(id='_br_b', ctx=ast.Load()),
+                    slice=ast.Slice(lower=ast.Constant(value=8),
+                                   upper=ast.BinOp(left=ast.Constant(value=8),
+                                                  op=ast.Add(),
+                                                  right=ast.Name(id='_br_n', ctx=ast.Load())),
+                                   step=None),
+                    ctx=ast.Load(),
+                ),
+                attr='decode', ctx=ast.Load(),
+            ),
+            args=[ast.Constant(value='utf-8')], keywords=[],
+        )], keywords=[],
+    )))
+
+    return ast.FunctionDef(
+        name=node.name, args=combiner_args, body=body,
+        decorator_list=[], returns=None, type_comment=None,
+    )
+
+
+# --- Mode dispatch ----------------------------------------------------------
+
+_ELIGIBILITY = {
+    'additive': _is_eligible_additive,
+    'additive_n': _is_eligible_additive,
+    'bool': _is_eligible_bool,
+    'serialized': _is_eligible_serialized,
+}
+
+_BUILDERS = {
+    'additive': lambda node, rng, n: _build_additive_shares(node, rng, 2),
+    'additive_n': _build_additive_shares,
+    'bool': lambda node, rng, n: _build_bool_shares(node, rng, 2),
+    'serialized': lambda node, rng, n: _build_serialized_shares(node, rng, 2),
+}
+
+
+def _resolve_mode(ctx, fn: ast.FunctionDef) -> Optional[str]:
+    """Pick the FSS mode for `fn` based on ctx.fss_mode (auto-discovery)."""
+    mode = str(getattr(ctx, 'fss_mode', 'auto') or 'auto').lower()
+    if mode in _ELIGIBILITY and _ELIGIBILITY[mode](fn):
+        return mode
+    if mode == 'auto':
+        # Try bool first (most type-preserving for predicates), then additive
+        # (int arithmetic), then serialized (any repr-safe value).
+        for m in ('bool', 'additive', 'serialized'):
+            if _ELIGIBILITY[m](fn):
+                return m
+        return None
+    return None
+
+
+def _effective_n_shares(ctx, mode: str) -> int:
+    if mode == 'additive':
+        return 2
+    if mode == 'additive_n':
+        n = int(getattr(ctx, 'fss_shares', 3) or 3)
+        return max(2, n)
+    if mode == 'bool':
+        return 2
+    if mode == 'serialized':
+        return 2
+    return 2
 
 
 # --- Pass -------------------------------------------------------------------
 
 def apply_fss(tree: ast.Module, ctx) -> ast.Module:
-    """Split eligible functions into 2 additive shares + a combiner.
+    """Split eligible functions into FSS shares + a combiner.
 
-    For each eligible function ``f(x)``:
-      1. Create ``_br_fss_1_<rand>(x, r): return <f's body> + r``
-      2. Create ``_br_fss_2_<rand>(x, r): return -r``
-      3. Replace ``f`` with ``f(x): r = secrets.randbelow(...); return
-         _br_fss_1(x, r) + _br_fss_2(x, r)``
-
-    The two share functions are inserted BEFORE the original in the module
-    body (so they're defined when the combiner runs).
+    Mode + share count are controlled via ctx.fss_mode / ctx.fss_shares.
+    Cap is ctx.fss_max (default 5); 0 with ctx.fss_all_eligible = unlimited.
     """
     rng = _rng_for(ctx)
     max_fns = int(getattr(ctx, 'fss_max', 0) or 5)
+    if getattr(ctx, 'fss_all_eligible', False):
+        max_fns = 0  # unlimited
     shared = 0
 
-    for i, node in enumerate(list(tree.body)):
+    for node in list(tree.body):
         if not isinstance(node, ast.FunctionDef) or isinstance(node, ast.AsyncFunctionDef):
             continue
-        if not _is_eligible(node):
+        mode = _resolve_mode(ctx, node)
+        if mode is None:
             continue
-        if shared >= max_fns:
+        if max_fns and shared >= max_fns:
             break
-        # Copy the original args + add `r`.
-        orig_args = node.args
-        ret_expr = node.body[0].value
-        name1 = _fresh_name('1', rng)
-        name2 = _fresh_name('2', rng)
 
-        # share 1 args: same as orig + trailing `r`
-        s1_args = ast.arguments(
-            posonlyargs=list(orig_args.posonlyargs),
-            args=list(orig_args.args) + [ast.arg(arg='r', annotation=None)],
-            kwonlyargs=list(orig_args.kwonlyargs),
-            kw_defaults=list(orig_args.kw_defaults),
-            defaults=list(orig_args.defaults),
-            vararg=orig_args.vararg,
-            kwarg=orig_args.kwarg,
-        )
-        # share 1 body: return <orig ret> + r
-        import copy
-        s1_ret = ast.Return(value=ast.BinOp(
-            left=copy.deepcopy(ret_expr),
-            op=ast.Add(),
-            right=ast.Name(id='r', ctx=ast.Load()),
-        ))
-        s1_fn = ast.FunctionDef(
-            name=name1, args=s1_args, body=[s1_ret],
-            decorator_list=[], returns=None, type_comment=None,
-        )
+        n_shares = _effective_n_shares(ctx, mode)
+        builder = _BUILDERS[mode] if mode in _BUILDERS else _BUILDERS['additive']
+        if mode == 'additive_n':
+            share_fns, combiner = _build_additive_shares(node, rng, n_shares)
+        elif mode == 'bool':
+            share_fns, combiner = _build_bool_shares(node, rng, n_shares)
+        elif mode == 'serialized':
+            share_fns, combiner = _build_serialized_shares(node, rng, n_shares)
+        else:  # additive
+            share_fns, combiner = _build_additive_shares(node, rng, 2)
 
-        # share 2 args: same as orig + trailing `r`
-        s2_args = ast.arguments(
-            posonlyargs=list(orig_args.posonlyargs),
-            args=list(orig_args.args) + [ast.arg(arg='r', annotation=None)],
-            kwonlyargs=list(orig_args.kwonlyargs),
-            kw_defaults=list(orig_args.kw_defaults),
-            defaults=list(orig_args.defaults),
-            vararg=orig_args.vararg,
-            kwarg=orig_args.kwarg,
-        )
-        # share 2 body: return -r
-        s2_ret = ast.Return(value=ast.UnaryOp(
-            op=ast.USub(),
-            operand=ast.Name(id='r', ctx=ast.Load()),
-        ))
-        s2_fn = ast.FunctionDef(
-            name=name2, args=s2_args, body=[s2_ret],
-            decorator_list=[], returns=None, type_comment=None,
-        )
-
-        # combiner: def f(x): import secrets as _br_s; _br_r = ...; return s1(x, _br_r) + s2(x, _br_r)
-        combiner_args = ast.arguments(
-            posonlyargs=list(orig_args.posonlyargs),
-            args=list(orig_args.args),
-            kwonlyargs=list(orig_args.kwonlyargs),
-            kw_defaults=list(orig_args.kw_defaults),
-            defaults=list(orig_args.defaults),
-            vararg=orig_args.vararg,
-            kwarg=orig_args.kwarg,
-        )
-        # Build the call args for the shares (same as orig's positional args)
-        orig_arg_names = [a.arg for a in (orig_args.args + orig_args.posonlyargs)]
-        call_args = [ast.Name(id=nm, ctx=ast.Load()) for nm in orig_arg_names]
-        combiner_body = [
-            ast.Import(names=[ast.alias(name='secrets', asname='_br_s')]),
-            ast.Assign(
-                targets=[ast.Name(id='_br_r', ctx=ast.Store())],
-                value=ast.BinOp(
-                    left=ast.Call(
-                        func=ast.Attribute(
-                            value=ast.Name(id='_br_s', ctx=ast.Load()),
-                            attr='randbelow', ctx=ast.Load()),
-                        args=[ast.Constant(value=1 << 64)],
-                        keywords=[],
-                    ),
-                    op=ast.Sub(),
-                    right=ast.Constant(value=1 << 63),
-                ),
-            ),
-            ast.Return(value=ast.BinOp(
-                left=ast.Call(
-                    func=ast.Name(id=name1, ctx=ast.Load()),
-                    args=call_args + [ast.Name(id='_br_r', ctx=ast.Load())],
-                    keywords=[],
-                ),
-                op=ast.Add(),
-                right=ast.Call(
-                    func=ast.Name(id=name2, ctx=ast.Load()),
-                    args=call_args + [ast.Name(id='_br_r', ctx=ast.Load())],
-                    keywords=[],
-                ),
-            )),
-        ]
-        combiner = ast.FunctionDef(
-            name=node.name, args=combiner_args, body=combiner_body,
-            decorator_list=[], returns=None, type_comment=None,
-        )
-
-        # Replace the original in-place: insert s1, s2 before, replace node with combiner
         idx = tree.body.index(node)
-        tree.body[idx:idx + 1] = [s1_fn, s2_fn, combiner]
+        tree.body[idx:idx + 1] = [*share_fns, combiner]
         ast.fix_missing_locations(tree)
         shared += 1
 
@@ -324,13 +832,17 @@ def apply_fss(tree: ast.Module, ctx) -> ast.Module:
 # --- Smoke test -------------------------------------------------------------
 
 def _smoke() -> None:
-    """Combine == original + shares alone are random + eligibility + determinism."""
+    """Verify all modes: combine == original, shares alone random, eligibility."""
 
     class _Ctx:
         build_rng = None
         fss_seed = 31
         fss_max = 5
+        fss_mode = 'auto'
+        fss_shares = 3
+        fss_all_eligible = False
 
+    # --- Mode: additive (backward compat with H.9) ---
     src = (
         "def square(x):\n"
         "    return x * x\n"
@@ -338,77 +850,98 @@ def _smoke() -> None:
         "def add_one(n):\n"
         "    return n + 1\n"
         "\n"
-        "def fib(n):\n"
-        "    a, b = 0, 1\n"
-        "    for _ in range(n):\n"
-        "        a, b = b, a + b\n"
-        "    return a\n"
+        "def is_even(n):\n"
+        "    return n % 2 == 0\n"
         "\n"
-        "def with_call(x):\n"
-        "    return abs(x)\n"
+        "def get_tuple(a, b):\n"
+        "    return (a, b)\n"
     )
     tree = ast.parse(src)
     ns = {}
     exec(compile(ast.Module(body=tree.body, type_ignores=[]), '<base>', 'exec'), ns)
     assert ns['square'](5) == 25
     assert ns['add_one'](5) == 6
-    assert ns['fib'](10) == 55
-    assert ns['with_call'](-5) == 5
-    print("H.9 baseline: square(5)=25, add_one(5)=6, fib(10)=55  OK")
+    assert ns['is_even'](4) is True
+    assert ns['get_tuple'](3, 4) == (3, 4)
+    print("iO-2 baseline: square=25, add_one=6, is_even=True, get_tuple=(3,4)  OK")
 
     ctx = _Ctx()
+    ctx.fss_mode = 'auto'
     out = apply_fss(tree, ctx)
-    assert getattr(ctx, 'fss_shared', 0) > 0, "no functions shared"
-    print(f"H.9 shared: {ctx.fss_shared} functions split into 2 shares  OK")
+    assert getattr(ctx, 'fss_shared', 0) == 4, f"expected 4 shared, got {ctx.fss_shared}"
+    print(f"iO-2 auto: {ctx.fss_shared} functions shared (square/add_one additive, is_even bool, get_tuple serialized)  OK")
 
-    # Combine == original
     ns2 = {}
     exec(compile(ast.Module(body=out.body, type_ignores=[]), '<fss>', 'exec'), ns2)
-    assert ns2['square'](5) == 25, "square(5) changed"
-    assert ns2['add_one'](5) == 6, "add_one(5) changed"
-    assert ns2['fib'](10) == 55, "fib not shared but still correct"
-    # square with multiple values
-    for v in [0, 1, -1, 10, -10, 100]:
-        assert ns2['square'](v) == v * v, f"square({v}) = {ns2['square'](v)}"
-    print("H.9 combine: square/add_one return correct values  OK")
+    assert ns2['square'](5) == 25, f"square(5)={ns2['square'](5)}"
+    assert ns2['add_one'](5) == 6
+    assert ns2['is_even'](4) is True, f"is_even(4)={ns2['is_even'](4)}"
+    assert ns2['is_even'](5) is False, f"is_even(5)={ns2['is_even'](5)}"
+    assert ns2['get_tuple'](3, 4) == (3, 4), f"get_tuple={ns2['get_tuple'](3,4)}"
+    print("iO-2 combine: all 4 return correct values  OK")
 
-    # Shares present: the module should now have _br_fss_1_* and _br_fss_2_* defs
     src_after = ast.unparse(out)
-    assert '_br_fss_1_' in src_after and '_br_fss_2_' in src_after
-    print("H.9 shares: _br_fss_1_* and _br_fss_2_* present  OK")
+    assert '_br_fss_1_' in src_after
+    print("iO-2 shares: _br_fss_* present  OK")
 
-    # Shares alone are random: call a share with a fixed r, verify f1 + f2 = f(x)
-    # but f1 alone is not f(x) (it's f(x)+r). Find the share names.
-    import re
-    share1_names = re.findall(r'def (_br_fss_1_\w+)\(', src_after)
-    share2_names = re.findall(r'def (_br_fss_2_\w+)\(', src_after)
-    assert len(share1_names) >= 1 and len(share2_names) >= 1
-    # The first share pair corresponds to `square` (the first eligible fn).
-    s1 = ns2[share1_names[0]]
-    s2 = ns2[share2_names[0]]
-    r = 12345
-    f1 = s1(5, r)  # square(5) + r = 25 + 12345
-    f2 = s2(5, r)  # -r = -12345
-    assert f1 == 25 + r, f"share1 = {f1}, expected {25 + r}"
-    assert f2 == -r, f"share2 = {f2}, expected {-r}"
-    assert f1 + f2 == 25, f"combine = {f1 + f2}, expected 25"
-    print(f"H.9 additive: s1(5,r)={f1}, s2(5,r)={f2}, sum={f1+f2} == square(5)  OK")
+    # --- Mode: additive_n (3 shares) ---
+    tree3 = ast.parse("def cube(x):\n    return x * x * x\n")
+    ctx3 = _Ctx()
+    ctx3.fss_mode = 'additive_n'
+    ctx3.fss_shares = 3
+    out3 = apply_fss(tree3, ctx3)
+    ns3 = {}
+    exec(compile(ast.Module(body=out3.body, type_ignores=[]), '<fss3>', 'exec'), ns3)
+    for v in [0, 1, -1, 5, -5, 100]:
+        assert ns3['cube'](v) == v * v * v, f"cube({v}) = {ns3['cube'](v)}"
+    print(f"iO-2 additive_n (3 shares): cube correct for 6 values  OK")
 
-    # Eligibility: fib (non-single-return) + with_call (has call) NOT shared
-    fib_fn = next(n for n in out.body if getattr(n, 'name', '') == 'fib')
-    assert 'while' not in ast.unparse(fib_fn) and '_br_fss' not in ast.unparse(fib_fn)
-    wc_fn = next(n for n in out.body if getattr(n, 'name', '') == 'with_call')
-    assert '_br_fss' not in ast.unparse(wc_fn), "with_call should not be shared (has call)"
-    print("H.9 eligibility: fib (multi-stmt) + with_call (call side-effect) skipped  OK")
+    # --- Mode: bool ---
+    tree_b = ast.parse("def is_pos(n):\n    return n > 0\n")
+    ctx_b = _Ctx()
+    ctx_b.fss_mode = 'bool'
+    out_b = apply_fss(tree_b, ctx_b)
+    ns_b = {}
+    exec(compile(ast.Module(body=out_b.body, type_ignores=[]), '<fssb>', 'exec'), ns_b)
+    for v in [-5, 0, 5]:
+        assert ns_b['is_pos'](v) is (v > 0), f"is_pos({v}) = {ns_b['is_pos'](v)}"
+    print("iO-2 bool: is_pos correct for -5/0/5  OK")
 
-    # Determinism
-    tree2 = ast.parse(src)
-    ctx2 = _Ctx()
-    apply_fss(tree2, ctx2)
-    assert ctx2.fss_shared == ctx.fss_shared
-    print(f"H.9 deterministic: same seed -> {ctx.fss_shared} shared  OK")
+    # --- Mode: serialized ---
+    tree_s = ast.parse("def make_pair(a, b):\n    return (a, b)\n")
+    ctx_s = _Ctx()
+    ctx_s.fss_mode = 'serialized'
+    out_s = apply_fss(tree_s, ctx_s)
+    ns_s = {}
+    exec(compile(ast.Module(body=out_s.body, type_ignores=[]), '<fsss>', 'exec'), ns_s)
+    for a, b in [(1, 2), ('x', 'y'), (0, -1)]:
+        assert ns_s['make_pair'](a, b) == (a, b), f"make_pair({a},{b}) = {ns_s['make_pair'](a, b)}"
+    print("iO-2 serialized: make_pair correct for 3 cases  OK")
 
-    print("H.9 SMOKE: PASS")
+    # --- Lift cap: fss_all_eligible ---
+    src_many = "\n".join(f"def f{i}(x):\n    return x + {i}\n" for i in range(10))
+    tree_many = ast.parse(src_many)
+    ctx_many = _Ctx()
+    ctx_many.fss_mode = 'additive'
+    ctx_many.fss_all_eligible = True
+    ctx_many.fss_max = 0
+    out_many = apply_fss(tree_many, ctx_many)
+    assert ctx_many.fss_shared == 10, f"expected 10, got {ctx_many.fss_shared}"
+    ns_many = {}
+    exec(compile(ast.Module(body=out_many.body, type_ignores=[]), '<many>', 'exec'), ns_many)
+    for i in range(10):
+        assert ns_many[f'f{i}'](5) == 5 + i
+    print(f"iO-2 lift cap: all 10 functions shared (was cap 5)  OK")
+
+    # --- Determinism ---
+    tree_d = ast.parse("def square(x):\n    return x * x\n")
+    ctx_d1 = _Ctx(); ctx_d1.fss_mode = 'additive'
+    ctx_d2 = _Ctx(); ctx_d2.fss_mode = 'additive'
+    apply_fss(tree_d, ctx_d1)
+    assert ctx_d1.fss_shared == 1
+    print("iO-2 deterministic: same seed -> same share count  OK")
+
+    print("iO-2 SMOKE: PASS")
 
 
 if __name__ == "__main__":

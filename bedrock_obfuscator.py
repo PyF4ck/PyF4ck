@@ -373,6 +373,16 @@ except:
         h_fss: bool = False
         h_tls_callback: bool = False
         h_exc_table_vm: bool = False
+        # --- Phase iO-2: FSS extensions (Layer 6+) ------------------
+        # fss_mode: 'auto' (default; bool→additive→serialized), 'additive',
+        # 'additive_n' (n-share collusion-resistant), 'bool' (XOR sharing),
+        # 'serialized' (any repr-safe return via int.from_bytes).
+        # fss_shares: number of shares for additive_n (default 3, min 2).
+        # fss_all_eligible: when True, lift the 3-5 cap → share ALL eligible
+        # functions (iO-grade coverage).
+        fss_mode: str = 'auto'
+        fss_shares: int = 3
+        fss_all_eligible: bool = False
 
         @classmethod
         def from_args(cls, args) -> "BuildContext":
@@ -457,6 +467,9 @@ except:
                 h_fss=bool(getattr(args, 'h_fss', False)),
                 h_tls_callback=bool(getattr(args, 'h_tls_callback', False)),
                 h_exc_table_vm=bool(getattr(args, 'h_exc_table_vm', False)),
+                fss_mode=getattr(args, 'fss_mode', 'auto') or 'auto',
+                fss_shares=int(getattr(args, 'fss_shares', 3) or 3),
+                fss_all_eligible=bool(getattr(args, 'fss_all_eligible', False)),
             )
 
 
@@ -5343,9 +5356,23 @@ except Exception:
             # H.9 FSS 2-share (function secret sharing).
             self.parser.add_argument('--h-fss', dest='h_fss',
                                      action=argparse.BooleanOptionalAction, default=None,
-                                     help='[Phase H.9] Function secret sharing: split '
-                                          'numeric f(x) into 2 additive shares. Numeric '
-                                          'pure functions only. Default off (extreme auto-on).')
+                                     help='[Phase H.9 + iO-2] Function secret sharing: split '
+                                          'eligible f(x) into additive (int) / XOR (bool) / '
+                                          'serialized (any repr-safe) shares. Phase iO-2 '
+                                          'extends the original H.9 (2-share additive int) to '
+                                          'bool + serialized + n-share + all-eligible. Default off.')
+            # Phase iO-2: FSS extensions
+            self.parser.add_argument('--fss-mode', dest='fss_mode', default='auto',
+                                     choices=['auto', 'additive', 'additive_n', 'bool', 'serialized'],
+                                     help='[iO-2] FSS mode. auto = bool→additive→serialized '
+                                          '(default). additive_n = n-share collusion-resistant. '
+                                          'See --fss-shares.')
+            self.parser.add_argument('--fss-shares', dest='fss_shares', type=int, default=3,
+                                     help='[iO-2] Number of shares for additive_n mode (default 3, min 2).')
+            self.parser.add_argument('--fss-all-eligible', dest='fss_all_eligible', action='store_true',
+                                     help='[iO-2] Lift the 3-5 cap → share ALL eligible functions (iO-grade coverage).')
+            self.parser.add_argument('--no-fss-all-eligible', dest='fss_all_eligible', action='store_false',
+                                     help='Disable --fss-all-eligible (override profile auto-enable).')
             # H.10 TLS callback injection (native PE post-build).
             self.parser.add_argument('--h-tls-callback', dest='h_tls_callback',
                                      action=argparse.BooleanOptionalAction, default=None,
@@ -6953,6 +6980,11 @@ except Exception:
             "vm_extended": True,
             "junk": True,
             "bool_obf": True,
+            # Phase iO-2: FSS extensions — share ALL eligible functions (lift
+            # the 3-5 cap), using auto mode (bool→additive→serialized) so
+            # predicates get XOR sharing, int-returning get additive, and
+            # any repr-safe return (tuples, lists, dicts) gets serialized.
+            "fss_all_eligible": True,
         },
     }
 
