@@ -1,11 +1,13 @@
-# Bedrock Obfuscator — Production Readiness Report (Phase 5 + Phase 7)
+# Bedrock Obfuscator — Production Readiness Report (Phase 5 + Phase 7 + iO)
 
 ## Status: PRODUCTION-READY with documented limitations
 
-The obfuscator (Phases 1-5 + Phase 7 hardening) is safe to deploy in
-production with the flags and constraints documented below. The native VM
-(Phase 5) is an **opt-in enhancement layer**; the core obfuscation
-(Phases 1-4) protects ALL code regardless of VM eligibility.
+The obfuscator (Phases 1-5 + Phase 7 hardening + Phase H esoteric + Phase iO)
+is safe to deploy in production with the flags and constraints documented
+below. The native VM (Phase 5) is an **opt-in enhancement layer**; the core
+obfuscation (Phases 1-4) protects ALL code regardless of VM eligibility. The
+`io` profile adds Practical Indistinguishability Obfuscation (binary capsule)
+for the strongest protection.
 
 ---
 
@@ -18,6 +20,8 @@ production with the flags and constraints documented below. The native VM
 | **Phase 3: Debug poison + metamorphic** | ALL functions | 22/22 |
 | **Phase 4: Anti-meta debranding** (`--anti-meta`) | ALL output strings | `grep -ic bedrock` = 0 |
 | **Phase 5: Native VM** (`--native-vm`) | VM-eligible subset only | 16/16 harness + real-world (see Verification gates — `_c_interp_test` / `_integration_test` need an isolated `_xvm` build on `PYTHONPATH`) |
+| **Phase H: Esoteric** (11 passes) | ALL functions | `_phase_h_test.py` 11 individual + combined-9 |
+| **Phase iO: Practical iO** (`--profile io`) | ALL | `_io_distinguish_test.py` 27/27 (N=20, chi-square gate), `_io_adversarial_ml.py` 5/5 (ML accuracy 40% < chance 50%) |
 
 The core obfuscation (Phases 1-4) protects **every function** — capsule
 runtime, encrypted const pool, HMAC chain, debug poison, metamorphic
@@ -61,6 +65,27 @@ python "bedrock_obfuscator.py" -f input.py -o output.py \
 ```
 ⚠ `--env-key` ties output to the building machine's hardware fingerprint.
 Test on the TARGET machine, not just the build machine.
+
+### iO profile (Practical Indistinguishability Obfuscation)
+```
+python "bedrock_obfuscator.py" -f input.py -o output.py \
+    --profile io --anti-vm off --anti-debug off --no-debug-poison \
+    --no-metamorphic --no-native-vm --no-cache --overwrite \
+    --adv-requests off --no-anti-timing --quiet
+```
+The `io` profile layers all of `extreme` + Phase H esoteric (11 passes) +
+Phase iO extensions (FSS, crypto opaque, pointfunc, lookup, entropy pad,
+**binary capsule**). The binary capsule encrypts the entire source, achieving
+statistical indistinguishability from random data (chi-square 501 ≈ random
+baseline 510, ML classifier accuracy 40% < chance 50%).
+
+Sandbox-safe flags (`--anti-vm off`, `--anti-debug off`) are required in
+CI/sandbox. In production, remove them to enable the full anti-VM/anti-debug
+stack. Full spec: `bedrock_native/IO_SPEC.md`.
+
+⚠ The `io` profile auto-disables `runtime_dec` + `chain` when the binary
+capsule is on (the capsule already encrypts everything; the redundant chain
+caused an intermittent hang bug — fixed in commit `5a34b43`).
 
 ---
 
@@ -243,5 +268,9 @@ isolated smoke `add(3,4)=7` through a v2 blob confirms the C path.
 Core obfuscation (Phases 1-4) protects ALL code. VM (Phase 5) adds stronger
 protection for the subset it can compile; the rest falls back safely. The
 most dangerous failure mode (silent wrong output from try/except) is
-prevented by exception-table detection. Test on YOUR code + YOUR platform
-before shipping.
+prevented by exception-table detection.
+
+**For maximum protection** (nation-state threat model, no perf constraint),
+use `--profile io` with sandbox-safe flags. The binary capsule (iO-7) makes
+the output statistically indistinguishable from random data. Test on YOUR
+code + YOUR platform before shipping.

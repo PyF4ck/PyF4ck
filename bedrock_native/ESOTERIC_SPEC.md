@@ -31,6 +31,12 @@ Every pass follows the Bedrock contract:
 Pass ordering follows the reverse-stack convention (declared LATER runs
 EARLIER; `bedrock_obfuscator.py:6032-6042`).
 
+> **Phase iO:** Phase H is the foundation for Phase iO (Practical
+> Indistinguishability Obfuscation). The `io` profile layers all of
+> `extreme` + Phase H + 7 iO extensions (FSS, crypto opaque, pointfunc,
+> lookup, entropy pad, binary capsule). See
+> [`IO_SPEC.md`](IO_SPEC.md) for the full iO specification.
+
 ---
 
 ## 2. The 11 Implemented Features
