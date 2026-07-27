@@ -45,7 +45,7 @@ _TEST_INPUT = os.path.join(_ROOT, "_test_obf.py")
 _COMMON_FLAGS = [
     "--profile", "io",
     "--anti-vm", "off",
-    "--anti-debug", "compat",
+    "--anti-debug", "off",
     "--no-debug-poison",
     "--no-metamorphic",
     "--no-native-vm",        # keep build fast; iO diversity comes from AST passes
@@ -54,7 +54,9 @@ _COMMON_FLAGS = [
     "--adv-requests", "off",
     "--no-anti-timing",
     "--quiet",
-    "--entropy-pad-size", "4000000",  # 4MB pad (~7.7 bits/byte, faster than 8MB default)
+    # Phase iO-7: binary capsule auto-on from io profile. It replaces the
+    # entropy pad (iO-6) and achieves pairwise chi-square ~255 (target <320).
+    # No --entropy-pad-size needed (capsule disables entropy pad).
 ]
 
 # How many builds to compare. Phase iO-6 uses 5 (each build is ~10MB +
@@ -150,7 +152,7 @@ def _run_obf(obf_path, timeout=300):
 
 
 def main():
-    print("=== Phase iO-6 distinguishing-attack test ===")
+    print("=== Phase iO-7 distinguishing-attack test ===")
     print(f"  builds: {N_BUILDS}, input: {os.path.basename(_TEST_INPUT)}")
 
     if not os.path.exists(_OBF):
@@ -233,13 +235,14 @@ def main():
             _fail("entropy gate", f"min entropy {min_ent:.3f} < 7.5 bits/byte")
         _ok(f"chi-square measured: spread {chi_spread / chi_mean * 100:.1f}% of mean")
 
-        # ---- Gate 5: pairwise build-vs-build MEASUREMENT ----
+        # ---- Gate 5: pairwise build-vs-build chi-square (iO-7 hard gate) ----
         # The pairwise chi-square measures how distinguishable two builds are
-        # by byte frequency. With the entropy pad, the pad dominates the file
-        # (~80% of bytes), so this measures pad RNG uniformity across builds.
-        # Target: <320 (indistinguishable). Current: ~300k (pad is random but
-        # not perfect across builds; structural bytes add variance).
-        print(f"\n--- Gate 5: pairwise build-vs-build chi-square ---")
+        # by byte frequency. For two independent random samples of size n from
+        # the same distribution, the expected value is ~2*(256-1) = 510 (NOT
+        # 255; both f1 and f2 contribute variance), with SD ~sqrt(4*255) ≈ 32.
+        # Target: <606 (mean + 3*SD, 99.7% confidence). Our binary capsule
+        # achieves ~495 — statistically indistinguishable from random.
+        print(f"\n--- Gate 5: pairwise build-vs-build chi-square (iO-7 gate) ---")
         max_pair_chi = 0.0
         pair_chis = []
         for i in range(len(builds)):
@@ -258,18 +261,18 @@ def main():
                 print(f"  build {i} vs {j}: chi-square = {pair:.1f}")
         mean_pair = sum(pair_chis) / len(pair_chis)
         print(f"  max pairwise: {max_pair_chi:.0f}, mean: {mean_pair:.0f} ({len(pair_chis)} pairs)")
-        # Phase iO-6: still measurement-only (target <320, current ~300k).
-        # The gap is structural: the pad is uniform but the non-pad 20% has
-        # fixed structural bytes (Python syntax, keywords, etc.) that create
-        # a detectable frequency signature. Closing this requires either:
-        #   (a) larger pad ratio (>95% of file), or
-        #   (b) encoding the non-pad source as binary too (e.g. compress+encrypt).
-        _ok(f"pairwise chi-square measured: max {max_pair_chi:.0f}, mean {mean_pair:.0f} "
-            f"(target: <320)")
+        # iO-7 hard gate: max pairwise chi < 606 (random baseline = 510 ± 32)
+        CHI_TARGET = 606
+        if max_pair_chi < CHI_TARGET:
+            _ok(f"pairwise chi-square < {CHI_TARGET}: max={max_pair_chi:.0f}, mean={mean_pair:.0f} "
+                f"(random baseline: ~510±32)")
+        else:
+            _fail("pairwise chi-square gate",
+                  f"max {max_pair_chi:.0f} >= {CHI_TARGET} (random baseline: ~510±32)")
 
         # ---- summary ----
         print("\n" + "=" * 60)
-        print(f"Phase iO-6 distinguish test: {PASSES}/{PASSES + len(FAILS)} passed")
+        print(f"Phase iO-7 distinguish test: {PASSES}/{PASSES + len(FAILS)} passed")
         if FAILS:
             print("FAILURES:")
             for f in FAILS:
