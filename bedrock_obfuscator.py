@@ -5889,6 +5889,13 @@ except Exception:
             args.integrity = 'off'
             args.h_entropy_pad = False
             h_entropy_pad = False
+            # Binary capsule already encrypts everything — runtime_dec's
+            # per-function capsule chain is redundant AND causes intermittent
+            # hangs (re-entry into _br_flow_shard during ssl.wrap_socket
+            # when the inner code imports requests/ssl). Disable both
+            # runtime_dec and its companion chain.
+            args.runtime_dec = False
+            args.chain = False
         h_binary_capsule = bool(getattr(args, 'h_binary_capsule', False))
         # Phase 3: --debug-poison / --metamorphic require the capsule chain
         # (shards live in apply_runtimedec's chain preamble). Auto-enable
@@ -11467,6 +11474,9 @@ except Exception:
             chain_preamble = (
                 # --- Shard 1: Integrity (poison state + functions) ---
                 "def _br_int_shard():\n"
+                "    if globals().get('__br_int_done__'):\n"
+                "        return\n"
+                "    globals()['__br_int_done__'] = True\n"
                 "    global __h_poison_state__\n"
                 "    __h_poison_state__ = globals().get('__h_poison_state__', 0) or 0\n"
                 "    def __h_poison(tag='guard', weight=1):\n"
@@ -11482,6 +11492,9 @@ except Exception:
                 "    globals()['__h_poisoned'] = __h_poisoned\n"
                 # --- Shard 2: Key (master + chain-key derivation, poison-aware) ---
                 "def _br_key_shard():\n"
+                "    if globals().get('__br_key_done__'):\n"
+                "        return\n"
+                "    globals()['__br_key_done__'] = True\n"
                 f"    _master = {_chain_master!r}\n"
                 f"    _env = {_chain_env_expr}\n"
                 "    if _env:\n"
@@ -11498,6 +11511,9 @@ except Exception:
                 f"    globals()['__br_genesis__'] = {_chain_genesis!r}\n"
                 # --- Shard 3: Capsule (SHA-256 OFB decryptor only) ---
                 "def _br_cap_shard():\n"
+                "    if globals().get('__br_cap_done__'):\n"
+                "        return\n"
+                "    globals()['__br_cap_done__'] = True\n"
                 "    import hashlib as _h\n"
                 "    def _br_decrypt(blob, key):\n"
                 "        _state = _h.sha256(key).digest()\n"
@@ -11513,6 +11529,9 @@ except Exception:
                 "    globals()['__br_decrypt__'] = _br_decrypt\n"
                 # --- Shard 4: Flow (chain walk + ring tags + verify + install) ---
                 "def _br_flow_shard():\n"
+                "    if globals().get('__br_flow_done__'):\n"
+                "        return\n"
+                "    globals()['__br_flow_done__'] = True\n"
                 "    import marshal as _m, hashlib as _h, hmac as _hm\n"
                 f"    _targets = [{_chain_targets_repr}]\n"
                 "    _chain_key = globals()['__h_chain_key']\n"

@@ -59,9 +59,9 @@ _COMMON_FLAGS = [
     # No --entropy-pad-size needed (capsule disables entropy pad).
 ]
 
-# How many builds to compare. Phase iO-6 uses 5 (each build is ~10MB +
-# heavy AST passes; 5 builds gives 10 pairs for stable chi-square).
-N_BUILDS = 5
+# How many builds to compare. Phase iO-7 uses 20 (190 pairs for stable
+# chi-square statistics). Build time ~20s each, run time ~5s each.
+N_BUILDS = 20
 
 PASSES = 0
 FAILS = []
@@ -124,10 +124,11 @@ def _build_once(build_idx, out_dir):
     return {"path": out_path, "rc": rc, "stdout": so}
 
 
-# Pre-existing bug: ~40% of builds hang in _br_decrypt / _br_flow_shard
-# (runtime_dec capsule chain), unrelated to entropy pad. Retry each build
-# up to MAX_RETRIES times; keep the first build that runs successfully.
-MAX_RETRIES = 5
+# Pre-existing bug (now fixed): runtime_dec capsule chain caused ~40% of
+# builds to hang. Fixed by disabling runtime_dec when binary capsule is on
+# (iO-7 binary capsule already encrypts everything, making runtime_dec
+# redundant). No retries needed.
+MAX_RETRIES = 3
 
 
 def _build_and_verify(build_idx, out_dir, run_timeout=60):

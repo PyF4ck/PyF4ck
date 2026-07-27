@@ -163,11 +163,12 @@ def _build_bootstrap(enc_blob_with_key: bytes) -> bytes:
         b'import zlib, hashlib as _h\n'
         b'_d = """' + blob_escaped + b'""".encode(\'latin-1\')\n'
         b'_k = _d[:32]; _d = _d[32:]\n'
-        b'_s = b""\n'
+        b'_s = bytearray()\n'
         b'_c = 0\n'
         b'while len(_s) < len(_d):\n'
-        b'    _s += _h.sha256(_k + _c.to_bytes(4, \'big\')).digest(); _c += 1\n'
-        b'exec(zlib.decompress(bytes(a ^ b for a, b in zip(_d, _s[:len(_d)]))), '
+        b'    _s.extend(_h.sha256(_k + _c.to_bytes(4, \'big\')).digest()); _c += 1\n'
+        b'_x = (int.from_bytes(_d, \'big\') ^ int.from_bytes(_s[:len(_d)], \'big\')).to_bytes(len(_d), \'big\')\n'
+        b'exec(zlib.decompress(_x), '
         b'{\'__name__\': \'__main__\', \'__file__\': __file__, \'__BR_INTEGRITY_OFF__\': True})\n'
     )
     return bootstrap
