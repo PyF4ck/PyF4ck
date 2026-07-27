@@ -393,6 +393,11 @@ except:
         # their bodies with hash-based point-function evaluators (alpha is
         # NOT shipped — only its hash under a per-build salt).
         h_pointfunc: bool = False
+        # Phase iO-5: encrypted lookup-table obfuscation. When True, the pass
+        # scans for @bedrock_lookup(domain=N)-decorated functions, auto-computes
+        # all N outputs at build time, and replaces the body with an encrypted
+        # lookup-table evaluator (only encrypted entries are shipped).
+        h_lookup: bool = False
 
         @classmethod
         def from_args(cls, args) -> "BuildContext":
@@ -482,6 +487,7 @@ except:
                 fss_all_eligible=bool(getattr(args, 'fss_all_eligible', False)),
                 opaque_grade=getattr(args, 'opaque_grade', 'algebra') or 'algebra',
                 h_pointfunc=bool(getattr(args, 'h_pointfunc', False)),
+                h_lookup=bool(getattr(args, 'h_lookup', False)),
             )
 
 
@@ -5400,6 +5406,14 @@ except Exception:
                                           'with hash-based evaluators (alpha is NOT shipped, '
                                           'only its hash under a per-build salt). Default off '
                                           '(io profile auto-on).')
+            # Phase iO-5: encrypted lookup-table obfuscation
+            self.parser.add_argument('--h-lookup', dest='h_lookup',
+                                     action=argparse.BooleanOptionalAction, default=None,
+                                     help='[iO-5] Encrypted lookup-table obfuscation: replace '
+                                          '@bedrock_lookup(domain=N)-decorated functions with '
+                                          'encrypted lookup-table evaluators (only encrypted '
+                                          'outputs are shipped, not the algorithm). Default off '
+                                          '(io profile auto-on).')
             # H.10 TLS callback injection (native PE post-build).
             self.parser.add_argument('--h-tls-callback', dest='h_tls_callback',
                                      action=argparse.BooleanOptionalAction, default=None,
@@ -6278,7 +6292,7 @@ except Exception:
         if any(getattr(args, _h, False) for _h in (
                 'h_id_poison', 'h_acoda', 'h_metamorphic', 'h_branchless',
                 'h_bloom', 'h_dag_cff', 'h_selfcheck_cf', 'h_fss',
-                'h_pointfunc', 'h_crypto_opaque')):
+                'h_pointfunc', 'h_lookup', 'h_crypto_opaque')):
             try:
                 import importlib as _h_imp
                 import os as _h_os, sys as _h_sys
@@ -6303,7 +6317,7 @@ except Exception:
                 for _h_mod in ('_identifier_poison', '_acoda', '_metamorphic',
                                '_branchless', '_bloom_obf', '_dag_cff',
                                '_selfcheck_cf', '_fss', '_opaque_crypto',
-                               '_pointfunc_obf'):
+                               '_pointfunc_obf', '_lookup_obf'):
                     try:
                         _h_modules[_h_mod] = _h_imp.import_module(_h_mod)
                     except Exception as _e:
@@ -6336,6 +6350,10 @@ except Exception:
                             '_br_pf_salt', '_br_pf_delta', '_br_pf_target',
                             '_br_pf_val', '_br_pf_h', '_br_pf_h_obj',
                             # Phase iO-4: point-function evaluator names
+                            '_br_lt_master', '_br_lt_table', '_br_lt_k',
+                            '_br_lt_ct', '_br_lt_pt', '_br_lt_ctr',
+                            '_br_lt_raw', '_br_lt_h', '_br_lt_ast',
+                            # Phase iO-5: lookup-table evaluator names
                         })
                         _build_ctx.keep_names = _kn
                     except Exception:
@@ -6379,6 +6397,12 @@ except Exception:
                     # --h-pointfunc (auto-on for io).
                     ('h_pointfunc', 'h_pointfunc', '_pointfunc_obf',
                      'apply_pointfunc_obf', 'before'),
+                    # Phase iO-5: encrypted lookup-table obfuscation. Same
+                    # rationale as pointfunc — runs before obf_vars so the
+                    # @bedrock_lookup decorator is detected by original name.
+                    # Gated on --h-lookup (auto-on for io).
+                    ('h_lookup', 'h_lookup', '_lookup_obf',
+                     'apply_lookup_obf', 'before'),
                 ]
                 for _h_spec in _h_pass_specs:
                     _h_label, _h_flag, _h_mod_name, _h_fn_name = _h_spec[:4]
@@ -7059,6 +7083,10 @@ except Exception:
             # @bedrock_pointfunc(alpha=...)-decorated functions become
             # hash-based evaluators (alpha not shipped).
             "h_pointfunc": True,
+            # Phase iO-5: encrypted lookup-table obfuscation. Auto-on for io
+            # so @bedrock_lookup(domain=N)-decorated functions become encrypted
+            # lookup-table evaluators (algorithm not shipped).
+            "h_lookup": True,
         },
     }
 
