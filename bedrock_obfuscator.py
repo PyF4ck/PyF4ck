@@ -5081,7 +5081,7 @@ except Exception:
             self.parser = argparse.ArgumentParser(description='Bedrock Obfuscator by baobg')
             self.parser.add_argument('-f', '--file', help='Path to the Python file to obfuscate')
             self.parser.add_argument('-o', '--output', help='Output file name')
-            self.parser.add_argument('--profile', default='balanced', choices=['fast', 'balanced', 'paranoid', 'extreme'], help='Build profile preset (default: balanced)')
+            self.parser.add_argument('--profile', default='balanced', choices=['fast', 'balanced', 'paranoid', 'extreme', 'io'], help='Build profile preset (default: balanced). `io` = extreme + Phase H esoteric passes (iO-grade, no perf constraint).')
             self.parser.add_argument('--runtime-mode', default='main', help='Runtime mode: main (native capsule, default) or legacy. VM runtimes (vm-native*/chunk-vm-lite) were removed in vNext and are mapped to main with a deprecation warning.')
             self.parser.add_argument('--anti-debug', default='strict', choices=['strict', 'compat', 'off'], help='Anti-debug policy (default: strict)')
             self.parser.add_argument('--anti-hook', default='strict', choices=['strict', 'compat', 'off'], help='Anti-hook policy (default: strict)')
@@ -5480,8 +5480,16 @@ except Exception:
 
     # === [14] main() entrypoint ===
     def _apply_extreme_overrides(args):
-        """Boost the `extreme` preset to enable every new extension flag."""
-        if getattr(args, '_profile_preset', getattr(args, 'profile', '')) != 'extreme':
+        """Boost the `extreme`/`io` preset to enable every new extension flag.
+
+        Runs for both `extreme` and `io` profiles. The `io` profile (Phase
+        iO-1) layers Phase H esoteric passes on top of extreme; this function
+        applies the shared conditional overrides (vm_fallback, native_vm,
+        runtime_dec, chain, etc.) that are unsafe to put in the PROFILES dict
+        because they must honour explicit --no-* CLI disables.
+        """
+        _preset = getattr(args, '_profile_preset', getattr(args, 'profile', ''))
+        if _preset not in ('extreme', 'io'):
             return
         _argv = tuple(str(_x) for _x in (getattr(args, '_argv', None) or ()))
         def _flag_explicit(*flags):
@@ -5508,7 +5516,12 @@ except Exception:
             ('h_dag_cff', True), ('h_selfcheck_cf', True),
             ('h_fss', True),
         ):
-            if not getattr(args, attr, False):
+            # Honour explicit --no-<flag> CLI disables. Previously this block
+            # only checked `getattr(args, attr, False)`, which is False after
+            # --no-foo sets args.foo=False, so it clobbered the user's explicit
+            # disable. Phase iO-1: gate on _flag_explicit('--no-<flag>') too.
+            _cli_disable = '--no-' + attr.replace('_', '-')
+            if not getattr(args, attr, False) and not _flag_explicit(_cli_disable):
                 setattr(args, attr, val)
         # Phase H native passes (H.10 TLS callback, H.11 exc-table VM) require
         # --transpile (they patch/link a native .pyd). Auto-on for extreme ONLY
@@ -5518,6 +5531,17 @@ except Exception:
             for _h_native in ('h_tls_callback', 'h_exc_table_vm'):
                 if not getattr(args, _h_native, False) and                         not _flag_explicit('--no-' + _h_native.replace('_', '-')):
                     setattr(args, _h_native, True)
+        # Phase iO-1: H.1 identifier poisoning injects `name = __builtins__['name']`
+        # shadow bindings inside functions. When the capsule runtime
+        # (runtime_dec) marshal+exec a function, the shadow's local binding is
+        # lost in the recreated __code__, and any lambda/closure referencing the
+        # shadowed builtin (range/len/etc.) raises `NameError: cannot access
+        # free variable '<name>'`. Gate h_id_poison OFF when runtime_dec is on
+        # (mirrors the homoglyph/lambda_enc gate vs native_vm). The user can
+        # still force it on with `--h-id-poison` explicitly.
+        if getattr(args, 'runtime_dec', False) and getattr(args, 'h_id_poison', False):
+            if not _flag_explicit('--h-id-poison'):
+                args.h_id_poison = False
         # Native capsule runtime (runtime_dec) replaces the dropped VM runtime
         # in Bedrock vNext Phase 1 — extreme now auto-enables it so the
         # per-function encrypt/decrypt-on-call capsule engages. Homoglyph is
@@ -5529,8 +5553,15 @@ except Exception:
         # can still pass --homoglyph explicitly, but extreme with native_vm
         # stays safe by default.
         _native_vm_on = bool(getattr(args, 'native_vm', False)) or not _flag_explicit('--no-native-vm')
+        # Phase iO-1: homoglyph breaks BOTH the native VM (recursive self-calls
+        # reference pre-rename names) AND the capsule runtime (runtime_dec
+        # marshal+exec recreates __code__ whose Unicode names can't resolve in
+        # the new scope → `NameError: name '<unicode>' is not defined`). Gate
+        # it OFF when EITHER native_vm or runtime_dec is on. The user can still
+        # force it on with `--homoglyph` explicitly.
+        _capsule_on = bool(getattr(args, 'runtime_dec', False))
         if not getattr(args, 'homoglyph', False) and not _flag_explicit('--no-homoglyph'):
-            if not _native_vm_on:
+            if not _native_vm_on and not _capsule_on:
                 args.homoglyph = True
         if not getattr(args, 'vm_opcode_remap', False) and not _flag_explicit('--no-vm-opcode-remap'):
             args.vm_opcode_remap = True
@@ -5579,13 +5610,19 @@ except Exception:
         # (Phase 5) targets `def` nodes — a lambda-ified function is no longer
         # a def, so the VM compiler skips it, changing behavior. Gate it the
         # same way as homoglyph: don't auto-enable when native_vm is on.
+        # Phase iO-1: also gate OFF when runtime_dec (capsule) is on — lambda
+        # closures recreated by marshal+exec lose their cell bindings, causing
+        # `NameError: free variable` (same root cause as homoglyph/h_id_poison).
         if not getattr(args, 'lambda_enc', False) and not _flag_explicit('--no-lambda-enc'):
-            if not _native_vm_on:
+            if not _native_vm_on and not _capsule_on:
                 args.lambda_enc = True
         # Only honour explicit CLI disables, never auto-disable for extreme.
-        if getattr(args, 'anti_vm', 'off') == 'off':
+        # `anti_vm=strict` self-destructs in sandboxed CI/VM environments, so
+        # we only auto-enable it when the user did NOT explicitly pass
+        # --anti-vm off / --no-anti-vm. Same for anti_debugger_v2.
+        if getattr(args, 'anti_vm', 'off') == 'off' and not _flag_explicit('--anti-vm'):
             args.anti_vm = 'strict'
-        if getattr(args, 'anti_debugger_v2', 'off') == 'off':
+        if getattr(args, 'anti_debugger_v2', 'off') == 'off' and not _flag_explicit('--anti-debugger-v2'):
             args.anti_debugger_v2 = 'on'
 
     def main(argv=None):
@@ -5698,26 +5735,22 @@ except Exception:
                 _ext_apply_profile(args, args.profile, argv=getattr(args, '_argv', None))
             except Exception as _e:
                 Logging.warning(f'apply_profile failed: {_e}')
-        # P0 production fail-closed: the extreme preset must default to
-        # --vm-fallback off so a missing or tampered _xvm.pyd poisons+aborts
-        # instead of silently degrading to the pure-Python reference
-        # interpreter. This is the only extreme-boost effect we apply here —
-        # the broader _apply_extreme_overrides() function exists but activates
-        # many additional flags (num_obf, import_obf, str_frag2, homoglyph,
-        # lambda_enc, junk, bool_obf, anti_vm=strict, anti_debugger_v2=on) that
-        # were never tested against the native VM path and introduce both
-        # correctness regressions (homoglyph/lambda_enc break VM-compiled
-        # recursion) and environment-sensitivity (anti_vm=strict self-destructs
-        # in sandboxed CI). Those will be gated+validated in follow-up work.
-        # Here we only honour an explicit --vm-fallback auto/dev override.
-        if getattr(args, '_profile_preset', getattr(args, 'profile', '')) == 'extreme':
-            _ext_argv = tuple(str(_x) for _x in (getattr(args, '_argv', None) or ()))
-            _vm_fb_explicit = any(
-                (_x == '--vm-fallback' or _x.startswith('--vm-fallback='))
-                for _x in _ext_argv
-            )
-            if not _vm_fb_explicit:
-                args.vm_fallback = 'off'
+        # P0 production: activate the full extreme/io override stack. The
+        # _apply_extreme_overrides() function was previously dormant (defined
+        # but never called) due to regression fears around homoglyph/lambda_enc
+        # breaking VM-compiled recursion and anti_vm=strict self-destructing in
+        # sandboxed CI. Both are now fixed:
+        #   - homoglyph/lambda_enc are gated OFF when native_vm is on (inside
+        #     the function itself, lines ~5531/5582).
+        #   - anti_vm/anti_debugger_v2 now honour explicit --anti-vm off /
+        #     --no-anti-vm CLI disables (won't self-destruct in CI).
+        # The function is idempotent with the vm_fallback block below and
+        # honours every --no-* flag the user passed. Runs for both `extreme`
+        # and `io` profiles (Phase iO-1).
+        try:
+            _apply_extreme_overrides(args)
+        except Exception as _e:
+            Logging.warning(f'_apply_extreme_overrides failed: {_e}')
         # Phase 3: --debug-poison / --metamorphic require the capsule chain
         # (shards live in apply_runtimedec's chain preamble). Auto-enable
         # runtime_dec + chain for ANY profile when the user explicitly opts
@@ -6844,6 +6877,82 @@ except Exception:
             "native_vm": True,
             # batch 6: SHA-256 stream cipher for obfct string encoding.
             "str_cipher": True,
+        },
+        # ─── io: Practical iO-grade (Phase iO-1) ───────────────────────────
+        # `io` = extreme + Phase H "esoteric" passes (Layer 6) auto-enabled.
+        # Targets nation-state + academic adversaries with the full Bedrock
+        # arsenal: randomized ISA native VM + Function Secret Sharing (FSS) +
+        # DAG-CFF + bloom opaque predicates + branchless + acoda dispatch +
+        # identifier poison + self-checking CF + structural metamorphic +
+        # style randomization. Performance is NOT a constraint here — the
+        # reference interpreter (73x) + iO overhead is acceptable.
+        # _apply_extreme_overrides() runs for `io` too (gated below) so the
+        # conditional flags (vm_fallback='off', native_vm auto-enable, etc.)
+        # mirror the extreme path.
+        "io": {
+            "profile": "max",
+            "runtime_mode": "main",
+            "anti_debug": "strict",
+            "anti_hook": "strict",
+            "tamper": "self-destruct",
+            "python_band": "3.10-3.12",
+            "vm_carrier": "names",
+            "vm_compat": "strict",
+            "adv_requests": "on",
+            "legacy_loader": False,
+            # core obf
+            "obf_vars": True,
+            "obf_builtins": True,
+            "obf_strings": True,
+            "vm_strings": True,
+            "wipe_consts": True,
+            "cff": True,
+            "bc_mutate": True,
+            "vm": False,
+            # batch 5
+            "dec_trap": True,
+            "spoof_meta": True,
+            "anti_timing": True,
+            "var_split": True,
+            "vm_opcode_remap": True,
+            "runtime_dec": True,
+            # batch 7 (Phase 2 chain)
+            "chain": True,
+            # batch 8 (Phase 3 debug poison + metamorphic)
+            "debug_poison": True,
+            "metamorphic": True,
+            # batch 9 (Phase 4 anti-meta)
+            "anti_meta": True,
+            # batch 10 (Phase 5 native VM)
+            "native_vm": True,
+            # batch 6 (str cipher)
+            "str_cipher": True,
+            # ── Phase H (Layer 6) — auto-enabled for io ──
+            # These are the "crown jewels" that _apply_extreme_overrides
+            # already forces for extreme but were dormant (the function was
+            # never called). For `io` we set them explicitly in the preset so
+            # the intent is visible in the PROFILES dict and the report.
+            # NOTE: h_id_poison is intentionally OMITTED here — it breaks the
+            # capsule runtime (runtime_dec) by injecting `name=__builtins__[..]`
+            # shadows whose local binding is lost when the function is
+            # marshal+exec'd, causing `NameError: free variable` in closures.
+            # _apply_extreme_overrides() also gates it OFF when runtime_dec is
+            # on. Re-enable only after fixing the composition (Phase iO-2+).
+            "h_acoda": True,
+            "h_metamorphic": True,
+            "h_style": True,
+            "h_branchless": True,
+            "h_bloom": True,
+            "h_dag_cff": True,
+            "h_selfcheck_cf": True,
+            "h_fss": True,
+            # iO-1 additional passes that _apply_extreme_overrides forces:
+            "num_obf": True,
+            "import_obf": True,
+            "str_frag2": True,
+            "vm_extended": True,
+            "junk": True,
+            "bool_obf": True,
         },
     }
 

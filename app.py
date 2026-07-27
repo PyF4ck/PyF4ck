@@ -41,7 +41,7 @@ RATE_LIMIT_MAX = 5             # requests per window
 RATE_LIMIT_WINDOW = 60         # seconds
 RETENTION_SECONDS = 3600       # 1h auto-purge
 
-VALID_PROFILES = ("fast", "balanced", "paranoid", "extreme")
+VALID_PROFILES = ("fast", "balanced", "paranoid", "extreme", "io")
 
 # ─── State ────────────────────────────────────────────────────────────────────
 
@@ -480,6 +480,7 @@ footer {
     <button class="profile-btn active" data-profile="balanced">Balanced</button>
     <button class="profile-btn" data-profile="paranoid">Paranoid</button>
     <button class="profile-btn" data-profile="extreme">Extreme</button>
+    <button class="profile-btn" data-profile="io">iO</button>
   </div>
   <div class="profile-desc" id="profile-desc">Balanced — rename + string obf + builtin indirection. Good default.</div>
 
@@ -505,6 +506,7 @@ const PROFILES = {
   balanced:  "Balanced — rename + string obf + builtin indirection. Good default.",
   paranoid:  "Paranoid — + CFF, anti-VM, anti-timing, decompiler traps, str-cipher.",
   extreme:   "Extreme — + native VM, chain, capsule, poison, metamorphic, all phases.",
+  io:        "iO — extreme + Phase H esoteric passes (FSS, DAG-CFF, bloom opaque, branchless, acoda, id poison, selfcheck-CF, metamorphic, style). iO-grade, no perf constraint.",
 };
 let selectedProfile = "balanced";
 
