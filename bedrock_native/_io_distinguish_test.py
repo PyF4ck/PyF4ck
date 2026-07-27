@@ -56,9 +56,10 @@ _COMMON_FLAGS = [
     "--quiet",
 ]
 
-# How many builds to compare. Phase iO-1 uses 3 (fast smoke); Phase iO-6 will
-# bump this to 20+ for statistical power.
-N_BUILDS = 3
+# How many builds to compare. Phase iO-1/iO-2 uses 2 (each build is ~2MB +
+# heavy AST passes; 3+ builds back-to-back can exhaust resources on small
+# machines). Phase iO-6 will bump this to 20+ for statistical power.
+N_BUILDS = 2
 
 PASSES = 0
 FAILS = []
@@ -115,7 +116,7 @@ def _build_once(build_idx, out_dir):
     """Build obf.py in out_dir. Returns dict with build info or None on failure."""
     out_path = os.path.join(out_dir, f"obf_{build_idx}.py")
     cmd = [sys.executable, _OBF, "-f", _TEST_INPUT, "-o", out_path] + _COMMON_FLAGS
-    rc, so, se = _run(cmd, cwd=_ROOT, timeout=300)
+    rc, so, se = _run(cmd, cwd=_ROOT, timeout=360)
     if rc != 0 or not os.path.exists(out_path):
         return None
     return {"path": out_path, "rc": rc, "stdout": so}

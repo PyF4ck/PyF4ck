@@ -383,6 +383,11 @@ except:
         fss_mode: str = 'auto'
         fss_shares: int = 3
         fss_all_eligible: bool = False
+        # Phase iO-3: crypto opaque predicates grade.
+        # 'algebra' = trivial x*(x-1)%2==0 (Z3 folds in seconds).
+        # 'crypto' = DL/LWE/hash-chain/RSA (Z3 can't fold).
+        # 'hybrid' = algebra AND crypto (solver must crack both).
+        opaque_grade: str = 'algebra'
 
         @classmethod
         def from_args(cls, args) -> "BuildContext":
@@ -470,6 +475,7 @@ except:
                 fss_mode=getattr(args, 'fss_mode', 'auto') or 'auto',
                 fss_shares=int(getattr(args, 'fss_shares', 3) or 3),
                 fss_all_eligible=bool(getattr(args, 'fss_all_eligible', False)),
+                opaque_grade=getattr(args, 'opaque_grade', 'algebra') or 'algebra',
             )
 
 
@@ -5373,6 +5379,13 @@ except Exception:
                                      help='[iO-2] Lift the 3-5 cap → share ALL eligible functions (iO-grade coverage).')
             self.parser.add_argument('--no-fss-all-eligible', dest='fss_all_eligible', action='store_false',
                                      help='Disable --fss-all-eligible (override profile auto-enable).')
+            # Phase iO-3: crypto opaque predicates
+            self.parser.add_argument('--opaque-grade', dest='opaque_grade', default='algebra',
+                                     choices=['algebra', 'crypto', 'hybrid'],
+                                     help='[iO-3] Opaque-predicate grade. algebra = trivial '
+                                          'x*(x-1)%2==0 (Z3 folds). crypto = DL/LWE/hash/RSA '
+                                          '(Z3 cannot fold). hybrid = both. Default algebra '
+                                          '(io profile auto-sets crypto).')
             # H.10 TLS callback injection (native PE post-build).
             self.parser.add_argument('--h-tls-callback', dest='h_tls_callback',
                                      action=argparse.BooleanOptionalAction, default=None,
@@ -6267,7 +6280,7 @@ except Exception:
                 _h_modules = {}
                 for _h_mod in ('_identifier_poison', '_acoda', '_metamorphic',
                                '_branchless', '_bloom_obf', '_dag_cff',
-                               '_selfcheck_cf', '_fss'):
+                               '_selfcheck_cf', '_fss', '_opaque_crypto'):
                     try:
                         _h_modules[_h_mod] = _h_imp.import_module(_h_mod)
                     except Exception as _e:
@@ -6296,6 +6309,7 @@ except Exception:
                             '_br_bloom_contains', '_br_ds1', '_br_ds2',
                             '_br_path', '_br_structural_mutate',
                             '_br_meta_shard', '_br_bloom_array',
+                            '_br_hchain',  # Phase iO-3: hash-chain helper
                         })
                         _build_ctx.keep_names = _kn
                     except Exception:
@@ -6303,7 +6317,21 @@ except Exception:
                 # Register each pass in declaration order (reverse stack ->
                 # last declared runs first). The try/except per pass means a
                 # failure in one H pass doesn't block the others.
+                # Phase iO-3: set the crypto-opaque gate flag from
+                # opaque_grade. The pass spec below checks
+                # getattr(args, 'h_crypto_opaque', False); we synthesize it
+                # from opaque_grade != 'algebra' so the user controls it via
+                # --opaque-grade (and io profile auto-sets 'crypto').
+                _og = str(getattr(args, 'opaque_grade', 'algebra') or 'algebra')
+                args.h_crypto_opaque = (_og in ('crypto', 'hybrid'))
                 _h_pass_specs = [
+                    # Phase iO-3: crypto opaque predicates. Declared FIRST so
+                    # it runs LAST (reverse-stack) — after bloom has injected
+                    # its `if _br_bloom_contains(c): <dead>` sites, this pass
+                    # wraps each in `if <crypto_pred> and _br_bloom_contains(c):`.
+                    # Gated on opaque_grade != 'algebra' (auto-on for extreme/io).
+                    ('h_crypto_opaque', 'h_crypto_opaque', '_opaque_crypto',
+                     'apply_opaque_crypto'),
                     ('h_id_poison', 'h_id_poison', '_identifier_poison',
                      'apply_identifier_poison'),
                     ('h_acoda', 'h_acoda', '_acoda', 'apply_acoda'),
@@ -6985,6 +7013,10 @@ except Exception:
             # predicates get XOR sharing, int-returning get additive, and
             # any repr-safe return (tuples, lists, dicts) gets serialized.
             "fss_all_eligible": True,
+            # Phase iO-3: crypto opaque predicates. Replace algebraic
+            # x*(x-1)%2==0 (Z3 folds in seconds) with DL/LWE/hash/RSA
+            # (Z3 cannot fold). 'crypto' grade auto-on for io.
+            "opaque_grade": "crypto",
         },
     }
 
