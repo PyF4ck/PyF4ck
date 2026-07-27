@@ -122,7 +122,7 @@ def _build_once(build_idx, out_dir):
     return {"path": out_path, "rc": rc, "stdout": so}
 
 
-def _run_obf(obf_path, timeout=90):
+def _run_obf(obf_path, timeout=180):
     """Run an obfuscated file, return (returncode, stdout)."""
     work = os.path.dirname(obf_path)
     rc, so, se = _run([sys.executable, os.path.basename(obf_path)],

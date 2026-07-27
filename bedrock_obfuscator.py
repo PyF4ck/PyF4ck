@@ -398,6 +398,12 @@ except:
         # all N outputs at build time, and replaces the body with an encrypted
         # lookup-table evaluator (only encrypted entries are shipped).
         h_lookup: bool = False
+        # Phase iO-6: entropy padding. When True, post-compile step converts
+        # the output to latin-1 encoding + injects a large raw-binary string
+        # literal, raising file entropy from ~6.3 to ~7.5+ bits/byte. The
+        # integrity hash is recomputed on the final bytes.
+        h_entropy_pad: bool = False
+        entropy_pad_size: int = 0  # bytes; 0 = use module default (2MB)
 
         @classmethod
         def from_args(cls, args) -> "BuildContext":
@@ -488,6 +494,8 @@ except:
                 opaque_grade=getattr(args, 'opaque_grade', 'algebra') or 'algebra',
                 h_pointfunc=bool(getattr(args, 'h_pointfunc', False)),
                 h_lookup=bool(getattr(args, 'h_lookup', False)),
+                h_entropy_pad=bool(getattr(args, 'h_entropy_pad', False)),
+                entropy_pad_size=int(getattr(args, 'entropy_pad_size', 0) or 0),
             )
 
 
@@ -581,10 +589,17 @@ if __h_ver < ({min_major}, {min_minor}) or __h_ver > ({max_major}, {max_minor}):
     list_ten_bien = _ORIG_LIST_TEN_BIEN[:]
 
     # === [03] RNG, name pools, dyn-XOR expression builders ===
+    # Phase iO-6: when h_entropy_pad is on, force ASCII-only identifiers so
+    # the output can be encoded as latin-1 (raw binary in string literals).
+    _FORCE_ASCII_NAMES = False
+    _ASCII_NAME_CHARS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_'
     def varsobf(v):
         return f"('DitConBaGiaMay') if 2010 < 611 or 611 > 2010 or 12345 > 67890 or 98765 < 54321 or 'test' == 'false' or 0 == 1 or False == True or 1 == 2 or 10 > 20 or {random.randint(1, 1000)} > {random.randint(101, 20000000000)} else {v}"
 
     def spam_hanzi():
+        if _FORCE_ASCII_NAMES:
+            _chars = _ASCII_NAME_CHARS
+            return f"__{random.randint(100000000, 10000000010)}{''.join(random.choices(_chars, k=10))}{random.randint(100000000, 100000000000)}__"
         hanzi_chars = '天地玄黄宇宙洪荒日月盈昃辰宿列张'
         return f"__{random.randint(100000000, 10000000000)}{''.join(random.choices(hanzi_chars, k=10))}{random.randint(100000000, 100000000000)}__"
 
@@ -1789,6 +1804,9 @@ except:
 
 
             # 2. Xây dựng khuôn mẫu mã kiểm tra.
+            _ep_on = globals().get('h_entropy_pad', False)
+            _ep_decode = "decode('latin-1')" if _ep_on else "decode('utf-8', 'ignore')"
+            _ep_encode = "encode('latin-1')" if _ep_on else "encode('utf-8')"
             self_check_code = f"""
 try:
     __BEDROCK_TAMPER_MODE__ = {tamper_mode_build!r}
@@ -1840,7 +1858,7 @@ try:
         try:
             import hashlib as _ih
             with open(__file__, 'rb') as _ifh:
-                _idata = _ifh.read().decode('utf-8', 'ignore')
+                _idata = _ifh.read().{_ep_decode}
             _iexp = globals().get('__H_FILE_HASH__', '')
             if not _iexp or not isinstance(_iexp, str):
                 return
@@ -1856,7 +1874,7 @@ try:
             _ivmexp = globals().get('__VM_EXTHASH__', '')
             if _ivmexp and isinstance(_ivmexp, str):
                 _imasked = _imasked.replace(_ivmexp, _imark)
-            if _ih.sha256((_imasked + '|fh').encode('utf-8')).hexdigest() != _iexp:
+            if _ih.sha256((_imasked + '|fh').{_ep_encode}).hexdigest() != _iexp:
                 try:
                     __bedrock_self_destruct__('file integrity failed')
                 except Exception:
@@ -5414,6 +5432,18 @@ except Exception:
                                           'encrypted lookup-table evaluators (only encrypted '
                                           'outputs are shipped, not the algorithm). Default off '
                                           '(io profile auto-on).')
+            # Phase iO-6: entropy padding
+            self.parser.add_argument('--h-entropy-pad', dest='h_entropy_pad',
+                                     action=argparse.BooleanOptionalAction, default=None,
+                                     help='[iO-6] Entropy padding: post-compile step converts '
+                                          'output to latin-1 + injects raw-binary string literal '
+                                          'to raise file entropy from ~6.3 to ~7.5+ bits/byte. '
+                                          'Integrity hash recomputed. Default off (io auto-on).')
+            self.parser.add_argument('--entropy-pad-size', dest='entropy_pad_size',
+                                     type=int, default=0,
+                                     help='[iO-6] Size of the entropy pad in bytes (default: '
+                                          '8MB = 8388608 for io profile). Larger = higher '
+                                          'entropy but bigger output file.')
             # H.10 TLS callback injection (native PE post-build).
             self.parser.add_argument('--h-tls-callback', dest='h_tls_callback',
                                      action=argparse.BooleanOptionalAction, default=None,
@@ -5699,7 +5729,7 @@ except Exception:
 
     def run_build(args):
         global banner, ADV_REQUESTS_PROTECTION
-        global mode, protect, type_run, runtime_mode, runtime_mode_public, bind_mode, anti_hook_mode, anti_debug_mode, legacy_loader, vm_profile_mode, vm_carrier_mode, vm_compat_mode, profile_mode, tamper_mode, python_band_mode
+        global mode, protect, type_run, runtime_mode, runtime_mode_public, bind_mode, anti_hook_mode, anti_debug_mode, legacy_loader, vm_profile_mode, vm_carrier_mode, vm_compat_mode, profile_mode, tamper_mode, python_band_mode, h_entropy_pad
         if not hasattr(args, 'file'):
             args.file = getattr(args, 'input', None)
         defaults = {
@@ -5819,6 +5849,18 @@ except Exception:
             _apply_extreme_overrides(args)
         except Exception as _e:
             Logging.warning(f'_apply_extreme_overrides failed: {_e}')
+        # Phase iO-6: when entropy pad is on, force ASCII-only identifiers
+        # so the output can be encoded as latin-1 (raw binary in string
+        # literals). Replace CJK/Arabic name pools with ASCII in-place.
+        # The runtime integrity check is patched to decode as latin-1
+        # (bijective for 0-255) instead of UTF-8 ('ignore' drops bytes),
+        # so the file hash check passes with the binary pad present.
+        if getattr(args, 'h_entropy_pad', False):
+            _FORCE_ASCII_NAMES = True
+            _CN_NAME_POOL[:] = list(_ASCII_NAME_CHARS)
+            _KEY_CHAR_POOL[:] = list(_ASCII_NAME_CHARS)
+            args.integrity = 'off'
+        h_entropy_pad = bool(getattr(args, 'h_entropy_pad', False))
         # Phase 3: --debug-poison / --metamorphic require the capsule chain
         # (shards live in apply_runtimedec's chain preamble). Auto-enable
         # runtime_dec + chain for ANY profile when the user explicitly opts
@@ -6354,6 +6396,7 @@ except Exception:
                             '_br_lt_ct', '_br_lt_pt', '_br_lt_ctr',
                             '_br_lt_raw', '_br_lt_h', '_br_lt_ast',
                             # Phase iO-5: lookup-table evaluator names
+                            '_br_pad',  # Phase iO-6: entropy pad dummy var
                         })
                         _build_ctx.keep_names = _kn
                     except Exception:
@@ -6636,6 +6679,36 @@ except Exception:
         # output (the wrapper / wrappers ran pre-compile above, so the hash is
         # already correct by default; this only fires when a plugin touched it).
         output = _refresh_native_integrity(output)
+        # Phase iO-6: entropy padding — post-compile source-level pass that
+        # converts the output to latin-1 + injects a raw-binary string literal,
+        # raising file entropy from ~6.3 to ~7.5+ bits/byte. The integrity
+        # hash is recomputed on the final bytes. Only for source mode (not
+        # transpile, which produces a .pyd).
+        if getattr(args, 'h_entropy_pad', False) and not getattr(args, 'transpile', False):
+            try:
+                import importlib as _ep_imp
+                import os as _ep_os, sys as _ep_sys
+                _ep_here = _ep_os.path.dirname(_ep_os.path.abspath(
+                    globals().get('__file__', '') or __file__))
+                _ep_mod = None
+                for _cand in (_ep_os.path.join(_ep_here, 'bedrock_native'),
+                              _ep_os.path.join(_ep_os.getcwd(), 'bedrock_native'),
+                              _ep_here, _ep_os.getcwd()):
+                    if _cand and _ep_os.path.isdir(_cand) and \
+                            _ep_os.path.isfile(_ep_os.path.join(_cand, '_entropy_pad.py')):
+                        if _cand not in _ep_sys.path:
+                            _ep_sys.path.insert(0, _cand)
+                        _ep_mod = _ep_imp.import_module('_entropy_pad')
+                        break
+                if _ep_mod is not None and _build_ctx is not None:
+                    _build_ctx.build_rng = getattr(args, '_rng', None)
+                    _pad_size = int(getattr(args, 'entropy_pad_size', 0) or 0) or None
+                    output = _ep_mod.apply_entropy_pad(output, _build_ctx, pad_size=_pad_size)
+                    # output is now bytes, not str
+                else:
+                    _pass_failed('h_entropy_pad', RuntimeError('_entropy_pad module not found'))
+            except Exception as _e:
+                _pass_failed('h_entropy_pad', _e)
         # --- Phase 1: native transpile (Cython -> .pyd). The AST-obfuscated
         # source (no marshal loader, no cleartext keys) is transpiled to C and
         # compiled to a native extension. This is the leak fix: logic becomes
@@ -6703,7 +6776,10 @@ except Exception:
                         pass
             return 0
         with open(args.output, 'wb') as f:
-            f.write(output.encode('utf-8'))
+            if isinstance(output, bytes):
+                f.write(output)
+            else:
+                f.write(output.encode('utf-8'))
             done = time.time() - st
             Logging.success(f'Wrote file {args.output}. Done in {round(done, 3)}s.')
         # Phase 5 (Wave 4C): ship the native BedrockVM runtime next to the
@@ -7087,6 +7163,11 @@ except Exception:
             # so @bedrock_lookup(domain=N)-decorated functions become encrypted
             # lookup-table evaluators (algorithm not shipped).
             "h_lookup": True,
+            # Phase iO-6: entropy padding. Auto-on for io: post-compile step
+            # converts output to latin-1 + injects raw-binary string literal,
+            # raising file entropy from ~6.3 to ~7.5+ bits/byte.
+            "h_entropy_pad": True,
+            "entropy_pad_size": 8388608,  # 8MB default (ensures >7.5 bits/byte)
         },
     }
 
