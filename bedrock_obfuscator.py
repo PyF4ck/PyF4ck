@@ -388,6 +388,11 @@ except:
         # 'crypto' = DL/LWE/hash-chain/RSA (Z3 can't fold).
         # 'hybrid' = algebra AND crypto (solver must crack both).
         opaque_grade: str = 'algebra'
+        # Phase iO-4: point-function obfuscation. When True, the pass scans
+        # for @bedrock_pointfunc(alpha=...)-decorated functions and replaces
+        # their bodies with hash-based point-function evaluators (alpha is
+        # NOT shipped — only its hash under a per-build salt).
+        h_pointfunc: bool = False
 
         @classmethod
         def from_args(cls, args) -> "BuildContext":
@@ -476,6 +481,7 @@ except:
                 fss_shares=int(getattr(args, 'fss_shares', 3) or 3),
                 fss_all_eligible=bool(getattr(args, 'fss_all_eligible', False)),
                 opaque_grade=getattr(args, 'opaque_grade', 'algebra') or 'algebra',
+                h_pointfunc=bool(getattr(args, 'h_pointfunc', False)),
             )
 
 
@@ -5386,6 +5392,14 @@ except Exception:
                                           'x*(x-1)%2==0 (Z3 folds). crypto = DL/LWE/hash/RSA '
                                           '(Z3 cannot fold). hybrid = both. Default algebra '
                                           '(io profile auto-sets crypto).')
+            # Phase iO-4: point-function obfuscation
+            self.parser.add_argument('--h-pointfunc', dest='h_pointfunc',
+                                     action=argparse.BooleanOptionalAction, default=None,
+                                     help='[iO-4] Point-function obfuscation: replace '
+                                          '@bedrock_pointfunc(alpha=...)-decorated functions '
+                                          'with hash-based evaluators (alpha is NOT shipped, '
+                                          'only its hash under a per-build salt). Default off '
+                                          '(io profile auto-on).')
             # H.10 TLS callback injection (native PE post-build).
             self.parser.add_argument('--h-tls-callback', dest='h_tls_callback',
                                      action=argparse.BooleanOptionalAction, default=None,
@@ -6138,6 +6152,13 @@ except Exception:
             except StopIteration:
                 operations.insert(0, step)
 
+        def _insert_before_obf_vars(step):
+            try:
+                idx = next(i for i, op in enumerate(operations) if op is Methods.obf_vars)
+                operations.insert(idx, step)
+            except StopIteration:
+                operations.insert(0, step)
+
         def _insert_before_compile(step):
             try:
                 idx = next(i for i, op in enumerate(operations)
@@ -6256,7 +6277,8 @@ except Exception:
         # _apply_runtime_wrappers below).
         if any(getattr(args, _h, False) for _h in (
                 'h_id_poison', 'h_acoda', 'h_metamorphic', 'h_branchless',
-                'h_bloom', 'h_dag_cff', 'h_selfcheck_cf', 'h_fss')):
+                'h_bloom', 'h_dag_cff', 'h_selfcheck_cf', 'h_fss',
+                'h_pointfunc', 'h_crypto_opaque')):
             try:
                 import importlib as _h_imp
                 import os as _h_os, sys as _h_sys
@@ -6280,7 +6302,8 @@ except Exception:
                 _h_modules = {}
                 for _h_mod in ('_identifier_poison', '_acoda', '_metamorphic',
                                '_branchless', '_bloom_obf', '_dag_cff',
-                               '_selfcheck_cf', '_fss', '_opaque_crypto'):
+                               '_selfcheck_cf', '_fss', '_opaque_crypto',
+                               '_pointfunc_obf'):
                     try:
                         _h_modules[_h_mod] = _h_imp.import_module(_h_mod)
                     except Exception as _e:
@@ -6310,6 +6333,9 @@ except Exception:
                             '_br_path', '_br_structural_mutate',
                             '_br_meta_shard', '_br_bloom_array',
                             '_br_hchain',  # Phase iO-3: hash-chain helper
+                            '_br_pf_salt', '_br_pf_delta', '_br_pf_target',
+                            '_br_pf_val', '_br_pf_h', '_br_pf_h_obj',
+                            # Phase iO-4: point-function evaluator names
                         })
                         _build_ctx.keep_names = _kn
                     except Exception:
@@ -6344,8 +6370,19 @@ except Exception:
                     ('h_fss', 'h_fss', '_fss', 'apply_fss'),
                     ('h_metamorphic', 'h_metamorphic', '_metamorphic',
                      'apply_metamorphic'),
+                    # Phase iO-4: point-function obfuscation. Declared LAST
+                    # so it runs FIRST (reverse-stack) — replaces decorated
+                    # function bodies entirely before bloom/crypto-opaque/etc
+                    # transform them. Uses _insert_before_obf_vars so the
+                    # @bedrock_pointfunc decorator is detected by its
+                    # ORIGINAL name (before obf_vars renames it). Gated on
+                    # --h-pointfunc (auto-on for io).
+                    ('h_pointfunc', 'h_pointfunc', '_pointfunc_obf',
+                     'apply_pointfunc_obf', 'before'),
                 ]
-                for _h_label, _h_flag, _h_mod_name, _h_fn_name in _h_pass_specs:
+                for _h_spec in _h_pass_specs:
+                    _h_label, _h_flag, _h_mod_name, _h_fn_name = _h_spec[:4]
+                    _h_insert = _h_spec[4] if len(_h_spec) > 4 else 'after'
                     if not getattr(args, _h_flag, False):
                         continue
                     try:
@@ -6353,7 +6390,8 @@ except Exception:
                         if _h_mod is None:
                             raise RuntimeError(f'{_h_mod_name} unavailable')
                         _h_fn = getattr(_h_mod, _h_fn_name)
-                        _insert_after_obf_vars(
+                        _inserter = _insert_before_obf_vars if _h_insert == 'before' else _insert_after_obf_vars
+                        _inserter(
                             _make_ast_step(_h_label, _h_fn))
                     except Exception as _e:
                         _pass_failed(_h_label, _e)
@@ -7017,6 +7055,10 @@ except Exception:
             # x*(x-1)%2==0 (Z3 folds in seconds) with DL/LWE/hash/RSA
             # (Z3 cannot fold). 'crypto' grade auto-on for io.
             "opaque_grade": "crypto",
+            # Phase iO-4: point-function obfuscation. Auto-on for io so
+            # @bedrock_pointfunc(alpha=...)-decorated functions become
+            # hash-based evaluators (alpha not shipped).
+            "h_pointfunc": True,
         },
     }
 
