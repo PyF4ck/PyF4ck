@@ -208,6 +208,57 @@ def _runtime_int_expr() -> ast.expr:
     )
 
 
+def _struct_mixed_branch(v_name: str, walrus: ast.NamedExpr,
+                          tautology_a: ast.expr,
+                          tautology_b: ast.expr) -> ast.expr:
+    """Phase G6 structural-mix: branch on a runtime bit to pick between two
+    DIFFERENT-shape tautologies, defeating a single AST-fold rule.
+
+    Builds::
+
+        (v := runtime) and (
+            (v & 1) and <tautology_a>
+            or
+            (~(v & 1) and 1) and <tautology_b>
+        )
+
+    Both branches are always-True tautologies, so the whole expression is
+    always True regardless of ``v``. But a CSE / peephole fold rule cannot
+    collapse it: the two branches have DIFFERENT shapes (the caller passes
+    distinct tautology constructions), so the analyst must reason about BOTH
+    to discharge the predicate -- and ``v & 1`` depends on the opaque
+    runtime value, blocking concrete-exec substitution.
+
+    This replaces the weaker ``v - v`` (LWE/RSA) and ``f(x) == f(x)``
+    (hash) tautologies, which a single ``x - x -> 0`` or
+    ``same-call == same-call -> True`` fold rule collapses.
+    """
+    bit = ast.BinOp(
+        left=ast.Name(id=v_name, ctx=ast.Load()),
+        op=ast.BitAnd(),
+        right=ast.Constant(value=1),
+    )
+    not_bit = ast.UnaryOp(
+        op=ast.Invert(),
+        operand=ast.BinOp(
+            left=ast.Name(id=v_name, ctx=ast.Load()),
+            op=ast.BitAnd(),
+            right=ast.Constant(value=1),
+        ),
+    )
+    # (v & 1) and tautA ; if v&1 is 1 (truthy) -> tautA, else 0 (falsy).
+    branch_a = ast.BoolOp(op=ast.And(), values=[bit, tautology_a])
+    # (~(v & 1) and 1) and tautB ; if v&1 is 0 -> ~0 = -1 (truthy) -> tautB.
+    # (the `and 1` coerces the -1 to truthy-1 so the bit's value never leaks
+    # into the result; tautB carries the boolean meaning.)
+    branch_b = ast.BoolOp(op=ast.And(),
+                          values=[ast.BoolOp(op=ast.And(),
+                                             values=[not_bit, ast.Constant(value=1)]),
+                                  tautology_b])
+    mixed = ast.BoolOp(op=ast.Or(), values=[branch_a, branch_b])
+    return ast.BoolOp(op=ast.And(), values=[walrus, mixed])
+
+
 def gen_dl_predicate(rng, *, bits: int = 128) -> ast.expr:
     """Discrete-Log-group opaque predicate with a RUNTIME variable.
 
@@ -267,115 +318,112 @@ def gen_dl_predicate(rng, *, bits: int = 128) -> ast.expr:
 
 
 def gen_lwe_predicate(rng, *, n: int = 8, q: int = 12289) -> ast.expr:
-    """LWE-style opaque predicate with a RUNTIME variable.
+    """LWE-style opaque predicate (Phase G6 structural-mix, no ``v - v``).
 
-    Honest construction: ship the LWE equality with a runtime-variable
-    noise term that always cancels::
+    Builds::
 
-        (v := __import__('time').perf_counter_ns())
-        and ((sum(a_i*s_i) + e + (v - v)) % q == b)
+        (v := runtime) and (
+            (v & 1) and ((sum(a_i*s_i) + e) % q == b)
+            or
+            (~(v & 1) and 1) and (b == ((sum(a'_i*s'_i) + e') % q))
+        )
 
-    The runtime term ``v - v`` always evaluates to 0, so the predicate
-    reduces to the baked LWE equality ``(sum(a_i*s_i) + e) % q == b`` --
-    always True. A static analyzer sees a symbolic noise term depending on
-    an opaque runtime value and must discharge both the cancellation
-    (``v - v == 0`` for the runtime value v) AND the modular arithmetic
-    to fold the predicate -- neither is handled by standard SMT theories
-    when v is an opaque runtime integer.
+    Two DIFFERENT-shape baked LWE equalities (different random a/s/e but the
+    same b), selected by the runtime bit ``v & 1``. Both are always True, so
+    the whole predicate is always True -- but a single fold rule cannot
+    collapse it because the two branches are structurally distinct (left-vs-
+    right equality nesting) AND the selector is an opaque runtime value.
 
-    Note: the additive ``v - v`` noise term is the right modular-arithmetic-
-    safe formulation. An earlier version tried ``v*sum - v*0 + core`` outside
-    the modular reduction, but that adds a multiple of `sum` that does NOT
-    reduce to 0 mod q and breaks the equality. Adding 0 is the identity in
-    any ring, so ``+ (v - v)`` is safe.
-
-    n defaults to 8; q=12289 is the standard LWE modulus.
+    This replaces the earlier ``v - v`` cancellation: a single
+    ``x - x -> 0`` peephole rule collapsed that tautology in one step. The
+    structural mix forces the analyst to reason about BOTH LWE instances and
+    the runtime-bit selector.
     """
     s = [rng.randint(1, 8) for _ in range(n)]
     a = [rng.randint(0, q - 1) for _ in range(n)]
     e = rng.randint(0, 4)
     b = (sum(a[i] * s[i] for i in range(n)) + e) % q
+    # A second LWE instance with the SAME b but different a'/s'/e'.
+    s2 = [rng.randint(1, 8) for _ in range(n)]
+    a2 = [rng.randint(0, q - 1) for _ in range(n)]
+    e2 = rng.randint(0, 4)
+    # Re-derive s2 so the second instance also equals b (baked, always True).
+    target = b
+    base = (sum(a2[i] * s2[i] for i in range(n)) + e2) % q
+    e2 = (target - base + e2 + q) % q  # adjust e2 so a2.s2 + e2 == b mod q
+    # Sanity: a2.s2 + e2 must equal b mod q (baked tautology).
+    assert (sum(a2[i] * s2[i] for i in range(n)) + e2) % q == b
+
     v_name = _fresh_walrus_name(rng)
-    # baked inner sum: sum([a0*s0, ...]).
-    terms = [ast.BinOp(left=ast.Constant(value=a[i]), op=ast.Mult(),
-                      right=ast.Constant(value=s[i])) for i in range(n)]
-    baked_sum = ast.Call(func=ast.Name(id='sum', ctx=ast.Load()),
-                         args=[ast.List(elts=terms, ctx=ast.Load())], keywords=[])
-    # (v - v) -> always 0 but symbolic on the runtime variable v.
-    runtime_cancel = ast.BinOp(
-        left=ast.Name(id=v_name, ctx=ast.Load()), op=ast.Sub(),
-        right=ast.Name(id=v_name, ctx=ast.Load()))
-    # ((sum + e + (v - v)) % q) == b   -> (sum + e + 0) % q == b  (LWE baked)
-    sum_plus_e_plus_cancel = ast.BinOp(
-        left=ast.BinOp(left=baked_sum, op=ast.Add(), right=ast.Constant(value=e)),
-        op=ast.Add(), right=runtime_cancel)
-    lhs = ast.BinOp(left=sum_plus_e_plus_cancel, op=ast.Mod(), right=ast.Constant(value=q))
     walrus = ast.NamedExpr(target=ast.Name(id=v_name, ctx=ast.Store()),
                            value=_runtime_int_expr())
-    cmp = ast.Compare(left=lhs, ops=[ast.Eq()], comparators=[ast.Constant(value=b)])
-    return ast.BoolOp(op=ast.And(), values=[walrus, cmp])
+    # Branch A: ((sum(a*s) + e) % q) == b  (left-nested)
+    terms_a = [ast.BinOp(left=ast.Constant(value=a[i]), op=ast.Mult(),
+                        right=ast.Constant(value=s[i])) for i in range(n)]
+    sum_a = ast.Call(func=ast.Name(id='sum', ctx=ast.Load()),
+                     args=[ast.List(elts=terms_a, ctx=ast.Load())], keywords=[])
+    lhs_a = ast.BinOp(
+        left=ast.BinOp(left=sum_a, op=ast.Add(), right=ast.Constant(value=e)),
+        op=ast.Mod(), right=ast.Constant(value=q))
+    taut_a = ast.Compare(left=lhs_a, ops=[ast.Eq()], comparators=[ast.Constant(value=b)])
+    # Branch B: b == ((sum(a'*s') + e') % q)  (right-nested, reversed operands)
+    terms_b = [ast.BinOp(left=ast.Constant(value=a2[i]), op=ast.Mult(),
+                        right=ast.Constant(value=s2[i])) for i in range(n)]
+    sum_b = ast.Call(func=ast.Name(id='sum', ctx=ast.Load()),
+                     args=[ast.List(elts=terms_b, ctx=ast.Load())], keywords=[])
+    rhs_b = ast.BinOp(
+        left=ast.BinOp(left=sum_b, op=ast.Add(), right=ast.Constant(value=e2)),
+        op=ast.Mod(), right=ast.Constant(value=q))
+    taut_b = ast.Compare(left=ast.Constant(value=b), ops=[ast.Eq()], comparators=[rhs_b])
+    return _struct_mixed_branch(v_name, walrus, taut_a, taut_b)
 
 
 def gen_hash_predicate(rng, *, n_min: int = 3, n_max: int = 15) -> ast.expr:
-    """Hash-chain opaque predicate with a RUNTIME variable (Random Oracle Model).
+    """Hash-chain opaque predicate (Phase G6 structural-mix, no f(x)==f(x)).
 
-    Ships the expression::
+    Builds a structural mix: branch on the runtime bit (v & 1) to pick
+    between two DIFFERENT-shape hash tautologies -- ``H(v) == H(v)``
+    (Compare Eq) and ``(H(v) - H(v)) == 0`` (Compare Eq over BinOp Sub).
+    Both are always True (a deterministic function agrees with itself), so
+    the whole predicate is always True; but a single ``same-call==same-call
+    -> True`` fold rule cannot collapse the Sub variant. The runtime-bit
+    selector blocks concrete-exec substitution.
 
-        (v := id(object())) and H_n(<fixed_seed> + int.to_bytes(v, 8, 'big')) == H_n(<fixed_seed>)
+    Replaces the earlier single ``f(x) == f(x)`` formulation, which one fold
+    rule (recognize syntactically-identical uninterpreted calls) collapses.
 
-    ... which is NOT always True (v changes the hash input). Instead, we use
-    the honest "hash of runtime value equals itself" formulation::
-
-        (v := id(object())) and int.from_bytes(_br_hchain(_br_int_to_bytes(v), n), 'big') == int.from_bytes(_br_hchain(_br_int_to_bytes(v), n), 'big')
-
-    This calls the hash chain TWICE on the SAME runtime v (captured once via
-    walrus), so both sides always agree for any v. Folding requires the SMT
-    solver to recognize that two syntactically-identical calls to an
-    uninterpreted function return equal values AND that the walrus capture
-    is the same value on both sides -- a tautology, but one that requires
-    reasoning about determinism of an uninterpreted function, which Z3's
-    standard theories do not handle automatically.
-
-    n is per-build random in [n_min, n_max] (kept small for runtime perf:
-    each predicate site costs 2n SHA-256 calls per evaluation).
+    n is per-build random in [n_min, n_max]; only ONE branch runs per eval
+    (Python and/or short-circuit), so cost stays 2n SHA-256 calls per eval.
     """
     n = rng.randint(n_min, n_max)
     v_name = _fresh_walrus_name(rng)
     walrus = ast.NamedExpr(target=ast.Name(id=v_name, ctx=ast.Store()),
                            value=_runtime_int_expr())
-    # _br_hchain(v.to_bytes(8, 'big'), n)  -- runtime input depends on v.
-    chain_call = ast.Call(
-        func=ast.Name(id='_br_hchain', ctx=ast.Load()),
-        args=[
-            ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id=v_name, ctx=ast.Load()),
-                    attr='to_bytes', ctx=ast.Load()),
-                args=[ast.Constant(value=8), ast.Constant(value='big')], keywords=[]),
-            ast.Constant(value=n)],
-        keywords=[])
-    # int.from_bytes(<chain>, 'big')  -> so the equality compares ints (hashable).
-    lhs = ast.Call(func=ast.Attribute(
-        value=ast.Name(id='int', ctx=ast.Load()),
-        attr='from_bytes', ctx=ast.Load()),
-        args=[chain_call, ast.Constant(value='big')], keywords=[])
-    # The RHS is a literal copy of the same chain_call expression (same v).
-    rhs_chain_call = ast.Call(
-        func=ast.Name(id='_br_hchain', ctx=ast.Load()),
-        args=[
-            ast.Call(
-                func=ast.Attribute(
-                    value=ast.Name(id=v_name, ctx=ast.Load()),
-                    attr='to_bytes', ctx=ast.Load()),
-                args=[ast.Constant(value=8), ast.Constant(value='big')], keywords=[]),
-            ast.Constant(value=n)],
-        keywords=[])
-    rhs = ast.Call(func=ast.Attribute(
-        value=ast.Name(id='int', ctx=ast.Load()),
-        attr='from_bytes', ctx=ast.Load()),
-        args=[rhs_chain_call, ast.Constant(value='big')], keywords=[])
-    cmp = ast.Compare(left=lhs, ops=[ast.Eq()], comparators=[rhs])
-    return ast.BoolOp(op=ast.And(), values=[walrus, cmp])
+
+    def _h_of_v():
+        # int.from_bytes(_br_hchain(v.to_bytes(8, 'big'), n), 'big')
+        return ast.Call(func=ast.Attribute(
+            value=ast.Name(id='int', ctx=ast.Load()),
+            attr='from_bytes', ctx=ast.Load()),
+            args=[ast.Call(
+                func=ast.Name(id='_br_hchain', ctx=ast.Load()),
+                args=[
+                    ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Name(id=v_name, ctx=ast.Load()),
+                            attr='to_bytes', ctx=ast.Load()),
+                        args=[ast.Constant(value=8), ast.Constant(value='big')],
+                        keywords=[]),
+                    ast.Constant(value=n)],
+                keywords=[]),
+            ast.Constant(value='big')], keywords=[])
+
+    # Branch A: H(v) == H(v)   (Compare Eq over two identical calls)
+    taut_a = ast.Compare(left=_h_of_v(), ops=[ast.Eq()], comparators=[_h_of_v()])
+    # Branch B: (H(v) - H(v)) == 0   (Compare Eq over a BinOp Sub)
+    diff = ast.BinOp(left=_h_of_v(), op=ast.Sub(), right=_h_of_v())
+    taut_b = ast.Compare(left=diff, ops=[ast.Eq()], comparators=[ast.Constant(value=0)])
+    return _struct_mixed_branch(v_name, walrus, taut_a, taut_b)
 
 
 _HASH_HELPER_SRC = (
@@ -389,32 +437,21 @@ _HASH_HELPER_SRC = (
 
 
 def gen_rsa_predicate(rng, *, bits: int = 128) -> ast.expr:
-    """RSA-factoring-based opaque predicate with a RUNTIME variable.
+    """RSA-factoring-based opaque predicate (Phase G6 structural-mix, no v-v).
 
-    Ships the expression::
+    Builds a structural mix: branch on the runtime bit (v & 1) to pick
+    between two DIFFERENT-shape baked-RSA tautologies -- ``pow(c, e, N) ==
+    c_pow_e`` (Compare Eq) and ``(pow(c, e, N) ^ c_pow_e) == 0`` (Compare Eq
+    over a BinOp BitXor). Both are always True (c_pow_e is baked as
+    pow(c,e,N)), but a single ``same==same -> True`` fold rule cannot
+    collapse the XOR variant; the analyst must reason about both branches
+    AND the runtime-bit selector.
 
-        (v := id(object())) and pow(v + (c_pow_e - c_pow_e), e, N) == pow(c_pow_e - c_pow_e + c, e, N)
-
-    Simplified honest form: by RSA-arith, pow(c, e, N) == c_pow_e is the
-    trivial baked equality; to add a runtime variable that defeats
-    concrete-exec we use::
-
-        (v := id(object())) and pow(c, e, N) == pow(c + (v - v), e, N)
-
-    The `v - v` term is always 0 (so the RHS reduces to pow(c, e, N) ==
-    c_pow_e, always True), but a static analyzer sees a symbolic modpow of
-    an opaque-runtime-dependent input. Folding requires recognizing that
-    ``v - v == 0`` for the opaque runtime value v AND that
-    ``pow(c, e, N) == c_pow_e`` -- the second is the RSA baked-equality
-    (analyst can verify by computing it), but the first requires the analyst
-    to discharge the runtime-var tautology.
-
-    Note: this gives fold-resistance via the runtime variable + the unhandled
-    modpow theory, NOT via factoring hardness (the analyst can compute
-    pow(c,e,N) directly). The RSA hardness framing is honest about this: the
-    runtime variable is what resists symbolic folding; the RSA modulus is
-    the carrier. bits default 128 (was 32) -- enough for the runtime-variable
-    resistance to matter.
+    Replaces the earlier ``pow(c, e, N) == pow(c + (v - v), e, N)`` form,
+    which a single ``x - x -> 0`` peephole rule collapsed. Fold-resistance
+    still comes from the unhandled modpow theory + the runtime variable;
+    the RSA modulus is the carrier, not the security primitive (the analyst
+    can compute pow(c,e,N) directly). bits default 128.
     """
     N, e, d = _gen_rsa_modulus(bits)
     c = rng.randint(2, N - 2)
@@ -422,25 +459,21 @@ def gen_rsa_predicate(rng, *, bits: int = 128) -> ast.expr:
     v_name = _fresh_walrus_name(rng)
     walrus = ast.NamedExpr(target=ast.Name(id=v_name, ctx=ast.Store()),
                            value=_runtime_int_expr())
-    # RHS: pow(c + (v - v), e, N) -- v-v is 0 but symbolic on v.
-    rhs = ast.Call(
-        func=ast.Name(id='pow', ctx=ast.Load()),
-        args=[
-            ast.BinOp(left=ast.Constant(value=c), op=ast.Add(),
-                      right=ast.BinOp(left=ast.Name(id=v_name, ctx=ast.Load()),
-                                      op=ast.Sub(),
-                                      right=ast.Name(id=v_name, ctx=ast.Load()))),
-            ast.Constant(value=e), ast.Constant(value=N)],
-        keywords=[])
-    cmp = ast.Compare(
-        left=ast.Call(func=ast.Name(id='pow', ctx=ast.Load()),
-                      args=[ast.Constant(value=c), ast.Constant(value=e), ast.Constant(value=N)],
-                      keywords=[]),
-        ops=[ast.Eq()], comparators=[rhs])
-    # Remove the unused `c_pow_e`-only constant path: the LHS computes
-    # pow(c,e,N) directly (always equals c_pow_e at runtime), so we keep
-    # c_pow_e as a sanity check value during build but do not ship it.
-    return ast.BoolOp(op=ast.And(), values=[walrus, cmp])
+    pow_c = ast.Call(func=ast.Name(id='pow', ctx=ast.Load()),
+                     args=[ast.Constant(value=c), ast.Constant(value=e),
+                           ast.Constant(value=N)], keywords=[])
+    # Branch A: pow(c, e, N) == c_pow_e   (Compare Eq, left call right constant)
+    taut_a = ast.Compare(left=pow_c, ops=[ast.Eq()],
+                         comparators=[ast.Constant(value=c_pow_e)])
+    # Branch B: (pow(c, e, N) ^ c_pow_e) == 0   (Compare Eq over BinOp BitXor)
+    xor_term = ast.BinOp(left=ast.Call(func=ast.Name(id='pow', ctx=ast.Load()),
+                                        args=[ast.Constant(value=c), ast.Constant(value=e),
+                                              ast.Constant(value=N)], keywords=[]),
+                         op=ast.BitXor(),
+                         right=ast.Constant(value=c_pow_e))
+    taut_b = ast.Compare(left=xor_term, ops=[ast.Eq()],
+                         comparators=[ast.Constant(value=0)])
+    return _struct_mixed_branch(v_name, walrus, taut_a, taut_b)
 
 
 # --- Convenience wrappers ---------------------------------------------------
@@ -604,7 +637,7 @@ def _smoke() -> None:
     assert len(set(captured)) > 1, f"DL runtime var did not vary: {captured[:5]}"
     print(f"iO-3 DL: always True for 50 evals + runtime var varies ({len(set(captured))} unique)  OK")
 
-    # --- LWE (runtime cancellation) ---
+    # --- LWE (Phase G6 structural-mix) ---
     rng = _rng_for(ctx)
     lwe_pred = gen_lwe_predicate(rng, n=6)
     results, captured = _eval_many(lwe_pred)
@@ -612,7 +645,7 @@ def _smoke() -> None:
     assert len(set(captured)) > 1, "LWE runtime var did not vary"
     print(f"iO-3 LWE: always True for 50 evals + runtime var varies  OK")
 
-    # --- Hash chain (deterministic-uninterpreted-function tautology) ---
+    # --- Hash chain (Phase G6 structural-mix) ---
     rng = _rng_for(ctx)
     hash_pred = gen_hash_predicate(rng, n_min=3, n_max=8)
     ns_h = {}
@@ -622,13 +655,40 @@ def _smoke() -> None:
     assert len(set(captured)) > 1, "HASH runtime var did not vary"
     print(f"iO-3 HASH: always True for 50 evals + runtime var varies  OK")
 
-    # --- RSA (runtime cancellation via v-v) ---
+    # --- RSA (Phase G6 structural-mix) ---
     rng = _rng_for(ctx)
     rsa_pred = gen_rsa_predicate(rng, bits=128)
     results, captured = _eval_many(rsa_pred)
     assert all(r is True for r in results), f"RSA not always-True: {results[:5]}"
     assert len(set(captured)) > 1, "RSA runtime var did not vary"
     print(f"iO-3 RSA: always True for 50 evals + runtime var varies  OK")
+
+    # --- Phase G6: structural-mix verification ---
+    # The weak tautologies `v - v` (LWE/RSA) and bare `f(x) == f(x)`
+    # (hash) must NOT survive in the emitted predicates -- a single fold
+    # rule collapses them. The structural-mix branch on `v & 1` (with the
+    # `~(v & 1)` complement) must be present in LWE/Hash/RSA.
+    import re as _re
+    _g6_specs = [
+        ('LWE', lwe_pred), ('HASH', hash_pred), ('RSA', rsa_pred),
+    ]
+    for _g6_label, _g6_pred in _g6_specs:
+        ast.fix_missing_locations(ast.Expression(body=_g6_pred))
+        _g6_src = ast.unparse(_g6_pred)
+        # `v - v` (the cancelled-runtime tautology) must be GONE.
+        assert not _re.search(r'(_br_rv_[0-9a-f]+) - \1', _g6_src), \
+            f"G6 {_g6_label}: `v - v` weak tautology still present"
+        # The structural-mix `& 1` selector must be present.
+        assert '& 1' in _g6_src, f"G6 {_g6_label}: `v & 1` selector missing"
+        # The complement `~(... & 1)` must be present (two-branch mix).
+        assert '~(' in _g6_src, f"G6 {_g6_label}: `~(v & 1)` complement missing"
+    # HASH-specific: the bare `f(x) == f(x)` (two identical calls with no
+    # operator between them) is now wrapped in the structural mix; the
+    # `H(v) - H(v)` XOR-style branch must be present alongside `H(v) == H(v)`.
+    _g6_hash_src = ast.unparse(hash_pred)
+    assert '- _br_hchain' in _g6_hash_src or '- int.from_bytes' in _g6_hash_src, \
+        "G6 HASH: BinOp Sub branch missing (still pure f(x)==f(x))"
+    print("iO-3 G6 structural-mix: no `v-v` / bare `f==f`; `v&1` branch present in LWE/HASH/RSA  OK")
 
     # --- Hybrid ---
     rng = _rng_for(ctx)
