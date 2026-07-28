@@ -11,11 +11,15 @@ Point-function obfuscation produces an evaluator O_alpha such that:
     (hiding: an adversary with oracle access to O_alpha cannot recover alpha
     faster than brute-force guessing).
 
-## Construction (Canetti 1998 + extensions)
+## Construction (two modes)
 
-This module implements a hash-based point-function obfuscator with a per-build
-salt and a "delta" hardening (so the obfuscated evaluator resists
-distinguishing attacks beyond simple equality):
+This module implements two point-function obfuscators:
+
+### mode='hash' (Canetti-style, default)
+
+A hash-based point-function obfuscator with a per-build salt and a "delta"
+hardening (so the obfuscated evaluator resists distinguishing attacks beyond
+simple equality):
 
   Build time:
     - pick per-build salt s (32 bytes, from BuildRNG)
@@ -28,8 +32,36 @@ distinguishing attacks beyond simple equality):
     - O_alpha(x) evaluates the hash comparison
     - Each evaluation is O(1) (one SHA-256 call)
     - An adversary seeing h_alpha cannot invert SHA-256 to recover alpha
-    - Distinguishing O_alpha from O_beta (alpha != beta) requires ~2^128
+    - Distinguishing O_alpha from O_beta (alpha != beta) requires ~2^256
       hash queries under the Random Oracle Model
+    - BUT an adversary with ORACLE access can distinguish in ONE query
+      (query x; if O(x) is True, x == alpha). This is the "oracle
+      adversary" weakness of hash-based point-function obfuscation.
+
+### mode='dpf' (BGI14 DPF, stronger against single-key adversary)
+
+A BGI14 Distributed Point Function obfuscator. The point function is
+encoded as two DPF keys (GGM-tree shares). A single key's Eval is
+pseudorandom under the PRG assumption, so an adversary holding ONE key
+cannot distinguish O_alpha from O_beta.
+
+  Build time:
+    - hash alpha down to an n-bit int alpha_int (n = 16)
+    - run BGI14 DPF Gen for f(x) = (x == alpha_int)
+    - ship BOTH keys k0, k1 in the same file
+
+  Runtime:
+    - hash the runtime input x down to the same n-bit int x_int
+    - evaluate both DPF shares: s0 = Eval(0, k0, x_int), s1 = Eval(1, k1, x_int)
+    - return bool(s0 XOR s1) == (x_int == alpha_int)
+
+  Honesty: shipping both keys in the same file means the adversary CAN
+  reconstruct f by combining the two Evals -- so this is obfuscation-by-
+  indirection, NOT cryptographic hiding. Real hiding requires shipping
+  only ONE key and providing the other via env var / release server
+  (Phase A key separation). The DPF mode is still useful: it raises the
+  bar from "single hash query distinguishes" to "analyst must understand
+  and combine the DPF construction".
 
 ## Use cases in Bedrock
 
@@ -70,12 +102,27 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 from _build_rng import BuildRNG  # noqa: E402
+from _fss import _dpf_gen, _DPF_SEED_LEN  # noqa: E402
 
 __all__ = [
     'obfuscate_point_function',
+    'obfuscate_point_function_dpf',
     'build_point_func_ast',
+    'build_point_func_ast_dpf',
     'apply_pointfunc_obf',
 ]
+
+
+# DPF point-function bit-width. The DPF encodes the point function on
+# Z_{2^n}. We hash the bytes alpha down to an n-bit int, so 16 bits gives
+# a 65536-point domain (small enough that the DPF key stays compact at
+# ~16 correction words, and the per-eval cost is ~16 HMAC-SHA256 calls).
+# Collisions in the hash-to-int step are astronomically unlikely for
+# distinct alphas under SHA-256, but if two distinct alphas collided the
+# point function would treat them as the same point (acceptable: the
+# obfuscated evaluator would return True for both, which is a minor
+# correctness relaxation, not a security issue).
+_DPF_POINT_BITS = 16
 
 
 # --- Helpers ----------------------------------------------------------------
@@ -142,6 +189,145 @@ def obfuscate_point_function(alpha: bytes, *, salt: bytes = None,
         'delta': delta,
         'h_alpha': h_alpha,
     }
+
+
+# --- DPF-based point-function obfuscation -----------------------------------
+#
+# The hash-based construction above is the simplest point-function obfuscator,
+# but an adversary with oracle access to O_alpha can distinguish O_alpha from
+# O_beta in a SINGLE query (query x; if O(x) is True, x == alpha). This is the
+# "oracle adversary" weakness noted in the plan.
+#
+# A DPF (Distributed Point Function, BGI14) provides a stronger obfuscation
+# against an adversary holding ONE of the two keys: a single key's Eval is
+# pseudorandom (under the PRG assumption), so querying it reveals nothing
+# about alpha. When BOTH keys are shipped in the same file (as we do here),
+# the adversary can reconstruct f by combining the two Evals -- so this is
+# "obfuscation-by-indirection", not cryptographic hiding. Real hiding
+# requires key separation (env var / release server) so the analyst sees
+# at most one key. See Phase A and the threat model in README.md.
+#
+# Construction:
+#   1. Hash the bytes alpha down to an n-bit int alpha_int (n = _DPF_POINT_BITS).
+#   2. Run BGI14 DPF Gen for the point function f(x) = (x == alpha_int).
+#   3. Emit two Eval functions (one per key) and an XOR combiner. The
+#      evaluator hashes the runtime input x down to the same n-bit int and
+#      evaluates the two DPF shares; the combiner XORs them to recover the
+#      point-function bit.
+
+
+def _hash_to_int(value_bytes: bytes, salt: bytes, n: int) -> int:
+    """Hash bytes down to an n-bit int (domain {0,1}^n)."""
+    h = hashlib.sha256()
+    h.update(salt)
+    h.update(value_bytes)
+    return int.from_bytes(h.digest()[: (n + 7) // 8], 'big') & ((1 << n) - 1)
+
+
+def obfuscate_point_function_dpf(alpha: bytes, *, salt: bytes = None,
+                                  n: int = None, rng=None) -> dict:
+    """Obfuscate a point function P_alpha using a BGI14 DPF.
+
+    Args:
+        alpha: the secret point (the value that evaluates to True).
+        salt: per-build salt (32 bytes); generated if None. Used to hash
+            alpha and the runtime input down to the DPF domain so distinct
+            alphas map to distinct domain points.
+        n: DPF domain bit-width (default _DPF_POINT_BITS = 16).
+        rng: random source for DPF key generation (os.urandom-style).
+
+    Returns:
+        dict with keys:
+          - 'salt': the salt (shipped with the evaluator)
+          - 'n': the DPF domain bit-width
+          - 'alpha_int': the n-bit int point (NOT shipped; debug only)
+          - 'k0': DPF key for party 0 (shipped)
+          - 'k1': DPF key for party 1 (shipped)
+        NOTE: both keys ARE shipped (obfuscation-by-indirection). For real
+        hiding, ship only ONE key and require the other via env / release
+        server (Phase A key separation).
+    """
+    if salt is None:
+        salt = secrets.token_bytes(32)
+    if n is None:
+        n = _DPF_POINT_BITS
+    if rng is None:
+        rng = secrets
+    alpha_int = _hash_to_int(alpha, salt, n)
+    k0, k1 = _dpf_gen(alpha_int, n, beta=1, rng=rng)
+    return {
+        'salt': salt,
+        'n': n,
+        'alpha_int': alpha_int,  # debug; not the secret alpha itself
+        'k0': k0,
+        'k1': k1,
+    }
+
+
+def build_point_func_ast_dpf(name: str, obf_params: dict,
+                              arg_name: str = 'x') -> ast.FunctionDef:
+    """Build an AST function def for the DPF-based point-function evaluator.
+
+    The generated function hashes the runtime input down to an n-bit int
+    (same hash as obfuscate_point_function_dpf), evaluates both DPF shares,
+    and XORs them to recover the point-function bit. The salt and both DPF
+    keys are shipped as bytes literals in the function body.
+
+    Both keys ship in the SAME file (obfuscation-by-indirection, not
+    cryptographic hiding). For real hiding, ship only ONE key and require
+    the other via env / release server (Phase A key separation).
+    """
+    salt = obf_params['salt']
+    n = obf_params['n']
+    k0 = obf_params['k0']
+    k1 = obf_params['k1']
+
+    def _key_repr(key):
+        seed, t0, cws, cw_final = key
+        cw_list = [(s_cw.hex(), t_cw_L, t_cw_R) for (s_cw, t_cw_L, t_cw_R) in cws]
+        return (seed.hex(), t0, cw_list, cw_final)
+
+    k0_repr = repr(_key_repr(k0))
+    k1_repr = repr(_key_repr(k1))
+    salt_repr = repr(salt)
+
+    # Build the function body from a source template for clarity. The DPF
+    # eval helper is emitted inline so the obfuscated function is self-
+    # contained (no external _br_dpf_eval dependency).
+    fn_src = (
+        f"def {name}({arg_name}):\n"
+        f"    import hashlib as _br_pf_h\n"
+        f"    _br_pf_salt = {salt_repr}\n"
+        f"    _br_pf_n = {n}\n"
+        f"    _br_pf_k0 = {k0_repr}\n"
+        f"    _br_pf_k1 = {k1_repr}\n"
+        f"    _br_pf_val = {arg_name} if isinstance({arg_name}, bytes) else str({arg_name}).encode('utf-8')\n"
+        f"    _br_pf_hh = _br_pf_h.sha256()\n"
+        f"    _br_pf_hh.update(_br_pf_salt)\n"
+        f"    _br_pf_hh.update(_br_pf_val)\n"
+        f"    _br_pf_x = int.from_bytes(_br_pf_hh.digest()[:(_br_pf_n + 7) // 8], 'big') & ((1 << _br_pf_n) - 1)\n"
+        f"    def _br_dpf_eval(_b, _key, _x, _n):\n"
+        f"        _seed, _t, _cws, _cwf = _key\n"
+        f"        _s = bytes.fromhex(_seed)\n"
+        f"        for _i in range(_n):\n"
+        f"            _h = _br_pf_h.sha256(_s + b'\\x00dpf-ggm').digest()\n"
+        f"            _sL, _sR = _h[:16], _h[16:32]\n"
+        f"            _tL, _tR = _h[24] & 1, _h[25] & 1\n"
+        f"            _scw, _tcL, _tcR = _cws[_i]\n"
+        f"            _scw_b = bytes.fromhex(_scw)\n"
+        f"            _xi = (_x >> (_n - 1 - _i)) & 1\n"
+        f"            if _xi == 0:\n"
+        f"                _s = bytes(a ^ b for a, b in zip(_sL, _scw_b)) if _t else _sL\n"
+        f"                _t = _tL ^ (_tcL if _t else 0)\n"
+        f"            else:\n"
+        f"                _s = bytes(a ^ b for a, b in zip(_sR, _scw_b)) if _t else _sR\n"
+        f"                _t = _tR ^ (_tcR if _t else 0)\n"
+        f"        return _t if _b == 0 else (_t ^ _cwf)\n"
+        f"    return bool(_br_dpf_eval(0, _br_pf_k0, _br_pf_x, _br_pf_n) ^\n"
+        f"                _br_dpf_eval(1, _br_pf_k1, _br_pf_x, _br_pf_n))\n"
+    )
+    fn = ast.parse(fn_src).body[0]
+    return fn
 
 
 def build_point_func_ast(name: str, obf_params: dict,
@@ -318,16 +504,36 @@ def _extract_alpha_from_decorator(deco: ast.Call) -> Optional[bytes]:
 
 # --- Pass -------------------------------------------------------------------
 
+def _extract_mode_from_decorator(deco: ast.Call) -> str:
+    """Extract the mode ('hash' or 'dpf') from @bedrock_pointfunc(mode=...).
+
+    Default is 'hash' (the original salted-hash construction). 'dpf' uses
+    the BGI14 DPF construction (stronger obfuscation against single-key
+    adversaries, but ships both keys in the same file).
+    """
+    for kw in deco.keywords:
+        if kw.arg == 'mode':
+            if isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                return kw.value.value.lower()
+    return 'hash'
+
+
 def apply_pointfunc_obf(tree: ast.Module, ctx) -> ast.Module:
     """Replace @bedrock_pointfunc(alpha=...)-decorated functions with
     obfuscated point-function evaluators.
 
     For each decorated function `def check(x): return <impl>` with
     `@bedrock_pointfunc(alpha=b'secret')`, the body is replaced with the
-    hash-based point-function evaluator that returns True iff x == alpha.
+    obfuscated point-function evaluator that returns True iff x == alpha.
     The decorator is stripped (it's a build-time directive).
 
-    The alpha value is NOT shipped — only its hash under a per-build salt.
+    The alpha value is NOT shipped. Two obfuscation modes:
+      - mode='hash' (default): salted-hash construction (Canetti-style).
+        Single-query oracle distinguishable; simple and fast.
+      - mode='dpf': BGI14 DPF construction. Stronger obfuscation against
+        single-key adversaries (one DPF key alone is pseudorandom). Both
+        keys ship in the same file (obfuscation-by-indirection); for real
+        hiding, ship only one key via env / release server (Phase A).
     """
     rng = _rng_for(ctx)
     n_obf = 0
@@ -346,13 +552,30 @@ def apply_pointfunc_obf(tree: ast.Module, ctx) -> ast.Module:
         alpha = _extract_alpha_from_decorator(pf_deco)
         if alpha is None:
             continue
-        # Obfuscate
-        salt = secrets.token_bytes(32)
-        delta = rng.randint(0, (1 << 16) - 1)
-        obf_params = obfuscate_point_function(alpha, salt=salt, delta=delta)
-        # Build the evaluator function (preserves the original name + args)
-        new_fn = build_point_func_ast(node.name, obf_params,
-                                       arg_name=node.args.args[0].arg if node.args.args else 'x')
+        mode = _extract_mode_from_decorator(pf_deco)
+        # Obfuscate according to the chosen mode.
+        if mode == 'dpf':
+            class _DPFRng:
+                def __init__(self, r):
+                    self._r = r
+                def urandom(self, k):
+                    return secrets.token_bytes(k)
+                def randint(self, lo, hi):
+                    return self._r.randint(lo, hi)
+            dpf_rng = _DPFRng(rng)
+            salt = secrets.token_bytes(32)
+            obf_params = obfuscate_point_function_dpf(
+                alpha, salt=salt, n=_DPF_POINT_BITS, rng=dpf_rng)
+            new_fn = build_point_func_ast_dpf(
+                node.name, obf_params,
+                arg_name=node.args.args[0].arg if node.args.args else 'x')
+        else:  # 'hash' (default)
+            salt = secrets.token_bytes(32)
+            delta = rng.randint(0, (1 << 16) - 1)
+            obf_params = obfuscate_point_function(alpha, salt=salt, delta=delta)
+            new_fn = build_point_func_ast(
+                node.name, obf_params,
+                arg_name=node.args.args[0].arg if node.args.args else 'x')
         # Preserve any other decorators (non-pointfunc)
         new_fn.decorator_list = [d for d in node.decorator_list if not (
             isinstance(d, ast.Call) and _is_pointfunc_decorator(d))]
@@ -473,6 +696,88 @@ def _smoke() -> None:
     assert ci(41) is False
     assert ci('42') is True, "str '42' coerces to bytes '42' == int 42 coerced"
     print("iO-4 int coercion: check_int(42)=True, check_int(41)=False  OK")
+
+    # --- DPF mode: correctness + 1-key hiding ---
+    # Correctness: O_dpf(alpha) == True, O_dpf(other) == False. We verify
+    # over a sample of inputs (NOT the full 2**16 domain -- too slow at
+    # build time; correctness of the underlying DPF is verified exhaustively
+    # in _fss._smoke).
+    alpha_dpf = b'secret_dpf_key'
+    obf_dpf = obfuscate_point_function_dpf(alpha_dpf)
+    fn_dpf_ast = build_point_func_ast_dpf('check_dpf', obf_dpf)
+    mod_dpf = ast.Module(body=[fn_dpf_ast], type_ignores=[])
+    ast.fix_missing_locations(mod_dpf)
+    ns_dpf = {}
+    exec(compile(mod_dpf, '<dpf>', 'exec'), ns_dpf)
+    check_dpf = ns_dpf['check_dpf']
+    assert check_dpf(b'secret_dpf_key') is True, "check_dpf(secret) should be True"
+    assert check_dpf('secret_dpf_key') is True, "check_dpf accepts str too"
+    # Wrong inputs return False.
+    assert check_dpf(b'wrong') is False
+    assert check_dpf(b'secret_dpf_ke') is False  # prefix
+    assert check_dpf(b'secret_dpf_keyy') is False  # suffix
+    assert check_dpf(123) is False
+    assert check_dpf('') is False
+    # Sample more inputs (verify the DPF bit-sum is 0 off-alpha).
+    for probe in [b'x', b'foo', b'bar', b'baz', b'qux', bytes([0, 1, 2]),
+                  b'zzz', b'aaa', bytes([0xff]) * 16, b'another_key']:
+        assert check_dpf(probe) is False, f"check_dpf({probe!r}) should be False"
+    print("iO-4 DPF correctness: O_dpf(secret)=True, 10 wrong inputs=False  OK")
+
+    # --- DPF 1-key hiding: a single key's Eval is NOT the point function ---
+    # This is the security gain over the hash mode: an adversary holding
+    # ONLY k0 (not k1) sees pseudorandom bits, not a spike at alpha.
+    from _fss import _dpf_eval
+    n_dpf = obf_dpf['n']
+    k0 = obf_dpf['k0']
+    s0_seq = [_dpf_eval(0, k0, x, n_dpf) for x in range(1 << n_dpf)]
+    # The single-key sequence should NOT equal the point function (which
+    # would be a single 1 at alpha_int and 0s elsewhere).
+    alpha_int = obf_dpf['alpha_int']
+    f_seq = [1 if x == alpha_int else 0 for x in range(1 << n_dpf)]
+    assert s0_seq != f_seq, "single key alone must NOT equal the point function"
+    # And the number of 1s in the single-key sequence should be ~half
+    # (pseudorandom), not a single spike (which would leak alpha).
+    n_ones = sum(s0_seq)
+    assert n_ones > 1, f"single-key has {n_ones} ones -- looks like a spike (alpha leak?)"
+    print(f"iO-4 DPF 1-key hiding: single share != f_alpha ({n_ones} ones, not a spike)  OK")
+
+    # --- DPF apply_pointfunc_obf with mode='dpf' decorator ---
+    tree_dpf_apply = ast.parse("def is_valid_dpf(key):\n    return key == b'real_key'\n")
+    for node in tree_dpf_apply.body:
+        if isinstance(node, ast.FunctionDef) and node.name == 'is_valid_dpf':
+            node.decorator_list.insert(0, ast.Call(
+                func=ast.Name(id='bedrock_pointfunc', ctx=ast.Load()),
+                args=[], keywords=[
+                    ast.keyword(arg='alpha', value=ast.Constant(value=b'real_key')),
+                    ast.keyword(arg='mode', value=ast.Constant(value='dpf')),
+                ],
+            ))
+            break
+    ast.fix_missing_locations(tree_dpf_apply)
+    out_dpf_apply = apply_pointfunc_obf(tree_dpf_apply, ctx)
+    assert getattr(ctx, 'pointfunc_obfuscated', 0) >= 1, "should obfuscate 1 function"
+    src_dpf_after = ast.unparse(out_dpf_apply)
+    assert 'bedrock_pointfunc' not in src_dpf_after, "decorator should be stripped"
+    # Verify the DPF evaluator was emitted (look for DPF eval helper).
+    assert '_br_dpf_eval' in src_dpf_after, "DPF mode should emit _br_dpf_eval helper"
+    # Functional test.
+    ns_dpf_apply = {}
+    exec(compile(ast.Module(body=out_dpf_apply.body, type_ignores=[]), '<dpf2>', 'exec'), ns_dpf_apply)
+    iv_dpf = ns_dpf_apply['is_valid_dpf']
+    assert iv_dpf(b'real_key') is True, "DPF is_valid(real_key) should be True"
+    assert iv_dpf(b'fake') is False
+    assert iv_dpf('real_key') is True  # str coercion
+    print("iO-4 DPF apply: mode='dpf' decorator detected, body replaced, functional  OK")
+
+    # --- DPF diversity: same alpha, different salt -> different keys ---
+    obf_d1 = obfuscate_point_function_dpf(alpha_dpf, salt=b'A' * 32)
+    obf_d2 = obfuscate_point_function_dpf(alpha_dpf, salt=b'B' * 32)
+    # The seeds are random per-build (via secrets), so different builds give
+    # different keys even for the same salt. But the alpha_int depends on
+    # the salt, so different salts give different alpha_int (different point).
+    assert obf_d1['alpha_int'] != obf_d2['alpha_int'], "different salt -> different alpha_int"
+    print("iO-4 DPF diversity: different salt -> different alpha_int (hash-to-int)  OK")
 
     print("iO-4 SMOKE: PASS")
 

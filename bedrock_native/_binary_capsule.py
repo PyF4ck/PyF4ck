@@ -1,25 +1,62 @@
-"""Phase iO-7: Binary capsule — full-source encrypted encapsulation.
+"""Phase iO-7: Encrypted-source capsule (byte-distribution randomization).
 
-The entropy pad (iO-6) raises file entropy to ~7.9 bits/byte by appending a
-random binary string. However, ~20% of the file is still cleartext Python
-source (structural bytes), creating a detectable byte-frequency signature
-between builds (pairwise chi-square ~157k at 32MB pad, target <320).
+NOTE on terminology: this module was originally marketed as achieving
+"Practical Indistinguishability Obfuscation (iO)". It does NOT. iO in
+cryptography means obfuscations of two DIFFERENT but functionally
+equivalent programs are indistinguishable. This capsule only ensures the
+obfuscated OUTPUT FILE's byte distribution is uniform (a property of any
+encryption / PRG output) — it says nothing about distinguishing
+obfuscations of equivalent programs. See IO_SPEC.md "Limitations".
 
-The binary capsule solves this by encrypting the ENTIRE obfuscated source:
+The capsule encrypts the ENTIRE obfuscated source so the output file is
+~99.9% uniform encrypted data:
 
   1. Compress the obfuscated source (zlib).
   2. Encrypt with a per-build 32-byte key (SHA-256 CTR-mode keystream).
-  3. Prepend the key to the encrypted blob (first 32 bytes = key, rest = data).
-  4. Embed the blob as a latin-1 triple-quoted string literal.
-  5. Ship a tiny bootstrap (~10 lines) that reads the blob, extracts the key,
-     decrypts, decompresses, and execs the original source.
+  3. Embed the encrypted blob as a latin-1 triple-quoted string literal.
+  4. Ship a tiny bootstrap that decrypts, decompresses, and execs the
+     source.
 
-The resulting file is ~99.9% encrypted data (uniform byte distribution) and
-~0.1% bootstrap (structural bytes). The pairwise chi-square between two
-builds approaches ~510 — the expected value for two independent random
-samples from the same distribution.
+## Key handling (secure-by-default since the Phase A remediation)
 
-## Results (iO-7, N=20 builds, 190 pairs)
+The key is NOT shipped in the file by default. Two modes:
+
+  - **``embed_key=False`` (default, secure)**: the bootstrap reads the key
+    from the environment variable named by ``key_env`` (hex-encoded). The
+    build path emits the key to a sidecar ``<output>.key`` file and to
+    stderr, so the operator can set ``$key_env`` on the machine that runs
+    the obfuscated file. Without that env var, the file refuses to run and
+    the source stays encrypted on disk.
+
+  - **``embed_key=True`` (legacy / insecure, opt-in via ``--embed-key``)**:
+    the 32-byte key is prepended to the blob. The bootstrap reads it from
+    the first 32 bytes. WARNING: this ships the key in the clear — anyone
+    can recover the original source by running the ~10-line bootstrap. Do
+    not use this mode if you need any confidentiality at all.
+
+## Honest properties
+
+What this capsule DOES provide:
+  - The output file's byte distribution is uniform (~7.96 bits/byte,
+    pairwise chi-square ~510 ≈ random baseline) — so a byte-frequency
+    fingerprint (chi-square / byte-histogram ML classifier) cannot tell
+    two builds apart any better than chance.
+  - When ``embed_key=False`` the source is genuinely encrypted at rest:
+    the key is not in the file.
+
+What this capsule does NOT provide:
+  - **Not iO**: it never compares obfuscations of two different equivalent
+    programs (see IO_SPEC.md).
+  - **Not confidentiality against a runtime adversary**: when the file
+    runs, the key is in the process environment / memory, and the source
+    is decrypted in-process. An attacker with a debugger or who can read
+    the env var still recovers the source.
+  - **The bootstrap is greppable**: ``import zlib, hashlib`` and
+    ``exec(zlib.decompress`` are a unique structural signature (the
+    <0.1% non-random bytes). A regex identifies every capsule file at
+    100% accuracy. This is acknowledged in IO_SPEC.md limitation 2.
+
+## Results (iO-7, N=20 builds, 190 pairs, embed_key legacy mode)
 
 | Metric | Value | Random baseline |
 |--------|-------|-----------------|
@@ -30,6 +67,8 @@ samples from the same distribution.
 | Build success | 100% (20/20) | — |
 | Output size | ~1.3 MB | — |
 
+(These measure ENCRYPTED-OUTPUT uniformity, NOT the iO property.)
+
 ## Usage
 
 ```python
@@ -37,26 +76,20 @@ from _binary_capsule import apply_binary_capsule
 
 # source = obfuscated Python source string (UTF-8)
 # ctx = BuildContext (provides BuildRNG for per-build key generation)
-capsule_bytes = apply_binary_capsule(source, ctx)
-# capsule_bytes is a latin-1 encoded .py file (~1.3 MB for ~2 MB source)
+capsule_bytes = apply_binary_capsule(source, ctx)              # secure (env)
+capsule_bytes = apply_binary_capsule(source, ctx, embed_key=True)  # legacy
+# ctx.capsule_key holds the 32-byte key (emit to <output>.key sidecar).
 ```
 
 CLI:
 ```bash
-python bedrock_obfuscator.py -f input.py -o obf.py --profile io \
-    --anti-vm off --anti-debug off --no-debug-poison --no-metamorphic \
-    --no-native-vm --no-cache --overwrite --adv-requests off --no-anti-timing --quiet
+# Secure (default): key in env, sidecar .key emitted
+python bedrock_obfuscator.py -f input.py -o obf.py --profile io ...
+# Then run with:  BR_CAPSULE_KEY=$(cat obf.py.key) python obf.py
+
+# Legacy (insecure, opt-in): key embedded in the file
+python bedrock_obfuscator.py -f input.py -o obf.py --profile io --embed-key ...
 ```
-
-## Why this achieves iO indistinguishability
-
-Two builds of the same program produce files whose byte distributions differ
-only in the encrypted blob (independently uniform) and the tiny bootstrap
-(slightly different per-build keys/names). The structural signature is
-diluted to <0.1% of the file, making the pairwise chi-square ~510 — the
-expected value for two random samples from the same uniform distribution.
-An ML classifier (logistic regression, 256-dim byte histogram) achieves
-40% accuracy — worse than the 50% chance baseline.
 
 ## Composition
 
@@ -110,7 +143,8 @@ def _rng_for(ctx) -> random.Random:
                 self._sub = s
 
             def randbytes(self, n):
-                return self._sub.read(n)
+                # SubStream exposes random(n), not read(n).
+                return self._sub.random(n)
 
             def randint(self, lo, hi):
                 return self._sub.randint(lo, hi)
@@ -131,11 +165,13 @@ def _generate_key(ctx) -> bytes:
 def _encrypt(data: bytes, key: bytes) -> bytes:
     """Encrypt data with SHA-256 CTR-mode keystream (XOR).
 
-    This is NOT a cryptographically secure cipher (SHA-256 as PRNG in CTR
-    mode is unusual), but it produces uniform output — sufficient for iO
-    indistinguishability.  The key is per-build and embedded in the
-    bootstrap, so an attacker CAN decrypt; the goal is uniform byte
-    distribution, not confidentiality.
+    This is not a vetted AEAD — it is a SHA-256-CTR XOR stream cipher with no
+    authentication tag. It produces uniform output, which is what the
+    capsule's byte-distribution-randomization goal needs. Confidentiality
+    depends entirely on keeping ``key`` out of the file: with
+    ``embed_key=False`` (the default) the key is read from the environment
+    at runtime, so the source is genuinely encrypted at rest. With
+    ``embed_key=True`` the key ships in the file and confidentiality is nil.
     """
     out = bytearray(len(data))
     counter = 0
@@ -161,44 +197,94 @@ def _escape_for_triple_quoted(data: bytes) -> bytes:
     Individual 0x22 bytes are safe inside triple double-quotes.  We only
     need to break up runs of 3+ consecutive 0x22 bytes.
 
-    The escaping creates a small per-build signature, but the SAME byte
-    values are escaped the SAME way across builds, so it doesn't contribute
-    to the pairwise chi-square (which measures the DIFFERENCE between
-    builds, not deviation from uniform).
+    Implementation note: the previous version used
+    ``data.replace(b'\"\"\"', b'\"\"\\\\\"')``. That is WRONG because
+    ``bytes.replace`` does not re-scan its own output — a 4-byte run
+    ``0x22 0x22 0x22 0x22`` becomes ``0x22 0x22 0x5C 0x22 0x22 0x22``,
+    and the trailing three 0x22 bytes re-form an unescaped ``\"\"\"``,
+    prematurely terminating the string literal → SyntaxError at runtime.
+    For pseudorandom ciphertext the expected frequency of a 5+ run of 0x22
+    is ~1 in 3000 builds, so this silently corrupts builds.
+
+    Fixed by a single forward scan: escape every third consecutive 0x22 in
+    a run to ``\\"`` and reset the run counter. This guarantees no three
+    unescaped 0x22 bytes appear in the output.
     """
-    # Escape backslash first (must be first to avoid double-escaping)
+    # Escape backslash first (must be first to avoid double-escaping).
     out = data.replace(b'\\', b'\\\\')
     # Escape null (might cause C-level issues in some parsers)
     out = out.replace(b'\x00', b'\\x00')
     # Escape CR (tokenizer normalizes raw 0x0D → 0x0A; \r preserves 0x0D)
     out = out.replace(b'\r', b'\\r')
-    # Break up runs of 3+ consecutive double-quotes by escaping the 3rd
-    out = out.replace(b'"""', b'""\\"')
-    return out
+
+    # Break up runs of 3+ consecutive double-quotes with a forward scan.
+    # We must NOT emit three consecutive unescaped 0x22 bytes anywhere.
+    # AND the content must not END with 1-2 unescaped 0x22 bytes, because
+    # those would combine with the closing triple-quote delimiter to form
+    # a premature string terminator → SyntaxError.
+    result = bytearray()
+    quote_run = 0
+    for b in out:
+        if b == 0x22:
+            quote_run += 1
+            if quote_run == 3:
+                # Escape this third quote: emit `\"` and reset the run so
+                # the next quote starts a fresh count of 1.
+                result.append(0x5C)  # backslash
+                result.append(0x22)
+                quote_run = 0
+            else:
+                result.append(0x22)
+        else:
+            result.append(b)
+            quote_run = 0
+    # Trailing fix: if the content ends with 1-2 unescaped quotes, escape
+    # the last one so it doesn't combine with the closing `"""`.
+    if 1 <= quote_run <= 2 and result and result[-1] == 0x22:
+        result[-1] = 0x5C  # replace the trailing `"` with a backslash
+        result.append(0x22)  # and append the escaped `"`
+    return bytes(result)
 
 
-def _build_bootstrap(enc_blob_with_key: bytes) -> bytes:
+def _build_bootstrap(enc_blob: bytes, *, embed_key: bool = False,
+                     key_env: str = 'BR_CAPSULE_KEY') -> bytes:
     """Build the bootstrap Python code that decrypts + execs the blob.
 
-    The key is embedded as the first 32 bytes of the blob (in the clear),
-    so the bootstrap doesn't need a separate key variable. This minimizes
-    structural bytes in the bootstrap.
+    embed_key=True (legacy / insecure): the 32-byte key is prepended to
+    ``enc_blob``; the bootstrap reads it from the first 32 bytes. WARNING:
+    this ships the key in the clear — anyone can recover the original
+    source by running this ~10-line bootstrap. Kept for backward
+    compatibility only; pass ``--embed-key`` on the CLI to opt in.
 
-    The bootstrap:
-      1. Reads the blob from _d (latin-1 string literal).
-      2. Extracts the key (first 32 bytes).
-      3. Derives a SHA-256 CTR keystream from the key.
-      4. XORs to decrypt the remaining bytes.
-      5. Decompresses with zlib.
-      6. Execs the result.
+    embed_key=False (default, secure): the key is NOT in the file. The
+    bootstrap reads it from the environment variable named by ``key_env``
+    (hex-encoded). The operator must set that env var on the machine that
+    runs the obfuscated file. The build path emits the key to a sidecar
+    ``<output>.key`` file and to stderr so the operator can capture it.
     """
-    blob_escaped = _escape_for_triple_quoted(enc_blob_with_key)
+    blob_escaped = _escape_for_triple_quoted(enc_blob)
+    env_name = repr(key_env).encode('latin-1')
+
+    if embed_key:
+        key_line = b'_k = _d[:32]; _d = _d[32:]\n'
+    else:
+        # Read the key from the environment (hex). Fail loudly with a clear
+        # message if the env var is missing, so the file does NOT silently
+        # fall back to anything — the source stays encrypted on disk.
+        key_line = (
+            b"import os as _br_os\n"
+            b"_br_ke = _br_os.environ.get(" + env_name + b")\n"
+            b"if not _br_ke:\n"
+            b"    raise SystemExit('capsule: key missing -- set env ' + "
+            + env_name + b" + '=<hex> (see <output>.key sidecar) before running')\n"
+            b"_k = bytes.fromhex(_br_ke)\n"
+        )
 
     bootstrap = (
         b'# -*- coding: latin-1 -*-\n'
         b'import zlib, hashlib as _h\n'
         b'_d = """' + blob_escaped + b'""".encode(\'latin-1\')\n'
-        b'_k = _d[:32]; _d = _d[32:]\n'
+        + key_line +
         b'_s = bytearray()\n'
         b'_c = 0\n'
         b'while len(_s) < len(_d):\n'
@@ -210,13 +296,23 @@ def _build_bootstrap(enc_blob_with_key: bytes) -> bytes:
     return bootstrap
 
 
-def apply_binary_capsule(source: str, ctx, *, key: bytes = None) -> bytes:
+def apply_binary_capsule(source: str, ctx, *, key: bytes = None,
+                         embed_key: bool = False,
+                         key_env: str = 'BR_CAPSULE_KEY') -> bytes:
     """Wrap the obfuscated source in an encrypted binary capsule.
 
     Args:
         source: the obfuscated source string (UTF-8, may contain non-ASCII).
-        ctx: BuildContext (for BuildRNG access).
+        ctx: BuildContext (for BuildRNG access + key emission).
         key: optional encryption key (32 bytes). If None, generated per-build.
+        embed_key: if True (legacy / insecure), prepend the key to the blob so
+            the file is self-contained — WARNING: anyone can recover the
+            source by running the bootstrap. If False (default, secure), the
+            key is NOT shipped; the bootstrap reads it from env var
+            ``key_env``. The generated key is exposed via ``ctx.capsule_key``
+            (bytes) so the build path can emit a sidecar ``.key`` file.
+        key_env: environment variable name the bootstrap reads the key from
+            (hex-encoded) when ``embed_key=False``.
 
     Returns:
         bytes: the capsule file content (latin-1 encoded). The file starts
@@ -234,13 +330,24 @@ def apply_binary_capsule(source: str, ctx, *, key: bytes = None) -> bytes:
         key = _generate_key(ctx)
     encrypted = _encrypt(compressed, key)
 
-    # 4. Prepend key to blob (first 32 bytes = key, rest = encrypted data)
-    # This removes the need for a separate key variable in the bootstrap,
-    # minimizing structural bytes and reducing the pairwise chi-square.
-    blob_with_key = key + encrypted
+    # Expose the key to the build path (for sidecar emission) regardless of
+    # embed mode. When embed_key=False this is the ONLY copy of the key —
+    # the file itself does not contain it.
+    try:
+        ctx.capsule_key = key
+        ctx.capsule_key_env = key_env if not embed_key else None
+    except Exception:
+        pass
 
-    # 5. Build bootstrap (reads key from first 32 bytes of blob)
-    bootstrap = _build_bootstrap(blob_with_key)
+    # 4. Assemble blob: prepend the key only in legacy embed mode.
+    if embed_key:
+        blob = key + encrypted
+    else:
+        blob = encrypted
+
+    # 5. Build bootstrap (reads key from blob prefix in legacy mode, or from
+    #    the environment in secure mode).
+    bootstrap = _build_bootstrap(blob, embed_key=embed_key, key_env=key_env)
 
     return bootstrap
 
@@ -248,7 +355,8 @@ def apply_binary_capsule(source: str, ctx, *, key: bytes = None) -> bytes:
 # --- Smoke test -------------------------------------------------------------
 
 def _smoke() -> None:
-    """Verify: encryption round-trip, correctness, entropy, diversity."""
+    """Verify: encryption round-trip, correctness, entropy, diversity,
+    embed_key=False (secure default) + escape-bug fuzz."""
 
     class _Ctx:
         build_rng = None
@@ -256,22 +364,87 @@ def _smoke() -> None:
 
     ctx = _Ctx()
 
-    # --- Round-trip: encrypt + decrypt = original ---
     import os, tempfile, subprocess
-    source = "print('hello world')\n"
-    capsule = apply_binary_capsule(source, ctx)
-    assert capsule.startswith(b'# -*- coding: latin-1 -*-\n'), "must start with latin-1"
-    print(f"iO-7 round-trip: capsule size {len(capsule)} bytes")
 
-    # --- Correctness: capsule runs and produces same output ---
+    # --- Legacy embed_key=True round-trip (backward compat) ---
+    source = "print('hello world')\n"
+    capsule = apply_binary_capsule(source, ctx, embed_key=True)
+    assert capsule.startswith(b'# -*- coding: latin-1 -*-\n'), "must start with latin-1"
+    print(f"capsule round-trip (embed_key=True): {len(capsule)} bytes")
+
     path = os.path.join(tempfile.gettempdir(), '_io7_smoke.py')
     with open(path, 'wb') as f:
         f.write(capsule)
     r = subprocess.run([sys.executable, path], capture_output=True, timeout=10)
     assert r.returncode == 0, f"capsule should run: {r.stderr}"
     assert r.stdout.strip() == b'hello world', f"output mismatch: {r.stdout!r}"
-    print("iO-7 correctness: capsule runs correctly  OK")
+    print("capsule correctness (embed_key=True): runs correctly  OK")
     os.unlink(path)
+
+    # --- embed_key=False (secure default): key NOT in file ---
+    ctx_env = _Ctx()
+    capsule_env = apply_binary_capsule(source, ctx_env, embed_key=False,
+                                        key_env='BR_CAPSULE_KEY_TEST')
+    # The capsule key is exposed on ctx for the build path to emit a sidecar.
+    assert hasattr(ctx_env, 'capsule_key') and len(ctx_env.capsule_key) == 32, \
+        "ctx.capsule_key must be set (32 bytes)"
+    key_hex = ctx_env.capsule_key.hex()
+    assert ctx_env.capsule_key_env == 'BR_CAPSULE_KEY_TEST'
+    print(f"capsule secure mode: key {key_hex[:8]}... exposed on ctx  OK")
+
+    # Run WITHOUT the env var → must FAIL loudly, not leak source.
+    path_env = os.path.join(tempfile.gettempdir(), '_io7_env.py')
+    with open(path_env, 'wb') as f:
+        f.write(capsule_env)
+    env_clean = {k: v for k, v in os.environ.items() if k != 'BR_CAPSULE_KEY_TEST'}
+    r_no_env = subprocess.run([sys.executable, path_env],
+                              capture_output=True, timeout=10, env=env_clean)
+    assert r_no_env.returncode != 0, "capsule must FAIL when env var is missing"
+    assert b'key missing' in (r_no_env.stderr + r_no_env.stdout).lower(), \
+        f"must print a clear 'key missing' message: {r_no_env.stderr!r}"
+    assert b'hello world' not in (r_no_env.stdout + r_no_env.stderr), \
+        "must NOT leak source output when key is missing"
+    print("capsule secure mode: refuses to run without env var  OK")
+
+    # Run WITH the env var → correct output.
+    env_set = dict(env_clean)
+    env_set['BR_CAPSULE_KEY_TEST'] = key_hex
+    r_env = subprocess.run([sys.executable, path_env],
+                           capture_output=True, timeout=10, env=env_set)
+    assert r_env.returncode == 0, f"capsule must run with env set: {r_env.stderr}"
+    assert r_env.stdout.strip() == b'hello world', \
+        f"output mismatch with env set: {r_env.stdout!r}"
+    print("capsule secure mode: runs correctly when env var is set  OK")
+    os.unlink(path_env)
+
+    # --- Verify the OLD recovery attack no longer works on secure mode ---
+    # The legacy attack (read 32 bytes from the start of the blob as the key)
+    # must now FAIL — the blob has no key prefix.
+    import re as _re, hashlib as _h2
+    m = _re.search(rb'_d = """(.*?)"""', capsule_env, _re.DOTALL)
+    blob = m.group(1)  # already bytes (capsule_env is bytes)
+    # Core property: the real key is NOT a prefix of the blob.
+    assert not blob.startswith(ctx_env.capsule_key), \
+        "secure-mode blob must NOT start with the real key"
+    # If the blob is long enough, simulate the legacy attack (use blob[:32]
+    # as a fake key, decrypt blob[32:]) — it must produce non-zlib garbage.
+    if len(blob) > 64:
+        fake_key = blob[:32]
+        ct = blob[32:]
+        _s = bytearray(); _c = 0
+        while len(_s) < len(ct):
+            _s.extend(_h2.sha256(fake_key + _c.to_bytes(4, 'big')).digest())
+            _c += 1
+        _x = (int.from_bytes(ct, 'big') ^ int.from_bytes(_s[:len(ct)], 'big')).to_bytes(len(ct), 'big')
+        try:
+            zlib.decompress(_x)
+            leaked = True
+        except Exception:
+            leaked = False
+        assert not leaked, "legacy recovery attack must NOT work on secure-mode capsule"
+        print("capsule secure mode: legacy key-prefix recovery attack fails  OK")
+    else:
+        print("capsule secure mode: blob too short for legacy attack sim (skipped)  OK")
 
     # --- Entropy: capsule has near-uniform byte distribution ---
     import collections, math
@@ -283,27 +456,26 @@ def _smoke() -> None:
         return -sum((c / n) * math.log2(c / n) for c in freq.values())
 
     cap_h = _entropy(capsule)
-    print(f"iO-7 entropy (small source): {cap_h:.4f} bits/byte")
-    # Small source: bootstrap dominates, entropy will be low. Just record it.
-    print("iO-7 entropy (small): recorded  OK")
+    print(f"capsule entropy (small source): {cap_h:.4f} bits/byte")
+    print("capsule entropy (small): recorded  OK")
 
     # --- Diversity: different seeds → different capsules ---
     ctx2 = _Ctx()
     ctx2.capsule_seed = 99
-    capsule2 = apply_binary_capsule(source, ctx2)
+    capsule2 = apply_binary_capsule(source, ctx2, embed_key=True)
     assert capsule != capsule2, "different seeds must produce different capsules"
-    print("iO-7 diversity: different seeds -> different capsules  OK")
+    print("capsule diversity: different seeds -> different capsules  OK")
 
     # --- Non-ASCII source handled ---
     source_unicode = "x = '\u4f60\u597d'\nassert x == '\u4f60\u597d'\nprint('ok')\n"
-    capsule_u = apply_binary_capsule(source_unicode, ctx)
+    capsule_u = apply_binary_capsule(source_unicode, ctx, embed_key=True)
     path_u = os.path.join(tempfile.gettempdir(), '_io7_unicode.py')
     with open(path_u, 'wb') as f:
         f.write(capsule_u)
     r2 = subprocess.run([sys.executable, path_u], capture_output=True, timeout=10)
     assert r2.returncode == 0, f"unicode capsule should run: {r2.stderr}"
     assert r2.stdout.strip() == b'ok', f"unicode output mismatch: {r2.stdout!r}"
-    print("iO-7 unicode: non-ASCII source handled  OK")
+    print("capsule unicode: non-ASCII source handled  OK")
     os.unlink(path_u)
 
     # --- Large source: entropy approaches 8.0 ---
@@ -311,26 +483,93 @@ def _smoke() -> None:
     _rng.seed(42)
     large_source = ''.join(f'x_{i} = {_rng.randint(0, 10**9)}\n' for i in range(5000))
     large_source += "print('done')\n"
-    capsule_large = apply_binary_capsule(large_source, ctx)
+    capsule_large = apply_binary_capsule(large_source, ctx, embed_key=True)
     cap_large_h = _entropy(capsule_large)
-    print(f"iO-7 large: {len(capsule_large)} bytes, entropy {cap_large_h:.4f}")
+    print(f"capsule large: {len(capsule_large)} bytes, entropy {cap_large_h:.4f}")
     assert cap_large_h > 7.5, f"large capsule entropy {cap_large_h:.3f} must be >7.5"
-    print("iO-7 large: entropy >7.5  OK")
+    print("capsule large: entropy >7.5  OK")
+
+    # --- Escape-bug fuzz: the ciphertext itself must never contain an
+    # unescaped triple-quote after _escape_for_triple_quoted. The previous
+    # bug (bytes.replace without re-scan) silently corrupted ~1/3000 builds.
+    #
+    # Ground truth: actually COMPILE the escaped content wrapped in a
+    # triple-quoted literal and catch SyntaxError. This is exactly what
+    # the Python tokenizer does at runtime, so it is authoritative.
+    def _escaped_blob_compiles(escaped: bytes) -> bool:
+        """Wrap the escaped content in a triple-quoted literal and try to
+        compile it. Returns True if it parses (no premature termination).
+        The latin-1 coding declaration is REQUIRED so the parser accepts
+        raw non-ASCII bytes in the literal body."""
+        src = b'# -*- coding: latin-1 -*-\n_d = """' + escaped + b'"""\n'
+        try:
+            compile(src, '<fuzz>', 'exec')
+            return True
+        except SyntaxError:
+            return False
+
+    import random as _fr
+    _fr.seed(1234)
+    _bad = 0
+    for _ in range(2000):
+        n = _fr.randint(0, 40)
+        # Bias toward many 0x22 bytes to stress the run-length logic.
+        blob_test = bytes(_fr.choice([0x22, 0x22, 0x22, _fr.randint(0, 255)])
+                          for _ in range(n))
+        escaped = _escape_for_triple_quoted(blob_test)
+        if not _escaped_blob_compiles(escaped):
+            _bad += 1
+            if _bad == 1:
+                print(f"  first failing blob (n={n}): {blob_test!r}")
+                print(f"  escaped: {escaped!r}")
+    assert _bad == 0, f"escape fuzz: {_bad}/2000 blobs fail to compile (old bug present)"
+    print(f"capsule escape fuzz: 2000 random blobs all compile  OK")
+
+    # Sanity: confirm the fuzz WOULD catch the old buggy algorithm.
+    def _old_escape(data: bytes) -> bytes:
+        out = data.replace(b'\\', b'\\\\')
+        out = out.replace(b'\x00', b'\\x00')
+        out = out.replace(b'\r', b'\\r')
+        out = out.replace(b'"""', b'""\\"')
+        return out
+    _fr.seed(1234)
+    old_bad = 0
+    for _ in range(2000):
+        n = _fr.randint(0, 40)
+        blob_test = bytes(_fr.choice([0x22, 0x22, 0x22, _fr.randint(0, 255)])
+                          for _ in range(n))
+        escaped = _old_escape(blob_test)
+        if not _escaped_blob_compiles(escaped):
+            old_bad += 1
+    assert old_bad > 0, "fuzz must detect the old bug (else the test is vacuous)"
+    print(f"capsule escape fuzz: old algorithm detected as broken ({old_bad}/2000) — test is sound  OK")
 
     # --- Triple-quote handling: data containing 0x22 0x22 0x22 ---
     tricky = b'\x22\x22\x22' * 100
     source_tricky = f"x = {tricky!r}\nprint('ok')\n"
-    capsule_tricky = apply_binary_capsule(source_tricky, ctx)
+    capsule_tricky = apply_binary_capsule(source_tricky, ctx, embed_key=True)
     path_tricky = os.path.join(tempfile.gettempdir(), '_io7_tricky.py')
     with open(path_tricky, 'wb') as f:
         f.write(capsule_tricky)
     r3 = subprocess.run([sys.executable, path_tricky], capture_output=True, timeout=10)
     assert r3.returncode == 0, f"tricky capsule should run: {r3.stderr}"
     assert r3.stdout.strip() == b'ok', f"tricky output mismatch: {r3.stdout!r}"
-    print("iO-7 triple-quote: data with 0x22x3 handled  OK")
+    print("capsule triple-quote: source with 0x22x3 handled  OK")
     os.unlink(path_tricky)
 
-    print("iO-7 SMOKE: PASS")
+    # --- Run-length stress: ciphertext containing 5+ consecutive 0x22 ---
+    # This is the exact case the old replace()-based bug corrupted.
+    stress_blobs = [b'\x22' * k for k in range(3, 21)]
+    stress_blobs.append(b'A\x22\x22\x22\x22\x22B')  # run embedded
+    stress_blobs.append(b'\x22\x22')  # trailing 2 quotes
+    stress_blobs.append(b'\x22')  # trailing 1 quote
+    for sb in stress_blobs:
+        esc = _escape_for_triple_quoted(sb)
+        assert _escaped_blob_compiles(esc), \
+            f"stress blob {sb!r} fails to compile: {esc!r}"
+    print("capsule run-length stress: 1..20 consecutive 0x22 + trailing cases all safe  OK")
+
+    print("capsule SMOKE: PASS")
 
 
 if __name__ == "__main__":

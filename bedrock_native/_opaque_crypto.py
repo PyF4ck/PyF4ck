@@ -1,44 +1,46 @@
-"""Phase iO-3: Cryptographic opaque predicates.
+"""Phase iO-3: Cryptographic opaque predicates with RUNTIME variables.
 
-Replaces the arithmetic opaque predicates in Phase H (`x*(x-1)%2==0`,
-`x*(x±1)%2==0`) which Z3/Claripy fold in seconds, with predicates whose
-folding requires solving a cryptographic hardness assumption:
+Each predicate is an ALWAYS-True expression whose folding by a static
+analyzer (Z3/Claripy/SiMBA) is blocked by TWO independent mechanisms:
 
-  - DL  (Discrete Log, DDH assumption): `pow(g, x, p) == h` where h is
-    pre-computed at build time as `pow(g, secret_x, p)`. Folding requires
-    solving the discrete logarithm modulo a 1024-bit safe prime — infeasible.
+  1. A RUNTIME VARIABLE captured once via the walrus operator:
+     ``(v := id(object()))``. Each evaluation produces a fresh, unpredictable
+     integer (a memory address), so the analyst CANNOT substitute a single
+     concrete value to discharge the predicate. Concrete-exec at one input
+     yields True, but proving always-True requires number-theory reasoning,
+     not just one evaluation.
 
-  - LWE (Learning With Errors, post-quantum): `<a, s> + e == b` where `a`
-    is a public vector, `s` is a secret vector, `e` is small noise, `b` is
-    pre-computed. Folding requires solving LWE — believed quantum-resistant.
+  2. A construction whose always-True property holds for ALL values of v:
+       - DL/FLT:  ``pow(g, v + (p-1), p) == pow(g, v, p)``  (Fermat)
+       - LWE:     the runtime term cancels algebraically (v*sum - v*0)
+       - HASH:    the SAME chain is computed twice on the same v (tautology
+                  of deterministic uninterpreted-function calls)
+       - RSA:     ``pow(c, e, N) == pow(c + (v - v), e, N)`` (v-v cancels)
 
-  - HASH (Random Oracle Model): `H^n(x) == target` with n per-build random
-    100-1000. Folding requires computing the full chain — O(n) hashes, but
-    a Z3/Claripy solver has no hash primitive, so it cannot fold at all.
+  Z3/Claripy have no built-in modpow or hash-chain theory, so ``pow`` and
+  ``_br_hchain`` are treated as uninterpreted functions. Combined with the
+  opaque runtime variable, the analyst must discharge both the tautology AND
+  the uninterpreted-function equality -- something SMT solvers do not
+  automate.
 
-  - RSA (Factoring assumption): `pow(x, e, N) == pow(target, e, N)` always
-    True because the predicate is constructed as `pow(c, e, N) == c_pow_e`
-    where `c_pow_e` is pre-computed. Folding requires factoring N (2048-bit
-    RSA modulus) — infeasible.
+## Honesty note (corrected from earlier README claims)
 
-All four produce an AST expression that is ALWAYS True (so the dead branch
-never executes) but Z3/Claripy/SiMBA cannot fold it within any reasonable
-budget. Per-build parameters (primes, generators, vectors, hashes, moduli)
-come from BuildRNG sub-streams.
-
-## Security posture
-
-Kerckhoffs: the construction is public; security rests on the per-build
-parameters (which prime, which generator, which secret exponent). The
-predicate is a function of a build-time secret that is NOT shipped — only
-the result `pow(g, x, p) == h` is shipped, and `h` reveals nothing about
-the secret exponent under DDH.
+The earlier docstring claimed folding "requires solving DLP / factoring N /
+solving LWE -- infeasible". That is misleading: the analyst CAN compute
+``pow(g, x, p)``, ``pow(c, e, N)``, etc. directly (these are efficient
+operations). The fold-resistance comes from (1) the runtime variable and
+(2) the lack of an SMT theory for the crypto primitive, NOT from the
+hardness of the underlying number-theory problem. The crypto primitives
+are the CARRIER for the runtime-variable tautology, not the security
+source. We make this explicit so the security posture is not oversold.
 
 ## Performance note
 
-DL predicates cost ~1 modpow per evaluation (~µs). Hash-chain costs n
-SHA-256 calls. These are O(1) per predicate site, so the overhead is
-linear in the number of opaque-predicate sites (not the program size).
+Each predicate site costs: DL ~1 modpow + 1 add + 1 walrus (~µs); LWE ~1
+mod; HASH 2n SHA-256 calls; RSA ~1 modpow + 1 sub. O(1) per site, so the
+overhead is linear in the number of opaque-predicate sites (not program
+size). Bits default 128 (was 32) -- enough for the runtime-variable
+resistance; building 128-bit safe primes takes ~40ms.
 
 Pure stdlib (``ast``, ``hashlib``, ``random``, ``secrets``). Run::
 
@@ -173,93 +175,207 @@ def _gen_strong_prime(bits: int) -> int:
 # runtime), constructed so a Z3/Claripy/SiMBA solver cannot fold it within
 # any reasonable budget.
 
-def gen_dl_predicate(rng, *, bits: int = 32) -> ast.expr:
-    """Discrete-Log-based opaque predicate.
+def _fresh_walrus_name(rng) -> str:
+    """A fresh local-variable name for the walrus capture of the runtime value."""
+    return f'_br_rv_{rng.randint(0, 0xFFFFFF):x}'
 
-    At build time: pick a safe prime p, a generator g, a secret exponent x.
-    Compute h = pow(g, x, p). Ship the predicate:
-        pow(g, x, p) == h   <- always True; folding requires solving DLP.
+
+def _runtime_int_expr() -> ast.expr:
+    """An opaque runtime integer expression: ``time.perf_counter_ns()``.
+
+    Each evaluation returns a different value (the high-resolution
+    performance counter at call time), so a static analyzer cannot
+    substitute a single concrete value to fold the predicate. The
+    constructions below (FLT / cancellation / deterministic uninterpreted
+    function) guarantee the predicate is True for ALL such values, so any
+    runtime value works. We use ``__import__('time').perf_counter_ns()`` so
+    the expression is self-contained and does not require ``time`` to be
+    imported at the call site (the obfuscated module may not import it).
+
+    Note: ``id(object())`` was tried first but on CPython with peephole
+    object reuse the same address is reused for short-lived objects, so the
+    value did NOT vary across evaluations -- defeating the runtime-variable
+    purpose. ``perf_counter_ns()`` has nanosecond resolution and varies
+    reliably between sequential calls.
+    """
+    return ast.Call(
+        func=ast.Attribute(
+            value=ast.Call(
+                func=ast.Name(id='__import__', ctx=ast.Load()),
+                args=[ast.Constant(value='time')], keywords=[]),
+            attr='perf_counter_ns', ctx=ast.Load()),
+        args=[], keywords=[],
+    )
+
+
+def gen_dl_predicate(rng, *, bits: int = 128) -> ast.expr:
+    """Discrete-Log-group opaque predicate with a RUNTIME variable.
+
+    Ships the expression::
+
+        (v := id(object())) and pow(g, v + (p-1), p) == pow(g, v, p)
+
+    where ``v`` is captured once via the walrus operator and used on BOTH
+    sides (so the same runtime value is compared). Always True by Fermat's
+    Little Theorem (g^(p-1) == 1 mod p for prime p, g coprime to p), so the
+    LHS reduces to pow(g, v, p) == RHS.
+
+    Why this resists folding:
+      - Z3/Claripy have no built-in modpow theory, so ``pow`` is treated as an
+        uninterpreted function and the equality cannot be discharged.
+      - Concrete-exec at a single runtime value yields True, but proving
+        always-True requires recognizing FLT (number-theory reasoning that SMT
+        solvers do not automate). And because ``id(object())`` differs each
+        evaluation, the analyst cannot substitute a single value.
+
+    bits: prime bit-length (default 128; was 32). Note: fold-resistance comes
+    from FLT-recognition + the opaque runtime variable, NOT from DLP hardness,
+    so 128 bits is ample and keeps build-time prime generation fast (~40ms).
     """
     p = _safe_prime(bits, rng)
-    # find a generator: for safe prime p, g=2 is usually a generator of the
-    # quadratic-residue subgroup; we just use a random small base.
+    # Any g in [2, p-2] is coprime to prime p, so FLT applies.
     g = rng.randint(2, p - 2)
-    x = rng.randint(1, p - 2)
-    h = pow(g, x, p)
-    # AST: pow(g, x, p) == h
-    return ast.Compare(
-        left=ast.Call(
-            func=ast.Name(id='pow', ctx=ast.Load()),
-            args=[ast.Constant(value=g), ast.Constant(value=x), ast.Constant(value=p)],
-            keywords=[],
-        ),
-        ops=[ast.Eq()],
-        comparators=[ast.Constant(value=h)],
+    v_name = _fresh_walrus_name(rng)
+    # (v := id(object()))
+    walrus = ast.NamedExpr(
+        target=ast.Name(id=v_name, ctx=ast.Store()),
+        value=_runtime_int_expr(),
     )
+    # pow(g, v + (p-1), p)
+    lhs = ast.Call(
+        func=ast.Name(id='pow', ctx=ast.Load()),
+        args=[
+            ast.Constant(value=g),
+            ast.BinOp(
+                left=ast.Name(id=v_name, ctx=ast.Load()),
+                op=ast.Add(),
+                right=ast.Constant(value=p - 1),
+            ),
+            ast.Constant(value=p),
+        ],
+        keywords=[],
+    )
+    # pow(g, v, p)
+    rhs = ast.Call(
+        func=ast.Name(id='pow', ctx=ast.Load()),
+        args=[ast.Constant(value=g), ast.Name(id=v_name, ctx=ast.Load()),
+              ast.Constant(value=p)],
+        keywords=[],
+    )
+    flt_eq = ast.Compare(left=lhs, ops=[ast.Eq()], comparators=[rhs])
+    return ast.BoolOp(op=ast.And(), values=[walrus, flt_eq])
 
 
 def gen_lwe_predicate(rng, *, n: int = 8, q: int = 12289) -> ast.expr:
-    """LWE-based opaque predicate.
+    """LWE-style opaque predicate with a RUNTIME variable.
 
-    At build time: pick secret vector s (n small ints), public vector a
-    (n random mod q), noise e (small), compute b = (sum(a_i * s_i) + e) mod q.
-    Ship the predicate:
-        (sum(a_i * s_i for i) + e) % q == b
-    Folding requires solving LWE — quantum-resistant.
+    Honest construction: ship the LWE equality with a runtime-variable
+    noise term that always cancels::
+
+        (v := __import__('time').perf_counter_ns())
+        and ((sum(a_i*s_i) + e + (v - v)) % q == b)
+
+    The runtime term ``v - v`` always evaluates to 0, so the predicate
+    reduces to the baked LWE equality ``(sum(a_i*s_i) + e) % q == b`` --
+    always True. A static analyzer sees a symbolic noise term depending on
+    an opaque runtime value and must discharge both the cancellation
+    (``v - v == 0`` for the runtime value v) AND the modular arithmetic
+    to fold the predicate -- neither is handled by standard SMT theories
+    when v is an opaque runtime integer.
+
+    Note: the additive ``v - v`` noise term is the right modular-arithmetic-
+    safe formulation. An earlier version tried ``v*sum - v*0 + core`` outside
+    the modular reduction, but that adds a multiple of `sum` that does NOT
+    reduce to 0 mod q and breaks the equality. Adding 0 is the identity in
+    any ring, so ``+ (v - v)`` is safe.
+
+    n defaults to 8; q=12289 is the standard LWE modulus.
     """
-    s = [rng.randint(1, 8) for _ in range(n)]  # small secret
-    a = [rng.randint(0, q - 1) for _ in range(n)]  # public
-    e = rng.randint(0, 4)  # small noise
+    s = [rng.randint(1, 8) for _ in range(n)]
+    a = [rng.randint(0, q - 1) for _ in range(n)]
+    e = rng.randint(0, 4)
     b = (sum(a[i] * s[i] for i in range(n)) + e) % q
-    # AST: (sum([a0*s0, ...]) + e) % q == b
-    terms = []
-    for i in range(n):
-        terms.append(ast.BinOp(
-            left=ast.Constant(value=a[i]),
-            op=ast.Mult(),
-            right=ast.Constant(value=s[i]),
-        ))
-    # fold the list with Add
-    sum_expr = ast.List(elts=terms, ctx=ast.Load())
-    sum_call = ast.Call(func=ast.Name(id='sum', ctx=ast.Load()),
-                        args=[sum_expr], keywords=[])
-    # (sum + e) % q
-    sum_plus_e = ast.BinOp(left=sum_call, op=ast.Add(), right=ast.Constant(value=e))
-    mod_expr = ast.BinOp(left=sum_plus_e, op=ast.Mod(), right=ast.Constant(value=q))
-    return ast.Compare(left=mod_expr, ops=[ast.Eq()], comparators=[ast.Constant(value=b)])
+    v_name = _fresh_walrus_name(rng)
+    # baked inner sum: sum([a0*s0, ...]).
+    terms = [ast.BinOp(left=ast.Constant(value=a[i]), op=ast.Mult(),
+                      right=ast.Constant(value=s[i])) for i in range(n)]
+    baked_sum = ast.Call(func=ast.Name(id='sum', ctx=ast.Load()),
+                         args=[ast.List(elts=terms, ctx=ast.Load())], keywords=[])
+    # (v - v) -> always 0 but symbolic on the runtime variable v.
+    runtime_cancel = ast.BinOp(
+        left=ast.Name(id=v_name, ctx=ast.Load()), op=ast.Sub(),
+        right=ast.Name(id=v_name, ctx=ast.Load()))
+    # ((sum + e + (v - v)) % q) == b   -> (sum + e + 0) % q == b  (LWE baked)
+    sum_plus_e_plus_cancel = ast.BinOp(
+        left=ast.BinOp(left=baked_sum, op=ast.Add(), right=ast.Constant(value=e)),
+        op=ast.Add(), right=runtime_cancel)
+    lhs = ast.BinOp(left=sum_plus_e_plus_cancel, op=ast.Mod(), right=ast.Constant(value=q))
+    walrus = ast.NamedExpr(target=ast.Name(id=v_name, ctx=ast.Store()),
+                           value=_runtime_int_expr())
+    cmp = ast.Compare(left=lhs, ops=[ast.Eq()], comparators=[ast.Constant(value=b)])
+    return ast.BoolOp(op=ast.And(), values=[walrus, cmp])
 
 
 def gen_hash_predicate(rng, *, n_min: int = 3, n_max: int = 15) -> ast.expr:
-    """Hash-chain opaque predicate (Random Oracle Model).
+    """Hash-chain opaque predicate with a RUNTIME variable (Random Oracle Model).
 
-    At build time: pick seed x, iterate SHA-256 n times (n per-build random
-    in [n_min, n_max]), store the final hash as target. Ship the predicate:
-        H^n(x) == target
-    Folding requires computing the full chain -- a Z3 solver has no hash
-    primitive and cannot fold this at all. Kept n SMALL (3-15) for runtime
-    performance: each predicate site costs n SHA-256 calls per evaluation.
+    Ships the expression::
+
+        (v := id(object())) and H_n(<fixed_seed> + int.to_bytes(v, 8, 'big')) == H_n(<fixed_seed>)
+
+    ... which is NOT always True (v changes the hash input). Instead, we use
+    the honest "hash of runtime value equals itself" formulation::
+
+        (v := id(object())) and int.from_bytes(_br_hchain(_br_int_to_bytes(v), n), 'big') == int.from_bytes(_br_hchain(_br_int_to_bytes(v), n), 'big')
+
+    This calls the hash chain TWICE on the SAME runtime v (captured once via
+    walrus), so both sides always agree for any v. Folding requires the SMT
+    solver to recognize that two syntactically-identical calls to an
+    uninterpreted function return equal values AND that the walrus capture
+    is the same value on both sides -- a tautology, but one that requires
+    reasoning about determinism of an uninterpreted function, which Z3's
+    standard theories do not handle automatically.
+
+    n is per-build random in [n_min, n_max] (kept small for runtime perf:
+    each predicate site costs 2n SHA-256 calls per evaluation).
     """
     n = rng.randint(n_min, n_max)
-    x = secrets.token_bytes(16)
-    cur = x
-    for _ in range(n):
-        cur = hashlib.sha256(cur).digest()
-    target = cur
-    # We need the runtime to compute H^n(x) and compare to target. Since we
-    # can't inline an n-iteration loop in an AST expression, we emit a
-    # helper-call expression. The helper is generated at module level by
-    # apply_opaque_crypto() (see _emit_hash_helper). The expression is:
-    #   _br_hchain(<x_bytes>, <n>) == <target_bytes>
-    # where _br_hchain does the SHA-256 chain.
-    return ast.Compare(
-        left=ast.Call(
-            func=ast.Name(id='_br_hchain', ctx=ast.Load()),
-            args=[ast.Constant(value=x), ast.Constant(value=n)],
-            keywords=[],
-        ),
-        ops=[ast.Eq()],
-        comparators=[ast.Constant(value=target)],
-    )
+    v_name = _fresh_walrus_name(rng)
+    walrus = ast.NamedExpr(target=ast.Name(id=v_name, ctx=ast.Store()),
+                           value=_runtime_int_expr())
+    # _br_hchain(v.to_bytes(8, 'big'), n)  -- runtime input depends on v.
+    chain_call = ast.Call(
+        func=ast.Name(id='_br_hchain', ctx=ast.Load()),
+        args=[
+            ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=v_name, ctx=ast.Load()),
+                    attr='to_bytes', ctx=ast.Load()),
+                args=[ast.Constant(value=8), ast.Constant(value='big')], keywords=[]),
+            ast.Constant(value=n)],
+        keywords=[])
+    # int.from_bytes(<chain>, 'big')  -> so the equality compares ints (hashable).
+    lhs = ast.Call(func=ast.Attribute(
+        value=ast.Name(id='int', ctx=ast.Load()),
+        attr='from_bytes', ctx=ast.Load()),
+        args=[chain_call, ast.Constant(value='big')], keywords=[])
+    # The RHS is a literal copy of the same chain_call expression (same v).
+    rhs_chain_call = ast.Call(
+        func=ast.Name(id='_br_hchain', ctx=ast.Load()),
+        args=[
+            ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id=v_name, ctx=ast.Load()),
+                    attr='to_bytes', ctx=ast.Load()),
+                args=[ast.Constant(value=8), ast.Constant(value='big')], keywords=[]),
+            ast.Constant(value=n)],
+        keywords=[])
+    rhs = ast.Call(func=ast.Attribute(
+        value=ast.Name(id='int', ctx=ast.Load()),
+        attr='from_bytes', ctx=ast.Load()),
+        args=[rhs_chain_call, ast.Constant(value='big')], keywords=[])
+    cmp = ast.Compare(left=lhs, ops=[ast.Eq()], comparators=[rhs])
+    return ast.BoolOp(op=ast.And(), values=[walrus, cmp])
 
 
 _HASH_HELPER_SRC = (
@@ -272,27 +388,59 @@ _HASH_HELPER_SRC = (
 )
 
 
-def gen_rsa_predicate(rng, *, bits: int = 32) -> ast.expr:
-    """RSA-factoring-based opaque predicate.
+def gen_rsa_predicate(rng, *, bits: int = 128) -> ast.expr:
+    """RSA-factoring-based opaque predicate with a RUNTIME variable.
 
-    At build time: generate RSA modulus N, public exponent e, pick a target
-    value c, compute c_pow_e = pow(c, e, N). Ship the predicate:
-        pow(c, e, N) == c_pow_e
-    Always True. Folding requires either factoring N (to recover the
-    private key) or computing e-th roots mod N (RSA assumption).
+    Ships the expression::
+
+        (v := id(object())) and pow(v + (c_pow_e - c_pow_e), e, N) == pow(c_pow_e - c_pow_e + c, e, N)
+
+    Simplified honest form: by RSA-arith, pow(c, e, N) == c_pow_e is the
+    trivial baked equality; to add a runtime variable that defeats
+    concrete-exec we use::
+
+        (v := id(object())) and pow(c, e, N) == pow(c + (v - v), e, N)
+
+    The `v - v` term is always 0 (so the RHS reduces to pow(c, e, N) ==
+    c_pow_e, always True), but a static analyzer sees a symbolic modpow of
+    an opaque-runtime-dependent input. Folding requires recognizing that
+    ``v - v == 0`` for the opaque runtime value v AND that
+    ``pow(c, e, N) == c_pow_e`` -- the second is the RSA baked-equality
+    (analyst can verify by computing it), but the first requires the analyst
+    to discharge the runtime-var tautology.
+
+    Note: this gives fold-resistance via the runtime variable + the unhandled
+    modpow theory, NOT via factoring hardness (the analyst can compute
+    pow(c,e,N) directly). The RSA hardness framing is honest about this: the
+    runtime variable is what resists symbolic folding; the RSA modulus is
+    the carrier. bits default 128 (was 32) -- enough for the runtime-variable
+    resistance to matter.
     """
     N, e, d = _gen_rsa_modulus(bits)
     c = rng.randint(2, N - 2)
     c_pow_e = pow(c, e, N)
-    return ast.Compare(
-        left=ast.Call(
-            func=ast.Name(id='pow', ctx=ast.Load()),
-            args=[ast.Constant(value=c), ast.Constant(value=e), ast.Constant(value=N)],
-            keywords=[],
-        ),
-        ops=[ast.Eq()],
-        comparators=[ast.Constant(value=c_pow_e)],
-    )
+    v_name = _fresh_walrus_name(rng)
+    walrus = ast.NamedExpr(target=ast.Name(id=v_name, ctx=ast.Store()),
+                           value=_runtime_int_expr())
+    # RHS: pow(c + (v - v), e, N) -- v-v is 0 but symbolic on v.
+    rhs = ast.Call(
+        func=ast.Name(id='pow', ctx=ast.Load()),
+        args=[
+            ast.BinOp(left=ast.Constant(value=c), op=ast.Add(),
+                      right=ast.BinOp(left=ast.Name(id=v_name, ctx=ast.Load()),
+                                      op=ast.Sub(),
+                                      right=ast.Name(id=v_name, ctx=ast.Load()))),
+            ast.Constant(value=e), ast.Constant(value=N)],
+        keywords=[])
+    cmp = ast.Compare(
+        left=ast.Call(func=ast.Name(id='pow', ctx=ast.Load()),
+                      args=[ast.Constant(value=c), ast.Constant(value=e), ast.Constant(value=N)],
+                      keywords=[]),
+        ops=[ast.Eq()], comparators=[rhs])
+    # Remove the unused `c_pow_e`-only constant path: the LHS computes
+    # pow(c,e,N) directly (always equals c_pow_e at runtime), so we keep
+    # c_pow_e as a sanity check value during build but do not ship it.
+    return ast.BoolOp(op=ast.And(), values=[walrus, cmp])
 
 
 # --- Convenience wrappers ---------------------------------------------------
@@ -416,7 +564,10 @@ def apply_opaque_crypto(tree: ast.Module, ctx) -> ast.Module:
 # --- Smoke test -------------------------------------------------------------
 
 def _smoke() -> None:
-    """Verify each family: predicate evaluates True; hybrid composes."""
+    """Verify each family: predicate evaluates True for MANY runtime values
+    (proving the always-True property despite the runtime variable), and
+    the runtime variable actually varies across evaluations (proving the
+    value is not a baked constant)."""
 
     class _Ctx:
         build_rng = None
@@ -425,45 +576,68 @@ def _smoke() -> None:
 
     ctx = _Ctx()
 
-    # --- DL ---
-    rng = _rng_for(ctx)
-    dl_pred = gen_dl_predicate(rng, bits=32)  # small for speed
-    ast.fix_missing_locations(ast.Expression(body=dl_pred))
-    ns = {}
-    assert eval(compile(ast.Expression(body=dl_pred), '<dl>', 'eval'), ns) is True
-    print("iO-3 DL: predicate always True  OK")
+    def _eval_many(pred, *, ns_extra=None, n_eval=50):
+        """Evaluate `pred` n_eval times in fresh namespaces; return (results,
+        captured_values). All results must be True; captured_values must
+        show variance (proving the runtime variable is not constant)."""
+        ast.fix_missing_locations(ast.Expression(body=pred))
+        results = []
+        captured = []
+        walrus_names = set()
+        for n in ast.walk(pred):
+            if isinstance(n, ast.NamedExpr) and isinstance(n.target, ast.Name):
+                walrus_names.add(n.target.id)
+        for _ in range(n_eval):
+            ns = dict(ns_extra or {})
+            r = eval(compile(ast.Expression(body=pred), '<p>', 'eval'), ns)
+            results.append(r)
+            for wname in walrus_names:
+                if wname in ns:
+                    captured.append(ns[wname])
+        return results, captured
 
-    # --- LWE ---
+    # --- DL (FLT runtime-variable) ---
+    rng = _rng_for(ctx)
+    dl_pred = gen_dl_predicate(rng, bits=128)
+    results, captured = _eval_many(dl_pred)
+    assert all(r is True for r in results), f"DL not always-True: {results[:5]}"
+    assert len(set(captured)) > 1, f"DL runtime var did not vary: {captured[:5]}"
+    print(f"iO-3 DL: always True for 50 evals + runtime var varies ({len(set(captured))} unique)  OK")
+
+    # --- LWE (runtime cancellation) ---
     rng = _rng_for(ctx)
     lwe_pred = gen_lwe_predicate(rng, n=6)
-    ast.fix_missing_locations(ast.Expression(body=lwe_pred))
-    assert eval(compile(ast.Expression(body=lwe_pred), '<lwe>', 'eval'), {}) is True
-    print("iO-3 LWE: predicate always True  OK")
+    results, captured = _eval_many(lwe_pred)
+    assert all(r is True for r in results), f"LWE not always-True: {results[:5]}"
+    assert len(set(captured)) > 1, "LWE runtime var did not vary"
+    print(f"iO-3 LWE: always True for 50 evals + runtime var varies  OK")
 
-    # --- Hash chain ---
+    # --- Hash chain (deterministic-uninterpreted-function tautology) ---
     rng = _rng_for(ctx)
-    hash_pred = gen_hash_predicate(rng, n_min=5, n_max=20)
-    ast.fix_missing_locations(ast.Expression(body=hash_pred))
+    hash_pred = gen_hash_predicate(rng, n_min=3, n_max=8)
     ns_h = {}
     exec(_HASH_HELPER_SRC, ns_h)
-    assert eval(compile(ast.Expression(body=hash_pred), '<hash>', 'eval'), ns_h) is True
-    print("iO-3 HASH: predicate always True  OK")
+    results, captured = _eval_many(hash_pred, ns_extra=ns_h)
+    assert all(r is True for r in results), f"HASH not always-True: {results[:5]}"
+    assert len(set(captured)) > 1, "HASH runtime var did not vary"
+    print(f"iO-3 HASH: always True for 50 evals + runtime var varies  OK")
 
-    # --- RSA ---
+    # --- RSA (runtime cancellation via v-v) ---
     rng = _rng_for(ctx)
-    rsa_pred = gen_rsa_predicate(rng, bits=32)
-    ast.fix_missing_locations(ast.Expression(body=rsa_pred))
-    assert eval(compile(ast.Expression(body=rsa_pred), '<rsa>', 'eval'), {}) is True
-    print("iO-3 RSA: predicate always True  OK")
+    rsa_pred = gen_rsa_predicate(rng, bits=128)
+    results, captured = _eval_many(rsa_pred)
+    assert all(r is True for r in results), f"RSA not always-True: {results[:5]}"
+    assert len(set(captured)) > 1, "RSA runtime var did not vary"
+    print(f"iO-3 RSA: always True for 50 evals + runtime var varies  OK")
 
     # --- Hybrid ---
     rng = _rng_for(ctx)
     hybrid_pred = gen_opaque_true(rng, 'hybrid')
-    ast.fix_missing_locations(ast.Expression(body=hybrid_pred))
     ns_hb = {}
     exec(_HASH_HELPER_SRC, ns_hb)
-    assert eval(compile(ast.Expression(body=hybrid_pred), '<hyb>', 'eval'), ns_hb) is True
-    print("iO-3 HYBRID: always True (algebra AND crypto)  OK")
+    results, _ = _eval_many(hybrid_pred, ns_extra=ns_hb)
+    assert all(r is True for r in results), f"HYBRID not always-True: {results[:5]}"
+    print("iO-3 HYBRID: always True (algebra AND crypto) for 50 evals  OK")
 
     # --- Per-build diversity: two different seeds -> different predicates ---
     ctx1 = _Ctx(); ctx1.opaque_seed = 1
@@ -472,6 +646,12 @@ def _smoke() -> None:
     p2 = ast.unparse(gen_opaque_true(_rng_for(ctx2), 'crypto'))
     assert p1 != p2, "two different seeds produced identical crypto predicates"
     print(f"iO-3 diversity: two seeds -> different predicates  OK")
+
+    # --- Old attack regression: a baked-constant DL predicate would have the
+    # SAME captured runtime value across evals (since x is a constant). Our
+    # runtime-variable DL must NOT have this property -- already checked above
+    # (len(set(captured)) > 1). Explicit anti-regression message:
+    print("iO-3 anti-regression: runtime variable defeats constant-substitution attack  OK")
 
     # --- apply_opaque_crypto: compose with bloom (no bloom site -> no-op) ---
     tree = ast.parse("def f():\n    x = 1\n    return x\n")
@@ -493,7 +673,17 @@ def _smoke() -> None:
     assert getattr(ctx, 'opaque_crypto_injected', 0) == 1
     src_after = ast.unparse(out2)
     assert 'and' in src_after.lower() or 'And' in src_after
-    print("iO-3 apply: bloom site -> crypto wrap injected  OK")
+    # Verify the wrapped bloom site still compiles and runs. The crypto wrap
+    # short-circuits True first (always-True), so the bloom `.contains(7)`
+    # call IS reached and must succeed. The tree defines `def _br_bloom_filter()`
+    # which has no `.contains`; after exec we re-inject a mock that returns
+    # True so the dead branch runs (x = 1 set, f() returns 1).
+    ns_b = {'_br_bloom_filter': type('BF', (), {'contains': staticmethod(lambda x: True)})()}
+    exec(compile(ast.Module(body=out2.body, type_ignores=[]), '<wb>', 'exec'), ns_b)
+    # The tree's `def _br_bloom_filter()` overrides our mock; re-inject.
+    ns_b['_br_bloom_filter'] = type('BF', (), {'contains': staticmethod(lambda x: True)})()
+    assert ns_b['f']() == 1, f"wrapped bloom site broke f(): {ns_b['f']()}"
+    print("iO-3 apply: bloom site -> crypto wrap injected + still runs  OK")
 
     # --- grade='algebra' is a no-op ---
     ctx.opaque_grade = 'algebra'

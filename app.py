@@ -58,7 +58,13 @@ _rate: Dict[str, list] = defaultdict(list)
 class ObfuscateRequest(BaseModel):
     source: str
     profile: str = "balanced"
-    native_vm: bool = True
+    # Default OFF since Phase B remediation: native_vm=True executes the
+    # user's source server-side during VM compilation (bedrock_obfuscator.py
+    # line ~10950 `exec(code, ns)` to extract function objects). The playground
+    # has no sandbox (no seccomp/jail/resource limits), so this is a server-side
+    # RCE surface. Only opt in with trusted input. The io profile already
+    # forces --no-native-vm regardless.
+    native_vm: bool = False
     anti_meta: bool = True
 
 
@@ -280,6 +286,16 @@ def _run_obfuscator(source: str, profile: str, native_vm: bool, anti_meta: bool)
             pass
 
     warnings = []
+    if native_vm:
+        # Phase B remediation: native_vm=True runs the user's source
+        # server-side during VM compilation (exec at bedrock_obfuscator.py
+        # ~10950). The playground is unsandboxed — this is a server-side
+        # RCE surface. Surface the risk so the operator is never surprised.
+        warnings.append(
+            "WARNING: native_vm=True executes your source server-side during "
+            "VM compilation. The playground has no sandbox. Only use with "
+            "trusted input, or omit native_vm for a safe build."
+        )
     if native_vm and native_status == "reference":
         warnings.append(
             "Native VM build fell back to pure-Python reference interpreter. "
@@ -500,10 +516,10 @@ footer {
   <div class="profile-desc" id="profile-desc">Balanced — rename + string obf + builtin indirection. Good default.</div>
 
   <div class="opts" style="margin-top:12px;">
-    <label class="opt"><input type="checkbox" id="native-vm" checked> Native VM (.pyd)</label>
+    <label class="opt" title="WARNING: native_vm=True executes your source server-side during VM compilation. The playground is unsandboxed. Only use with trusted input."><input type="checkbox" id="native-vm"> Native VM (.pyd) ⚠ executes your code server-side</label>
     <label class="opt"><input type="checkbox" id="anti-meta" checked> Anti-meta (debrand)</label>
   </div>
-  <div class="caveat">⚠ Native VM (.pyd) chỉ hoạt động trên Windows Python 3.11 (cùng platform với server). Platform khác tự fallback sang pure-Python reference.</div>
+  <div class="caveat">⚠ Native VM (.pyd) chỉ hoạt động trên Windows Python 3.11 (cùng platform với server). Platform khác tự fallback sang pure-Python reference.<br><b>Security: native_vm=True executes your source server-side during VM compilation — the playground is unsandboxed, so only enable it with trusted input.</b></div>
 </div>
 
 <button class="submit" id="submit" onclick="doObfuscate()">Obfuscate</button>

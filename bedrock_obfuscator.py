@@ -5334,6 +5334,18 @@ except Exception:
                                           'Falls back to BEDROCK_MASTER_SEED env var. The seed '
                                           'lives on the build host AND the release server (same '
                                           'value); never ships in the artifact.')
+            # Phase C.2: reproducible-build seed for the per-build BuildRNG
+            # (ChaCha20+HKDF CSPRNG). When given, two builds of the same input
+            # with the same seed produce byte-identical output. When omitted,
+            # a fresh master seed is drawn per build (per-build diversity).
+            self.parser.add_argument('--fixed-seed', dest='fixed_seed',
+                                     metavar='HEX', default='',
+                                     help='[Phase C.2] Reproducible-build seed (hex of 32 bytes) '
+                                          'for the per-build BuildRNG. With this set, the same '
+                                          'input + seed reproduces the same build. Without it, a '
+                                          'fresh master seed is drawn per build (diversity). The '
+                                          'BuildRNG replaces the previous Mersenne-Twister fallback '
+                                          'in all H/iO passes (FSS, opaque, capsule, etc.).')
             self.parser.add_argument('--offline-grace-seconds', dest='offline_grace_seconds',
                                      type=int, default=604800,
                                      help='Key-cache TTL in seconds (default 604800 = 7 days). '
@@ -5461,6 +5473,22 @@ except Exception:
                                           'achieving pairwise chi-square ~255 (iO target <320). '
                                           'Replaces entropy pad when both are on. Default off '
                                           '(io auto-on).')
+            # Phase A remediation: key separation. Default reads the key
+            # from an env var (secure); --embed-key opts into the legacy
+            # insecure mode where the key ships in the file.
+            self.parser.add_argument('--embed-key', dest='embed_key',
+                                     action='store_true', default=False,
+                                     help='[Phase A] Embed the capsule key in the obfuscated file '
+                                          '(LEGACY / INSECURE: anyone can recover the source '
+                                          'by running the ~10-line bootstrap). Default OFF: the '
+                                          'key is read from the env var named by --capsule-key-env '
+                                          'at runtime, and emitted to a sidecar <output>.key file '
+                                          'during build.')
+            self.parser.add_argument('--capsule-key-env', dest='capsule_key_env',
+                                     default='BR_CAPSULE_KEY',
+                                     help='[Phase A] Environment variable name the capsule '
+                                          'bootstrap reads the hex-encoded key from when '
+                                          '--embed-key is off. Default: BR_CAPSULE_KEY.')
             # H.10 TLS callback injection (native PE post-build).
             self.parser.add_argument('--h-tls-callback', dest='h_tls_callback',
                                      action=argparse.BooleanOptionalAction, default=None,
@@ -6009,6 +6037,69 @@ except Exception:
             # safer file reading + sanitize control chars
             with open(file, 'rb') as f:
                 raw = f.read()
+            # Phase C.2: wire the per-build BuildRNG (ChaCha20 + HKDF CSPRNG).
+            # This replaces the previous Mersenne-Twister fallback that every
+            # H/iO pass silently used (args._rng was never assigned, so
+            # ctx.build_rng was always None). The BuildRNG threads a single
+            # master seed through independent HKDF sub-streams, so every
+            # randomized transform draws from a CSPRNG instead of a
+            # state-recoverable PRNG. In reproducible mode (--fixed-seed) the
+            # same input + seed reproduces the same build; without it the
+            # master seed is fresh per build (per-build diversity).
+            try:
+                _fs_raw = str(getattr(args, 'fixed_seed', '') or '')
+                _fs = None
+                if _fs_raw:
+                    _fs = bytes.fromhex(_fs_raw)
+                    if len(_fs) != 32:
+                        cli_fail(2, f'--fixed-seed must be hex of 32 bytes, got {len(_fs)}',
+                                 kind='error')
+                import importlib as _br_imp
+                _br_here = os.path.dirname(os.path.abspath(
+                    globals().get('__file__', '') or __file__))
+                _br_loaded = False
+                for _cand in (os.path.join(_br_here, 'bedrock_native'),
+                              os.path.join(os.getcwd(), 'bedrock_native')):
+                    if _cand and os.path.isdir(_cand) and \
+                            os.path.isfile(os.path.join(_cand, '_build_rng.py')):
+                        if _cand not in sys.path:
+                            sys.path.insert(0, _cand)
+                        _br_mod = _br_imp.import_module('_build_rng')
+                        args._rng = _br_mod.BuildRNG.create(raw, fixed_seed=_fs)
+                        # Also seed ctx.rng (a plain random.Random) from the
+                        # BuildRNG master seed so _derive_rng and the
+                        # "or random.Random()" fallbacks in the core passes
+                        # are deterministic in reproducible mode. NOTE: a few
+                        # bare random.Random() calls in non-core paths are
+                        # still seeded from system entropy; full reproducibility
+                        # of the 15k-line engine is beyond C.2 scope.
+                        _master = getattr(args._rng, '_master', None)
+                        if _master is not None:
+                            try:
+                                # Use a sub-stream so ctx.rng and the H/iO
+                                # sub-streams draw from independent keys.
+                                _sr = args._rng.stream(b'phase_core_rng')
+                                _ctx_seed = int.from_bytes(_sr.random(8), 'big')
+                                if _build_ctx is not None:
+                                    _build_ctx.rng = random.Random(_ctx_seed)
+                            except Exception:
+                                pass
+                        _br_loaded = True
+                        if _fs is not None:
+                            Logging.info('BuildRNG: reproducible mode (fixed seed)')
+                        else:
+                            Logging.info('BuildRNG: fresh-seed mode (per-build diversity)')
+                        break
+                if not _br_loaded:
+                    args._rng = None
+                    Logging.warning('BuildRNG not found in bedrock_native/; '
+                                    'H/iO passes fall back to random.Random().')
+            except SystemExit:
+                raise
+            except Exception as _bre:
+                args._rng = None
+                Logging.warning(f'BuildRNG init failed: {_bre}; '
+                                f'H/iO passes fall back to random.Random().')
             # try utf-8-sig first to strip BOM, fallback to latin1 to preserve bytes
             try:
                 code_ = raw.decode('utf-8-sig')
@@ -6768,8 +6859,43 @@ except Exception:
                         break
                 if _bc_mod is not None and _build_ctx is not None:
                     _build_ctx.build_rng = getattr(args, '_rng', None)
-                    output = _bc_mod.apply_binary_capsule(output, _build_ctx)
+                    # Phase A remediation: key separation. Default reads the
+                    # key from an env var at runtime (secure); --embed-key
+                    # opts into the legacy insecure mode.
+                    _embed_key = bool(getattr(args, 'embed_key', False))
+                    _key_env = str(getattr(args, 'capsule_key_env', 'BR_CAPSULE_KEY') or 'BR_CAPSULE_KEY')
+                    output = _bc_mod.apply_binary_capsule(
+                        output, _build_ctx,
+                        embed_key=_embed_key, key_env=_key_env)
                     # output is now bytes, not str
+                    # Emit the key for the operator. In secure mode this is
+                    # the ONLY copy — write it to a sidecar .key file next to
+                    # the output AND log it so the operator can capture it.
+                    _cap_key = getattr(_build_ctx, 'capsule_key', None)
+                    if _cap_key is not None and not _embed_key:
+                        _out_path = str(getattr(args, 'output', '') or '')
+                        if _out_path:
+                            _sidecar = _out_path + '.key'
+                            try:
+                                with open(_sidecar, 'w', encoding='utf-8') as _kf:
+                                    _kf.write(_cap_key.hex())
+                                _env_name = getattr(_build_ctx, 'capsule_key_env', None) or _key_env
+                                Logging.info(
+                                    f'Capsule key emitted to sidecar {_sidecar}. '
+                                    f'Run with: {_env_name}=$(cat "{_sidecar}") python <output>.py')
+                                cli_emit('info',
+                                         f'capsule key emitted to sidecar {_sidecar}; '
+                                         f'env var: {_env_name}',
+                                         path=_sidecar)
+                            except Exception as _ke:
+                                cli_emit('warning',
+                                         f'could not write capsule key sidecar: {_ke}')
+                    elif _embed_key:
+                        Logging.warning(
+                            'Capsule key embedded in the obfuscated file (--embed-key). '
+                            'This is INSECURE: anyone can recover the source by running the '
+                            '~10-line bootstrap. Use the default (no --embed-key) for secure '
+                            'key separation via env var.')
                 else:
                     _pass_failed('h_binary_capsule', RuntimeError('_binary_capsule module not found'))
             except Exception as _e:
