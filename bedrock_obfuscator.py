@@ -5971,6 +5971,25 @@ except Exception:
                 _ext_apply_profile(args, args.profile, argv=getattr(args, '_argv', None))
             except Exception as _e:
                 Logging.warning(f'apply_profile failed: {_e}')
+        # Phase G9: warn when the operator explicitly opts into the insecure
+        # cand/mark static key-recovery path (--no-env-key). The cand/mark
+        # digest is reversible: Agent 1 verified an unpacker recovers the
+        # source in minutes by matching sha256(...).hexdigest() == b85decode(mark).
+        # env-key (now the default for fast/balanced/paranoid/extreme) derives
+        # key1/key2 from the build machine's HW fingerprint, so the output
+        # only runs on that machine. The warning fires only when --no-env-key
+        # was explicitly typed (the profile preset sets env_key=True by
+        # default; apply_profile honours explicit --no-env-key).
+        _g9_explicit = _explicit_cli_dests(getattr(args, '_argv', None))
+        if 'env_key' in _g9_explicit and not getattr(args, 'env_key', False):
+            _g9_preset = getattr(args, '_profile_preset', args.profile)
+            if _g9_preset in ('fast', 'balanced', 'paranoid', 'extreme'):
+                Logging.warning(
+                    'Phase G9: --no-env-key selected. The cand/mark static '
+                    'key-recovery is REVERSIBLE -- an analyst can recover the '
+                    'source in minutes. The default (--env-key, HW-fingerprint '
+                    'binding) is the secure posture. Use --no-env-key only '
+                    'for cross-machine deploy where you accept this risk.')
         # P0 production: activate the full extreme/io override stack. The
         # _apply_extreme_overrides() function was previously dormant (defined
         # but never called) due to regression fears around homoglyph/lambda_enc
@@ -7370,6 +7389,16 @@ except Exception:
             # preserving, so it's safe to default ON. Honours --no-anti-meta
             # for operators who want the brand header visible.
             "anti_meta": True,
+            # Phase G9: env-key ON by default for non-capsule profiles. The
+            # legacy cand/mark static key-recovery is reversible (Agent 1
+            # verified an unpacker recovers the source in minutes). env-key
+            # derives key1/key2 from the build machine's HW fingerprint
+            # (machine-id + MAC + node + arch), so the output only runs on
+            # the build machine. Breaks cross-machine deploy by default;
+            # --no-env-key opts back into the reversible cand/mark path
+            # (NOT recommended). io profile uses the binary capsule's own
+            # key separation, so env-key is not forced there.
+            "env_key": True,
         },
         "balanced": {
             "profile": "max",
@@ -7392,6 +7421,8 @@ except Exception:
             "vm": False,
             # Phase G2: anti_meta ON by default (see fast preset comment).
             "anti_meta": True,
+            # Phase G9: env-key ON by default (see fast preset comment).
+            "env_key": True,
         },
         "paranoid": {
             "profile": "max",
@@ -7423,6 +7454,8 @@ except Exception:
             "str_cipher": True,
             # Phase G2: anti_meta ON by default (see fast preset comment).
             "anti_meta": True,
+            # Phase G9: env-key ON by default (see fast preset comment).
+            "env_key": True,
         },
         "extreme": {
             "profile": "max",
@@ -7471,6 +7504,8 @@ except Exception:
             # it so the output artifact carries no static bedrock/baobg
             # signature for AV/EDR to fingerprint.
             "anti_meta": True,
+            # Phase G9: env-key ON by default (see fast preset comment).
+            "env_key": True,
             # batch 10 (Phase 5): native BedrockVM compilation. Extreme
             # auto-enables it so eligible top-level functions become
             # BedrockVM bytecode blobs (run via the shipped _xvm C
