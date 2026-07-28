@@ -41,3 +41,6 @@ Thumbs.db
 # Backups (replaced by git history)
 *.bak.py
 *.pre*.bak.py
+
+# ZCode agent internal (planning files, not source)
+.zcode/

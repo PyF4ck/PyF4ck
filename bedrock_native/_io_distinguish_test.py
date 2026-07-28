@@ -57,6 +57,11 @@ _COMMON_FLAGS = [
     # Phase iO-7: binary capsule auto-on from io profile. It replaces the
     # entropy pad (iO-6) and achieves pairwise chi-square ~255 (target <320).
     # No --entropy-pad-size needed (capsule disables entropy pad).
+    # Phase A remediation: --embed-key keeps the test self-contained. This
+    # harness measures byte-distribution uniformity + functional equivalence,
+    # NOT key security, so embedding the key is appropriate here. Production
+    # builds MUST omit --embed-key for real key separation.
+    "--embed-key",
 ]
 
 # How many builds to compare. Phase iO-7 uses 20 (190 pairs for stable

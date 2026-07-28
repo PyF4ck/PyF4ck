@@ -1,9 +1,26 @@
-# Phase iO — Practical Indistinguishability Obfuscation Specification
+# Phase io — Encrypted-Source Capsule Specification
 
-**Status:** COMPLETE. All 7 phases implemented, smoke-tested, and verified
-by the distinguishing test (`_io_distinguish_test.py`: 27/27 gates pass at
-N=20 builds, 190 pairs) and the adversarial ML classifier
-(`_io_adversarial_ml.py`: 5/5 gates pass, accuracy 40% < chance 50%).
+**Status:** The 7 phases are implemented and smoke-tested. The
+`_io_distinguish_test.py` ciphertext-uniformity harness passes its
+chi-square gate. The `_io_adversarial_ml.py` harness was **rewritten in
+Phase D** to fix methodological flaws in the original (N=10 vacuous,
+inconsistent gate, unimplemented bigram features, unstratified split); it
+now runs BOTH a PRG-uniformity experiment and an iO-property experiment
+(`Obf(P0)` vs `Obf(P1)` for two functionally-equivalent programs), with
+Wilson 95% CIs. The strict gate may now FAIL at small N — which is
+correct behaviour, because the bootstrap's cleartext signature is greppable.
+
+> **CORRECTION (Phases A/D/F remediation).** Earlier versions of this spec
+> marketed the work as "Practical Indistinguishability Obfuscation (iO)".
+> That was **incorrect**. iO in cryptography means obfuscations of two
+> *different but functionally-equivalent* programs are indistinguishable.
+> The capsule construction only ensures the obfuscated output *file's byte
+> distribution* is uniform — a property of any encryption/PRG output, which
+> says nothing about distinguishing obfuscations of equivalent programs.
+> The metric is now labelled "encrypted-output uniformity". The rewrite of
+> `_io_adversarial_ml.py` adds the actual iO-property test (Experiment 5b)
+> that the original never had. See §9 "Limitations" for the full
+> correction and what the tests do and do not measure.
 
 **Date:** 2026-07-27
 
@@ -11,27 +28,37 @@ N=20 builds, 190 pairs) and the adversarial ML classifier
 
 ## 1. Overview
 
-Phase iO upgrades the Bedrock Obfuscator from multi-layer obfuscation to
-**Practical iO (Indistinguishability Obfuscation)** grade. The goal: two
-builds of the same (functionally equivalent) program should be
-**computationally indistinguishable** — a statistical test or ML classifier
-cannot tell them apart from random data, let alone from each other.
+The `io` profile encrypts the obfuscated source so the output file's byte
+distribution approaches uniform. This is a **PRG-uniformity / ciphertext-
+uniformity** property, not the cryptographic iO property (see the
+correction above). Two builds of the same program produce files whose byte
+distributions differ only in the encrypted blob (independently uniform) and
+the tiny bootstrap (slightly different per-build keys/names).
 
 ### Threat model
 
-The `io` profile targets:
+> **CORRECTION (Phase F remediation).** The "nation-state adversary"
+> claim below applied to the legacy `--embed-key` mode, where the capsule
+> key ships in the file in the clear — that mode is **trivially broken** by
+> anyone (run the file's own ~10-line bootstrap to recover the source).
+> It does not target nation-state adversaries.
 
-- **Nation-state adversaries**: intelligence agencies with full access to
-  static analysis tools, symbolic execution engines (Z3, angr), and
-  decompiler suites (Ghidra, IDA, pydc).
-- **Academic adversaries**: researchers with novel ML-based devirtualization
-  (XL-DFR, rnn-based), byte-level fingerprinting (chi-square, KL-divergence),
-  and adversarial classifiers.
-- **No performance constraint**: the `io` profile trades runtime overhead
-  for maximum protection. Build time ~25s, runtime ~5-10× slower than
-  unobfuscated.
+The default since the Phase A remediation is **env-key mode**: the key is
+emitted to a sidecar `<output>.key` and read from `$BR_CAPSULE_KEY` at
+runtime, so the source is genuinely encrypted at rest. This raises the bar
+from "grep the file" to "read the process environment / dump the decrypted
+in-process source with a debugger" — stronger, but still defeatable by a
+runtime adversary. The strongest posture is the opt-in release-server
+mode (Phase G), where the master seed lives on a license server and the
+VM key is derived per-build — though the TPM attestation there is currently
+a structural placeholder (see `_key_release.py`).
 
-### The iO property
+The byte-distribution uniformity (chi-square, ML) is a property of the
+*ciphertext*, not of the protected *logic*. It defeats byte-frequency
+fingerprinting between builds; it does **not** defeat an adversary who can
+run the file and inspect the decrypted source in memory.
+
+### The "uniformity" property (formerly "the iO property")
 
 Two builds of the same program produce files whose byte distributions differ
 only in the encrypted blob (independently uniform) and the tiny bootstrap
@@ -41,13 +68,13 @@ expected value for two independent random samples from the same distribution.
 
 ### Foundation
 
-Phase iO builds on:
+The `io` profile builds on:
 - **Phase H** (esoteric + anti-pattern obfuscation, 11 passes): provides
   the `apply_X(tree, ctx)` pass framework, BuildRNG sub-streams, and the
   reverse-stack pass ordering convention.
 - **Phases 1-5, 7, G**: capsule runtime, HMAC chain, native VM, key release.
 
-The `_apply_extreme_overrides` function (dormant before iO-1) is wired into
+The `_apply_extreme_overrides` function (dormant before io-1) is wired into
 `run_build` to activate the full esoteric stack for both `extreme` and `io`
 profiles.
 
@@ -561,51 +588,73 @@ anti-VM/anti-debug stack.
 
 ### Limitations
 
-1. **Key in clear**: The binary capsule embeds the 32-byte encryption key
-   as the first 32 bytes of the blob. An attacker CAN decrypt. The goal is
-   uniform byte distribution (iO indistinguishability), not confidentiality.
+1. **Key in clear (CORRECTED in Phase A)**: The legacy `--embed-key` mode
+   embeds the 32-byte encryption key as the first 32 bytes of the blob -
+   an attacker CAN decrypt by running the ~10-line bootstrap. The **default
+   since Phase A** reads the key from `$BR_CAPSULE_KEY` at runtime and emits
+   it to a sidecar `<output>.key` during build, so the key is NOT in the
+   file. The legacy mode is retained only for backward compatibility and is
+   gated behind the explicit `--embed-key` flag (with a build-time warning).
 
 2. **Bootstrap structural bytes**: The ~10-line bootstrap has structural
    bytes (Python keywords, import statements) that create a small signature.
    This is <0.1% of the file and doesn't affect the chi-square gate, but a
-   dedicated adversary could fingerprint the bootstrap pattern.
+   dedicated adversary can fingerprint the bootstrap pattern with a regex
+   (`import zlib, hashlib` + `exec(zlib.decompress`) at 100% accuracy. The
+   rewritten `_io_adversarial_ml.py` (Phase D) uses byte-pair features that
+   CAN pick this up; the strict gate now sometimes fails at small N as a
+   result - which is correct.
 
-3. **Build-time RNG**: The per-build RNG seed determines the encryption key,
-   pad bytes, and name choices. Two builds with the same seed produce
-   byte-identical files. This is by design (reproducibility) but means the
-   seed must be kept secret if reproducibility is a concern.
+3. **Build-time RNG (CORRECTED in Phase C.2)**: The per-build RNG seed
+   determines the capsule key, pad bytes, and name choices. Two builds with
+   the same `--fixed-seed` produce byte-identical capsule keys. The BuildRNG
+   (ChaCha20 + HKDF, RFC-conformant) is now wired into the build path,
+   replacing the previous Mersenne-Twister fallback. Note: full engine
+   reproducibility (all 15k lines) is not yet achieved - a few bare
+   `random.Random()` calls in non-core paths still draw from system entropy.
 
 4. **runtime_dec hang (fixed)**: The `runtime_dec` capsule chain caused ~40%
    of builds to hang (re-entry into `_br_flow_shard` during `ssl.wrap_socket`).
    Fixed by disabling `runtime_dec` + `chain` when binary capsule is on
    (commit `5a34b43`). The hang bug still exists for `extreme` profile with
-   `runtime_dec` on — future work to add re-entrancy guards to the shard
+   `runtime_dec` on - future work to add re-entrancy guards to the shard
    functions themselves.
 
-5. **Small N in ML test**: The adversarial ML test uses N=10+10 (test set
-   ~10 samples). With more samples, the classifier might find weak signals.
-   Future work: scale to N=100+ and add stronger classifiers (random forest,
-   neural network).
+5. **ML test methodology (CORRECTED in Phase D)**: The original adversarial
+   ML test used N=10+10 (statistically vacuous), an inconsistent gate
+   (docstring said <55%, code said <70%), claimed byte-pair features that
+   were never implemented, and used an unstratified split. The rewritten test
+   uses N>=40 (override via `$BR_ML_N`), Wilson 95% CIs, actually-implemented
+   byte-pair features, a genuinely stratified split, and a consistent gate.
+   It now runs TWO experiments: (a) PRG-uniformity (obf vs urandom) and
+   (b) the actual iO-property test (`Obf(P0)` vs `Obf(P1)` for two
+   functionally-equivalent programs). Only (b) is the real iO test; the
+   original never had it.
 
 ### Future work
 
-1. **Key obfuscation**: Encrypt the capsule key with a BuildRNG-derived
-   scheme so the key is not in the clear. This adds confidentiality on top
-   of iO indistinguishability.
+1. **Stronger key separation**: Extend env-key mode to the per-function
+   capsule runtime keys (currently `runtime_dec` ships per-capsule keys in
+   a `_br_rd_keys` literal) and to the lookup-table master key. The
+   release-server mode (Phase G) is the strongest posture but opt-in.
 
 2. **Bootstrap obfuscation**: Obfuscate the bootstrap itself (currently
    ~10 lines of cleartext Python). Options: compile to bytecode + marshal,
-   or transpile to native via Cython.
+   or transpile to native via Cython. This would close limitation 2.
 
 3. **Stronger ML adversaries**: Add random forest, gradient-boosted trees,
-   and small neural network classifiers. Test with N=100+ samples and
-   byte-pair features (65536-dim).
+   and small neural network classifiers. Test with N=100+ samples.
 
 4. **Adaptive adversary**: Model an adversary that knows the bootstrap
    structure and tries to extract the encrypted blob, then distinguish
-   builds by the blob's encrypted content (which should still be
-   indistinguishable).
+   builds by the blob's encrypted content.
 
 5. **Runtime_dec hang root cause**: Fix the re-entrancy bug in
    `_br_flow_shard` so `runtime_dec` + `chain` can be safely re-enabled
    with the binary capsule (defense in depth).
+
+6. **Real cryptographic constructions (Phase E)**: Replace the value
+   secret-sharing "FSS" with actual BGI DPF/DCF, replace the constant-baked
+   opaque predicates with runtime-variable ones, and replace the salted-hash
+   point-function obfuscation with a DPF-based construction. These are
+   phased; see the plan for details.

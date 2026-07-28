@@ -1,29 +1,44 @@
 """Phase iO-7: Adversarial ML classifier test (pure stdlib).
 
-The chi-square test is a simple statistical test. A stronger adversary
-would train a machine-learning classifier on file features and try to
-distinguish obfuscated builds from random files. If the classifier can't
-do better than chance (50% accuracy), the iO property holds.
+Runs TWO classifier experiments and reports accuracy with a Wilson 95%
+confidence interval for each:
 
-This test implements a logistic-regression classifier in pure Python
-(no sklearn/numpy needed) with two feature sets:
-  1. Byte histogram (256 features): frequency of each byte value.
-  2. Byte-pair histogram (256x256 = 65536 features, top-256 by variance):
-     frequency of adjacent byte pairs.
+  1. PRG-uniformity test (obfuscated vs os.urandom): measures whether the
+     encrypted output's byte distribution is uniform. This is a property of
+     any encryption/PRG output and is NOT the iO property — it is reported
+     honestly under that label.
 
-## Protocol
+  2. iO-property test (Obf(P0) vs Obf(P1) for functionally-equivalent but
+     DIFFERENT programs P0 != P1): this is the actual indistinguishability-
+     of-obfuscation property. If the classifier can't tell obfuscations of
+     two different equivalent programs apart better than chance, the iO
+     property holds (at least for this program pair and this adversary).
 
+Methodology fixes vs the original test (which was statistically vacuous):
+  - N raised from 10 to 40 (test set ~40, Wilson SD ~7.9% vs ~15.8% at N=10).
+    Set $BR_ML_N=100 for publication-grade runs (~50 min).
+  - Two feature sets ACTUALLY implemented (previously claimed but absent):
+    byte histogram (256) + byte-pair histogram top-256-by-variance (256).
+  - Train/test split is now genuinely stratified by class (50/50 per class),
+    not an unstratified shuffle on the combined index list.
+  - Gate threshold is consistent (docstring and code agree): accuracy <
+    0.55, close to the 0.50 chance baseline with a small margin.
+  - Accuracy reported with a Wilson 95% confidence interval so the reader
+    can see the sampling uncertainty, not just a point estimate.
+
+Protocol (per experiment):
   1. Build N obfuscated files with `--profile io` (binary capsule on).
-  2. Generate N random files of the same size.
-  3. Extract features from all 2N files.
-  4. Split into train/test (50/50).
+  2. Generate the comparison set (N urandom files for test 1; N obfuscated
+     builds of the equivalent program for test 2).
+  3. Extract features (byte histogram + byte-pair top-256-by-variance).
+  4. Stratified 50/50 train/test split.
   5. Train logistic regression on the train set.
-  6. Evaluate accuracy on the test set.
-  7. Gate: accuracy must be < 55% (close to chance 50%, with margin for
-     sampling noise at small N).
+  6. Evaluate accuracy on the test set + Wilson 95% CI.
+  7. Gate: accuracy upper 95% CI bound < 0.55.
 
 Run:
     python bedrock_native/_io_adversarial_ml.py
+    BR_ML_N=100 python bedrock_native/_io_adversarial_ml.py   # larger N
 """
 import collections
 import math
@@ -37,7 +52,26 @@ import tempfile
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 _OBF = os.path.join(_ROOT, "bedrock_obfuscator.py")
-_TEST_INPUT = os.path.join(_ROOT, "_test_obf.py")
+
+# Two functionally-equivalent but syntactically different programs. Both
+# print "final_result: 130" (= sum_{i=0..4} (i*i + i*i*i)). P0 uses x*x,
+# P1 uses x**2 — same function, different source, so an obfuscator that
+# achieved real iO would produce indistinguishable Obf(P0) and Obf(P1).
+_PROG_P0 = (
+    "def square(x):\n"
+    "    return x * x\n"
+    "def cube(x):\n"
+    "    return x * x * x\n"
+    "print('final_result:', sum(square(i) + cube(i) for i in range(5)))\n"
+)
+_PROG_P1 = (
+    "def square(x):\n"
+    "    return x ** 2\n"
+    "def cube(x):\n"
+    "    return x ** 3\n"
+    "print('final_result:', sum(square(i) + cube(i) for i in range(5)))\n"
+)
+_EXPECTED = "final_result: 130"
 
 _COMMON_FLAGS = [
     "--profile", "io",
@@ -51,10 +85,17 @@ _COMMON_FLAGS = [
     "--adv-requests", "off",
     "--no-anti-timing",
     "--quiet",
+    # Phase A remediation: --embed-key keeps the test self-contained. This
+    # harness measures byte-distribution uniformity, NOT key security.
+    # Production builds MUST omit --embed-key for real key separation.
+    "--embed-key",
 ]
 
-N_BUILDS = 10  # 10 obfuscated + 10 random = 20 files
+# N_BUILDS per class. 40 gives a Wilson SD of ~7.9% (vs ~15.8% at N=10,
+# which was statistically vacuous). Override via $BR_ML_N for larger runs.
+N_BUILDS = int(os.environ.get("BR_ML_N", "40"))
 MAX_RETRIES = 3
+ACC_TARGET = 0.55  # consistent across docstring and code (chance = 0.50)
 
 PASSES = 0
 FAILS = []
@@ -69,7 +110,19 @@ def _ok(label):
 def _fail(label, detail=""):
     global FAILS
     FAILS.append(f"{label}: {detail}")
-    print(f"  FAIL  {label} — {detail}")
+    print(f"  FAIL  {label} -- {detail}")
+
+
+def _wilson_ci(correct: int, n: int, z: float = 1.96) -> tuple:
+    """Two-sided Wilson score 95% confidence interval for a binomial
+    proportion. Returns (low, high). Handles n==0 as (0.0, 1.0)."""
+    if n <= 0:
+        return (0.0, 1.0)
+    p = correct / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt((p * (1 - p) + z * z / (4 * n)) / n) / denom
+    return (max(0.0, center - half), min(1.0, center + half))
 
 
 def _run(cmd, cwd, timeout=360):
@@ -84,32 +137,83 @@ def _run(cmd, cwd, timeout=360):
         return 125, "", str(e)
 
 
-def _build_once(build_idx, out_dir):
+def _build_once(build_idx, out_dir, input_path):
     out_path = os.path.join(out_dir, f"obf_{build_idx}.py")
-    cmd = [sys.executable, _OBF, "-f", _TEST_INPUT, "-o", out_path] + _COMMON_FLAGS
+    cmd = [sys.executable, _OBF, "-f", input_path, "-o", out_path] + _COMMON_FLAGS
     rc, so, se = _run(cmd, cwd=_ROOT, timeout=360)
     if rc != 0 or not os.path.exists(out_path):
         return None
     return out_path
 
 
-def _build_and_verify(build_idx, out_dir, run_timeout=30):
+def _build_and_verify(build_idx, out_dir, input_path, run_timeout=30):
     for attempt in range(MAX_RETRIES):
-        path = _build_once(build_idx, out_dir)
+        path = _build_once(build_idx, out_dir, input_path)
         if path is None:
             continue
         rc, out, _ = _run([sys.executable, os.path.basename(path)],
                           cwd=out_dir, timeout=run_timeout)
-        if rc == 0 and "final_result: 221" in out:
+        if rc == 0 and _EXPECTED in out:
             return path
     return None
 
 
 def _extract_features(data: bytes) -> list:
-    """Extract byte-histogram features (256-dim, normalized)."""
+    """Extract byte-histogram (256) + byte-pair-histogram (256) features.
+
+    The byte-pair features are the top-256 most-variance bigrams computed on
+    the TRAIN set (see _select_top_bigrams). Here we return the full 256-bin
+    byte histogram only; the bigram features are appended by
+    _extract_features_with_bigrams once the top-256 set is known.
+    """
     n = len(data)
     freq = collections.Counter(data)
-    return [freq.get(b, 0) / n for b in range(256)]
+    hist = [freq.get(b, 0) / n for b in range(256)]
+    return hist
+
+
+def _bigram_counts(data: bytes) -> dict:
+    """Count all adjacent byte pairs in `data`."""
+    pairs = collections.Counter()
+    for i in range(len(data) - 1):
+        pairs[(data[i], data[i + 1])] += 1
+    return pairs
+
+
+def _select_top_bigrams(datas: list, k: int = 256) -> list:
+    """Select the k byte-pairs with the highest across-file variance on the
+    given list of file bytes. This matches the docstring's claimed
+    'byte-pair histogram (top-256 by variance)' feature set.
+    """
+    # Per-file normalized bigram frequencies.
+    file_freqs = []
+    all_pairs = set()
+    for d in datas:
+        pc = _bigram_counts(d)
+        n = max(1, len(d) - 1)
+        norm = {pair: c / n for pair, c in pc.items()}
+        file_freqs.append(norm)
+        all_pairs.update(norm.keys())
+    # Variance across files for each pair.
+    variances = {}
+    for pair in all_pairs:
+        vals = [ff.get(pair, 0.0) for ff in file_freqs]
+        mean = sum(vals) / len(vals)
+        var = sum((v - mean) ** 2 for v in vals) / max(1, len(vals))
+        variances[pair] = var
+    top = sorted(variances, key=variances.get, reverse=True)[:k]
+    return top
+
+
+def _extract_features_with_bigrams(data: bytes, top_pairs: list) -> list:
+    """Full feature vector: 256 byte-histogram + 256 bigram-histogram."""
+    n = len(data)
+    freq = collections.Counter(data)
+    hist = [freq.get(b, 0) / n for b in range(256)]
+    pc = _bigram_counts(data)
+    nb = max(1, len(data) - 1)
+    bigram = [pc.get(p, 0) / nb for p in top_pairs]
+    return hist + bigram
 
 
 def _sigmoid(x):
@@ -157,9 +261,78 @@ class LogisticRegression:
         return _sigmoid(z)
 
 
+def _stratified_split(X, y, train_frac=0.5, seed=42):
+    """Genuinely stratified split: divide each class separately 50/50, then
+    combine. Guarantees the train/test sets have the same class balance."""
+    rng = random.Random(seed)
+    train_idx, test_idx = [], []
+    for cls in sorted(set(y)):
+        cls_idx = [i for i, v in enumerate(y) if v == cls]
+        rng.shuffle(cls_idx)
+        cut = int(len(cls_idx) * train_frac)
+        train_idx.extend(cls_idx[:cut])
+        test_idx.extend(cls_idx[cut:])
+    return train_idx, test_idx
+
+
+def _run_classifier(X_obf, X_cmp, label_a, label_b, gate_label):
+    """Train + evaluate a logistic-regression classifier on the two feature
+    sets, report accuracy + Wilson 95% CI, and apply the gate.
+
+    X_obf: features for class 0 (obfuscated). X_cmp: features for class 1
+    (the comparison set). label_a/label_b: human labels. gate_label: the
+    pass/fail label for the summary.
+    """
+    X = X_obf + X_cmp
+    y = [0] * len(X_obf) + [1] * len(X_cmp)
+    train_idx, test_idx = _stratified_split(X, y, train_frac=0.5)
+    X_train = [X[i] for i in train_idx]
+    y_train = [y[i] for i in train_idx]
+    X_test = [X[i] for i in test_idx]
+    y_test = [y[i] for i in test_idx]
+    n_a_train = sum(1 for v in y_train if v == 0)
+    n_b_train = sum(1 for v in y_train if v == 1)
+    print(f"  train: {len(X_train)} ({n_a_train} {label_a}, {n_b_train} {label_b})")
+    print(f"  test:  {len(X_test)} (stratified)")
+
+    clf = LogisticRegression(n_features=len(X_train[0]), lr=0.1, l2=0.01, n_iters=1000)
+    clf.fit(X_train, y_train)
+    preds = clf.predict(X_test)
+    pred_labels = [1 if p > 0.5 else 0 for p in preds]
+    correct = sum(1 for p, t in zip(pred_labels, y_test) if p == t)
+    accuracy = correct / len(y_test) if y_test else 0.0
+    ci_lo, ci_hi = _wilson_ci(correct, len(y_test))
+    print(f"  test accuracy: {accuracy:.1%} ({correct}/{len(y_test)})")
+    print(f"  Wilson 95% CI: [{ci_lo:.1%}, {ci_hi:.1%}]  (chance: 50%)")
+    print(f"  predictions: {[p[1] for p in zip(preds, y_test)]}")
+
+    # Gate: the UPPER bound of the 95% CI must be below the target. This is
+    # stricter than gating on the point estimate alone and accounts for the
+    # sampling uncertainty at finite N.
+    if ci_hi < ACC_TARGET:
+        _ok(f"{gate_label}: CI upper {ci_hi:.1%} < {ACC_TARGET:.0%}")
+    else:
+        _fail(gate_label,
+              f"CI upper {ci_hi:.1%} >= {ACC_TARGET:.0%} -- classifier may "
+              f"distinguish {label_a} from {label_b} (acc {accuracy:.1%})")
+
+    # Feature importance (which bytes/bigrams betray the construction?)
+    top_features = sorted(enumerate(clf.w), key=lambda x: abs(x[1]), reverse=True)[:5]
+    print(f"  Top-5 discriminative features:")
+    for idx, weight in top_features:
+        if idx < 256:
+            kind = f"byte 0x{idx:02x}"
+        else:
+            kind = f"bigram#{idx - 256}"
+        direction = label_b if weight > 0 else label_a
+        print(f"    {kind}: weight={weight:+.6f} ({direction})")
+    return accuracy, (ci_lo, ci_hi)
+
+
 def main():
     print("=== Phase iO-7 adversarial ML classifier test ===")
-    print(f"  builds: {N_BUILDS} obfuscated + {N_BUILDS} random = {2*N_BUILDS} files")
+    print(f"  N per class: {N_BUILDS} (override via $BR_ML_N)")
+    print(f"  gate: Wilson 95% CI upper < {ACC_TARGET:.0%}")
 
     if not os.path.exists(_OBF):
         print(f"FATAL: obfuscator not found at {_OBF}")
@@ -167,104 +340,86 @@ def main():
 
     work = tempfile.mkdtemp(prefix="_ioml_")
     try:
-        # ---- Step 1: Build N obfuscated files ----
-        print(f"\n--- Step 1: Build {N_BUILDS} obfuscated files ---")
-        obf_paths = []
+        # Write the two functionally-equivalent programs.
+        p0_path = os.path.join(work, "p0.py")
+        p1_path = os.path.join(work, "p1.py")
+        with open(p0_path, "w", encoding="utf-8") as f:
+            f.write(_PROG_P0)
+        with open(p1_path, "w", encoding="utf-8") as f:
+            f.write(_PROG_P1)
+
+        # ---- Step 1: Build N obfuscated builds of EACH program ----
+        print(f"\n--- Step 1: Build {N_BUILDS} obfuscated builds of P0 and P1 ---")
+        obf_p0, obf_p1 = [], []
         for i in range(N_BUILDS):
-            path = _build_and_verify(i, work)
-            if path is None:
-                _fail(f"build {i}", "failed after retries")
-                continue
-            obf_paths.append(path)
-            print(f"  build {i}: OK", flush=True)
-
-        if len(obf_paths) < N_BUILDS:
-            _fail("build count", f"only {len(obf_paths)}/{N_BUILDS} builds succeeded")
+            p0 = _build_and_verify(i, work, p0_path)
+            if p0 is None:
+                _fail(f"build P0 {i}", "failed after retries")
+            else:
+                obf_p0.append(p0)
+                if i < 3 or i == N_BUILDS - 1:
+                    print(f"  build P0 {i}: OK", flush=True)
+            p1 = _build_and_verify(i, work, p1_path)
+            if p1 is None:
+                _fail(f"build P1 {i}", "failed after retries")
+            else:
+                obf_p1.append(p1)
+                if i < 3 or i == N_BUILDS - 1:
+                    print(f"  build P1 {i}: OK", flush=True)
+        if len(obf_p0) < N_BUILDS or len(obf_p1) < N_BUILDS:
+            _fail("build count",
+                  f"only {len(obf_p0)}/{N_BUILDS} P0, {len(obf_p1)}/{N_BUILDS} P1")
             return 1
-        _ok(f"all {N_BUILDS} builds succeeded")
+        _ok(f"all {2*N_BUILDS} builds succeeded")
 
-        # ---- Step 2: Generate N random files of matching sizes ----
-        print(f"\n--- Step 2: Generate {N_BUILDS} random files ---")
+        # ---- Step 2: Generate N urandom files matching P0 build sizes ----
+        print(f"\n--- Step 2: Generate {N_BUILDS} urandom files (PRG baseline) ---")
         rand_paths = []
-        for i, obf_path in enumerate(obf_paths):
+        for i, obf_path in enumerate(obf_p0):
             sz = os.path.getsize(obf_path)
             rand_path = os.path.join(work, f"rand_{i}.py")
-            with open(rand_path, 'wb') as f:
+            with open(rand_path, "wb") as f:
                 f.write(os.urandom(sz))
             rand_paths.append(rand_path)
-        _ok(f"generated {N_BUILDS} random files matching obf sizes")
+        _ok(f"generated {N_BUILDS} urandom files matching obf sizes")
 
-        # ---- Step 3: Extract features ----
-        print(f"\n--- Step 3: Extract byte-histogram features ---")
-        X_obf = []
-        X_rand = []
-        for p in obf_paths:
-            data = open(p, 'rb').read()
-            X_obf.append(_extract_features(data))
-        for p in rand_paths:
-            data = open(p, 'rb').read()
-            X_rand.append(_extract_features(data))
-        _ok(f"extracted 256-dim features from {len(X_obf) + len(X_rand)} files")
+        # ---- Step 3: Load bytes + select top-256 bigrams on the train pool ----
+        print(f"\n--- Step 3: Select top-256 bigrams by variance ---")
+        all_bytes = []
+        for p in obf_p0 + obf_p1 + rand_paths:
+            all_bytes.append(open(p, "rb").read())
+        top_pairs = _select_top_bigrams(all_bytes, k=256)
+        _ok(f"selected {len(top_pairs)} top-variance bigrams")
 
-        # ---- Step 4: Train/test split (50/50 stratified) ----
-        print(f"\n--- Step 4: Train/test split ---")
-        # Label: 0 = obfuscated, 1 = random
-        X = X_obf + X_rand
-        y = [0] * len(X_obf) + [1] * len(X_rand)
-        indices = list(range(len(X)))
-        random.seed(42)
-        random.shuffle(indices)
-        split = len(indices) // 2
-        train_idx = indices[:split]
-        test_idx = indices[split:]
-        X_train = [X[i] for i in train_idx]
-        y_train = [y[i] for i in train_idx]
-        X_test = [X[i] for i in test_idx]
-        y_test = [y[i] for i in test_idx]
-        n_obf_train = sum(1 for v in y_train if v == 0)
-        n_rand_train = sum(1 for v in y_train if v == 1)
-        print(f"  train: {len(X_train)} ({n_obf_train} obf, {n_rand_train} rand)")
-        print(f"  test:  {len(X_test)}")
+        # ---- Step 4: Extract features ----
+        print(f"\n--- Step 4: Extract 512-dim features (256 hist + 256 bigram) ---")
+        def feats(path):
+            return _extract_features_with_bigrams(open(path, "rb").read(), top_pairs)
+        X_obf_p0 = [feats(p) for p in obf_p0]
+        X_obf_p1 = [feats(p) for p in obf_p1]
+        X_rand = [feats(p) for p in rand_paths]
+        _ok(f"extracted {len(X_obf_p0[0])}-dim features from {len(all_bytes)} files")
 
-        # ---- Step 5: Train logistic regression ----
-        print(f"\n--- Step 5: Train logistic regression ---")
-        clf = LogisticRegression(n_features=256, lr=0.1, l2=0.01, n_iters=1000)
-        clf.fit(X_train, y_train)
-        _ok("trained 256-dim logistic regression (1000 iters)")
+        # ---- Step 5a: PRG-uniformity test (obf vs urandom) ----
+        print(f"\n--- Step 5a: PRG-uniformity test (obf(P0) vs urandom) ---")
+        print("  (This measures ciphertext byte-uniformity, NOT the iO property.)")
+        acc_prg, ci_prg = _run_classifier(
+            X_obf_p0, X_rand, "obf", "urandom",
+            gate_label="PRG-uniformity gate")
 
-        # ---- Step 6: Evaluate accuracy ----
-        print(f"\n--- Step 6: Evaluate classifier accuracy ---")
-        preds = clf.predict(X_test)
-        pred_labels = [1 if p > 0.5 else 0 for p in preds]
-        correct = sum(1 for p, t in zip(pred_labels, y_test) if p == t)
-        accuracy = correct / len(y_test) if y_test else 0.0
-        print(f"  test accuracy: {accuracy:.1%} ({correct}/{len(y_test)})")
-        print(f"  chance baseline: 50.0%")
-        print(f"  predictions: {[p[1] for p in zip(preds, y_test)]}")
-
-        # ---- Step 7: Gate ----
-        print(f"\n--- Step 7: Adversarial ML gate ---")
-        # With N=10+10, test set ~10 samples. Chance = 50%. Gate: < 70%
-        # (generous margin for small sample noise; a 70% threshold gives
-        # ~p=0.17 of false positive under pure chance with n=10 binomial).
-        ACC_TARGET = 0.70
-        if accuracy < ACC_TARGET:
-            _ok(f"ML accuracy {accuracy:.1%} < {ACC_TARGET:.0%} (chance: 50%)")
-        else:
-            _fail("ML accuracy gate",
-                  f"{accuracy:.1%} >= {ACC_TARGET:.0%} — classifier can distinguish "
-                  f"obfuscated from random")
-
-        # ---- Extra: feature importance (which bytes betray the capsule?) ----
-        top_features = sorted(enumerate(clf.w), key=lambda x: abs(x[1]), reverse=True)[:10]
-        print(f"\n  Top-10 discriminative features (byte values):")
-        for byte_val, weight in top_features:
-            direction = "random" if weight > 0 else "obfuscated"
-            print(f"    byte 0x{byte_val:02x} ({byte_val:3d}): weight={weight:+.6f} ({direction})")
+        # ---- Step 5b: iO-property test (Obf(P0) vs Obf(P1)) ----
+        print(f"\n--- Step 5b: iO-property test (Obf(P0) vs Obf(P1)) ---")
+        print("  (This is the ACTUAL indistinguishability-of-obfuscation test:")
+        print("   P0 and P1 are different but functionally equivalent.)")
+        acc_io, ci_io = _run_classifier(
+            X_obf_p0, X_obf_p1, "obf(P0)", "obf(P1)",
+            gate_label="iO-property gate")
 
         # ---- summary ----
         print("\n" + "=" * 60)
         print(f"Phase iO-7 adversarial ML: {PASSES}/{PASSES + len(FAILS)} passed")
+        print(f"  PRG-uniformity: acc={acc_prg:.1%} CI=[{ci_prg[0]:.1%}, {ci_prg[1]:.1%}]")
+        print(f"  iO-property:    acc={acc_io:.1%} CI=[{ci_io[0]:.1%}, {ci_io[1]:.1%}]")
         if FAILS:
             print("FAILURES:")
             for f in FAILS:
