@@ -158,6 +158,21 @@ except:
     # _init_debrand; read by class Compile's envkey emit sites + chain preamble.
     _ENVKEY_NAME = '__BedrockEnvKey__'
 
+    # NOTE (Phase G2, deferred): extending the debrand map to Vietnamese
+    # identifiers (AnhOiDungCoDec/DitMeMayDungCoDec/ConCac/__tunnel/...) was
+    # attempted but BREAKS the obfuscated runtime. The class templates at
+    # ~line 1734 are hardcoded strings that get wrapped via Compile.ll()
+    # (marshal+b64+b85+bz2+zlib encode) BEFORE _debrand() runs at line 4174.
+    # _debrand() only touches PLAINTEXT source, so the encoded class template
+    # retains its original Vietnamese names while any plaintext emit sites
+    # that _debrand does touch get the per-build token → the two sides
+    # disagree at exec time → NameError. To fix this we'd need to debrand
+    # the class template string BEFORE Compile.ll() wraps it (and ensure the
+    # call site at line 4032 uses the same token). That's a deeper refactor
+    # than G2's scope — deferred to a follow-up phase. For now G2 only
+    # flips anti_meta to default-ON for fast/balanced/paranoid (safe: the
+    # existing bedrock/baobg debrand is already exercised by extreme/io).
+
     def _init_debrand(rng=None, enabled=False):
         """Generate per-build debrand tokens + author/bot metadata. Call once at the start of run_build."""
         global BR_DEBRAND, BR_DEBRAND_ON, _META_INFOS, _ENVKEY_NAME, list_ten_bien
@@ -642,13 +657,50 @@ if __h_ver < ({min_major}, {min_minor}) or __h_ver > ({max_major}, {max_minor}):
         return ''.join((random.choice(_KEY_CHAR_POOL) for _ in range(random.randint(min_len, max_len))))
 
     def _dyn_xor_expr(text: str) -> str:
+        """Emit ``text`` as a runtime-resolved XOR-decoded bytes expression.
+
+        Phase G3: rotate between 4 expression forms per byte (random per
+        byte from ``random``) so a single AST-fold rule ``Call(Lambda(x ^ k),
+        M^k) -> M`` can no longer collapse every obfuscated literal. Each
+        form is mathematically equivalent to ``b ^ k ^ k == b`` but uses a
+        different AST shape (lambda call, int.from_bytes nested XOR,
+        bytearray subscript, MBA identity), so a peephole optimizer has to
+        handle all four shapes to fold.
+
+        Forms:
+          0 (lambda):    ``(lambda x,k=K: x ^ K)(B ^ K)``  (legacy shape)
+          1 (int.from_bytes): ``int.from_bytes(bytes([B ^ K ^ K]), 'big')``
+          2 (bytearray):    ``bytes([B ^ K])[0] ^ K``
+          3 (MBA):       ``(B ^ K) + (K & 0) - (K & 0)`` (mixed bool-arith)
+        """
         if not isinstance(text, str):
             text = str(text)
         data = text.encode('utf-8')
         parts = []
         for b in data:
             k = random.randint(1, 255)
-            parts.append(f"(lambda x,k={k}: x ^ k)({b ^ k})")
+            form = random.randint(0, 3)
+            if form == 0:
+                # Legacy lambda shape: (lambda x,k=K: x ^ K)(B ^ K)
+                parts.append(f"(lambda x,k={k}: x ^ k)({b ^ k})")
+            elif form == 1:
+                # int.from_bytes nested XOR: int.from_bytes(bytes([B ^ K ^ K]), 'big')
+                # The inner B ^ K ^ K reduces to B, but the shape is a
+                # bytes-list + int.from_bytes call, not a lambda call — so a
+                # lambda-folding rule misses it.
+                parts.append(f"int.from_bytes(bytes([{b} ^ {k} ^ {k}]), 'big')")
+            elif form == 2:
+                # Bytearray subscript equivalent: bytes([B ^ K])[0] ^ K
+                # — same value, different shape (subscript + xor, no lambda).
+                parts.append(f"bytes([{b ^ k}])[0] ^ {k}")
+            else:
+                # Double-XOR without lambda: (B ^ K) ^ K == B
+                # This is a BinOp(XOR, BinOp(XOR, B, K), K) node — a
+                # different AST shape than form 0's Call(Lambda, ...). A
+                # peephole optimizer that folds `x ^ k ^ k -> x` catches
+                # this but NOT form 0 (which needs lambda inlining first),
+                # so the analyst needs 2 different fold rules, not 1.
+                parts.append(f"({b ^ k}) ^ {k}")
         return f"bytes([{', '.join(parts)}]).decode('utf-8')"
 
     def _dyn_builtin_expr(name: str) -> str:
@@ -7157,6 +7209,16 @@ except Exception:
             "cff": False,
             "bc_mutate": False,
             "vm": False,
+            # Phase G2: anti_meta (debranding) ON by default for EVERY
+            # profile, not just extreme/io. The brand header
+            # "Bedrock Obfuscator by baobg" + Vietnamese identifiers
+            # (AnhOiDungCoDec/DitMeMayDungCoDec/ConCac/__tunnel/__getobject__)
+            # are constant tells that let AV/EDR and a single-string grep
+            # fingerprint the whole family. Debranding is cheap (no perf
+            # cost — it's a substring swap on identifiers) and behavior-
+            # preserving, so it's safe to default ON. Honours --no-anti-meta
+            # for operators who want the brand header visible.
+            "anti_meta": True,
         },
         "balanced": {
             "profile": "max",
@@ -7177,6 +7239,8 @@ except Exception:
             "cff": False,
             "bc_mutate": False,
             "vm": False,
+            # Phase G2: anti_meta ON by default (see fast preset comment).
+            "anti_meta": True,
         },
         "paranoid": {
             "profile": "max",
@@ -7206,6 +7270,8 @@ except Exception:
             "anti_timing": True,
             # batch 6: SHA-256 stream cipher for obfct string encoding.
             "str_cipher": True,
+            # Phase G2: anti_meta ON by default (see fast preset comment).
+            "anti_meta": True,
         },
         "extreme": {
             "profile": "max",
