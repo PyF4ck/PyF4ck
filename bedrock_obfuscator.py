@@ -5541,6 +5541,19 @@ except Exception:
                                      help='[Phase A] Environment variable name the capsule '
                                           'bootstrap reads the hex-encoded key from when '
                                           '--embed-key is off. Default: BR_CAPSULE_KEY.')
+            # Phase G4: operator control over capsule key delivery.
+            self.parser.add_argument('--capsule-key-file', dest='capsule_key_file',
+                                     default=None,
+                                     help='[Phase G4] Write the capsule key sidecar to PATH '
+                                          '(operator-chosen, not next to the artifact) with '
+                                          '0600 perms. Default: writes <output>.key next to '
+                                          'the artifact.')
+            self.parser.add_argument('--no-capsule-sidecar', dest='no_capsule_sidecar',
+                                     action='store_true', default=False,
+                                     help='[Phase G4] Do NOT write the capsule key to any file. '
+                                          'The key hex is printed to stderr once (capture '
+                                          'manually) and the operator must set the env var '
+                                          'out-of-band.')
             # H.10 TLS callback injection (native PE post-build).
             self.parser.add_argument('--h-tls-callback', dest='h_tls_callback',
                                      action=argparse.BooleanOptionalAction, default=None,
@@ -6926,12 +6939,49 @@ except Exception:
                     _cap_key = getattr(_build_ctx, 'capsule_key', None)
                     if _cap_key is not None and not _embed_key:
                         _out_path = str(getattr(args, 'output', '') or '')
-                        if _out_path:
+                        _env_name = getattr(_build_ctx, 'capsule_key_env', None) or _key_env
+                        # Phase G4: operator control over key delivery.
+                        _no_sidecar = bool(getattr(args, 'no_capsule_sidecar', False))
+                        _key_file = getattr(args, 'capsule_key_file', None)
+                        if _no_sidecar:
+                            # Refuse to write any file. Print key hex to
+                            # stderr once so the operator can capture it
+                            # manually and set the env var out-of-band.
+                            import sys as _sys
+                            _sys.stderr.write(
+                                f'\n[CAPSULE KEY] {_env_name}={_cap_key.hex()}\n'
+                                f'Set this env var before running the obfuscated file.\n\n')
+                            _sys.stderr.flush()
+                            cli_emit('info',
+                                     f'capsule key emitted to stderr (no sidecar file); '
+                                     f'env var: {_env_name}')
+                        elif _key_file:
+                            # Write to operator-chosen path with 0600 perms
+                            # (not next to the artifact).
+                            try:
+                                with open(_key_file, 'w', encoding='utf-8') as _kf:
+                                    _kf.write(_cap_key.hex())
+                                try:
+                                    import os as _cos
+                                    _cos.chmod(_key_file, 0o600)
+                                except Exception:
+                                    pass  # chmod may fail on Windows
+                                Logging.info(
+                                    f'Capsule key emitted to {_key_file} (0600). '
+                                    f'Run with: {_env_name}=$(cat "{_key_file}") python <output>.py')
+                                cli_emit('info',
+                                         f'capsule key emitted to {_key_file} (0600); '
+                                         f'env var: {_env_name}',
+                                         path=_key_file)
+                            except Exception as _ke:
+                                cli_emit('warning',
+                                         f'could not write capsule key to {_key_file}: {_ke}')
+                        elif _out_path:
+                            # Default: write <output>.key next to the artifact.
                             _sidecar = _out_path + '.key'
                             try:
                                 with open(_sidecar, 'w', encoding='utf-8') as _kf:
                                     _kf.write(_cap_key.hex())
-                                _env_name = getattr(_build_ctx, 'capsule_key_env', None) or _key_env
                                 Logging.info(
                                     f'Capsule key emitted to sidecar {_sidecar}. '
                                     f'Run with: {_env_name}=$(cat "{_sidecar}") python <output>.py')

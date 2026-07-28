@@ -439,7 +439,7 @@ def transpile_and_build(obf_source, out_dir, *, module_name='obf',
             input_sha256=hashlib.sha256(
                 obf_source.encode('utf-8')).hexdigest(),
             license_id=license_id,
-            master_seed_hex=build_rng.master_seed_hex(),
+            master_seed_hash=build_rng.master_seed_hash(),
             timestamp='',
             passes=['cython_transpile', 'c_obf_opaque'] +
                    (['c_antire_timing'] if has_antire else []),
