@@ -5554,6 +5554,34 @@ except Exception:
                                           'The key hex is printed to stderr once (capture '
                                           'manually) and the operator must set the env var '
                                           'out-of-band.')
+            # Phase G5: DPF key split -- ship k0 in the file, deliver k1 via env.
+            # Default 'env' (secure posture): a 1-key adversary faces the GGM
+            # pseudorandom tree, so alpha is hidden. 'off' = legacy (both keys
+            # embedded, backward-compat). Breaks backward-compat for 'env' builds
+            # (the output needs BR_DPF_K1 set to run) -- user accepted.
+            self.parser.add_argument('--dpf-key-split', dest='dpf_key_split',
+                                     choices=['env', 'off'], default='env',
+                                     help='[Phase G5] DPF key delivery. "env" (default, secure): '
+                                          'k0 ships in the file, k1 is read from the env var '
+                                          'named by --dpf-key-env at runtime. "off": both keys '
+                                          'ship in the file (legacy, reversible by an analyst).')
+            self.parser.add_argument('--dpf-key-env', dest='dpf_key_env',
+                                     default='BR_DPF_K1',
+                                     help='[Phase G5] Environment variable name the DPF '
+                                          'evaluator reads the hex-encoded k1 key tuple from '
+                                          'when --dpf-key-split=env. Default: BR_DPF_K1.')
+            self.parser.add_argument('--dpf-key-file', dest='dpf_key_file',
+                                     default=None,
+                                     help='[Phase G5] Write the DPF k1 key sidecar to PATH '
+                                          '(operator-chosen, not next to the artifact) with '
+                                          '0600 perms. Default: writes <output>.dpfkey next to '
+                                          'the artifact.')
+            self.parser.add_argument('--no-dpf-sidecar', dest='no_dpf_sidecar',
+                                     action='store_true', default=False,
+                                     help='[Phase G5] Do NOT write the DPF k1 key to any file. '
+                                          'The key hex is printed to stderr once (capture '
+                                          'manually) and the operator must set the env var '
+                                          'out-of-band.')
             # H.10 TLS callback injection (native PE post-build).
             self.parser.add_argument('--h-tls-callback', dest='h_tls_callback',
                                      action=argparse.BooleanOptionalAction, default=None,
@@ -6565,6 +6593,18 @@ except Exception:
                         _build_ctx.build_rng = getattr(args, '_rng', None)
                     except Exception:
                         pass
+                    # Phase G5: thread DPF key-split config from CLI to ctx.
+                    # --dpf-key-split=env (default) -> split on (secure);
+                    # =off -> both keys embedded (legacy). The H passes
+                    # (_fss, _pointfunc_obf) read ctx.dpf_key_split /
+                    # ctx.dpf_key_env and expose ctx.dpf_k1_hex for the sidecar.
+                    try:
+                        _dpf_split_arg = str(getattr(args, 'dpf_key_split', 'env') or 'env')
+                        _build_ctx.dpf_key_split = (_dpf_split_arg == 'env')
+                        _build_ctx.dpf_key_env = str(
+                            getattr(args, 'dpf_key_env', 'BR_DPF_K1') or 'BR_DPF_K1')
+                    except Exception:
+                        pass
                     # H passes inject module-level + function-level names
                     # (_br_acoda, _br_mut, _br_bloom, _br_bloom_contains,
                     # _br_ds1, _br_ds2, _br_path, _br_structural_mutate, etc.)
@@ -7002,6 +7042,67 @@ except Exception:
                     _pass_failed('h_binary_capsule', RuntimeError('_binary_capsule module not found'))
             except Exception as _e:
                 _pass_failed('h_binary_capsule', _e)
+        # Phase G5: emit the DPF k1 key sidecar (when --h-fss / --h-pointfunc
+        # used DPF mode with --dpf-key-split=env, the default). The H passes
+        # expose ctx.dpf_k1_hex + ctx.dpf_key_env_name. Mirrors the capsule
+        # .key sidecar's 3-way dispatch: --no-dpf-sidecar (stderr), --dpf-key-file
+        # (0600), default <output>.dpfkey.
+        if _build_ctx is not None:
+            try:
+                _dpf_k1_hex = getattr(_build_ctx, 'dpf_k1_hex', None)
+                _dpf_split_on = bool(getattr(_build_ctx, 'dpf_key_split', True))
+                if _dpf_k1_hex and _dpf_split_on:
+                    _dpf_env_name = str(getattr(_build_ctx, 'dpf_key_env_name', None)
+                                        or getattr(args, 'dpf_key_env', 'BR_DPF_K1')
+                                        or 'BR_DPF_K1')
+                    _dpf_out_path = str(getattr(args, 'output', '') or '')
+                    _dpf_no_sidecar = bool(getattr(args, 'no_dpf_sidecar', False))
+                    _dpf_key_file = getattr(args, 'dpf_key_file', None)
+                    if _dpf_no_sidecar:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f'\n[DPF K1 KEY] {_dpf_env_name}={_dpf_k1_hex}\n'
+                            f'Set this env var before running the obfuscated file.\n\n')
+                        _sys.stderr.flush()
+                        cli_emit('info',
+                                 f'dpf k1 key emitted to stderr (no sidecar file); '
+                                 f'env var: {_dpf_env_name}')
+                    elif _dpf_key_file:
+                        try:
+                            with open(_dpf_key_file, 'w', encoding='utf-8') as _dkf:
+                                _dkf.write(_dpf_k1_hex)
+                            try:
+                                import os as _dcos
+                                _dcos.chmod(_dpf_key_file, 0o600)
+                            except Exception:
+                                pass  # chmod may fail on Windows
+                            Logging.info(
+                                f'DPF k1 key emitted to {_dpf_key_file} (0600). '
+                                f'Run with: {_dpf_env_name}=$(cat "{_dpf_key_file}") python <output>.py')
+                            cli_emit('info',
+                                     f'dpf k1 key emitted to {_dpf_key_file} (0600); '
+                                     f'env var: {_dpf_env_name}',
+                                     path=_dpf_key_file)
+                        except Exception as _dke:
+                            cli_emit('warning',
+                                     f'could not write dpf k1 key to {_dpf_key_file}: {_dke}')
+                    elif _dpf_out_path:
+                        _dpf_sidecar = _dpf_out_path + '.dpfkey'
+                        try:
+                            with open(_dpf_sidecar, 'w', encoding='utf-8') as _dkf:
+                                _dkf.write(_dpf_k1_hex)
+                            Logging.info(
+                                f'DPF k1 key emitted to sidecar {_dpf_sidecar}. '
+                                f'Run with: {_dpf_env_name}=$(cat "{_dpf_sidecar}") python <output>.py')
+                            cli_emit('info',
+                                     f'dpf k1 key emitted to sidecar {_dpf_sidecar}; '
+                                     f'env var: {_dpf_env_name}',
+                                     path=_dpf_sidecar)
+                        except Exception as _dke:
+                            cli_emit('warning',
+                                     f'could not write dpf k1 key sidecar: {_dke}')
+            except Exception:
+                pass  # sidecar emission is best-effort; build must not fail here
         # --- Phase 1: native transpile (Cython -> .pyd). The AST-obfuscated
         # source (no marshal loader, no cleartext keys) is transpiled to C and
         # compiled to a native extension. This is the leak fix: logic becomes

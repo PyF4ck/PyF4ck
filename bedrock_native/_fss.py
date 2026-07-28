@@ -948,7 +948,10 @@ _DPF_MAX_BITS = 32
 _DPF_DOMAIN_BITS_MIN = 16
 
 
-def _build_dpf_shares(node: ast.FunctionDef, rng, n_shares: int):
+def _build_dpf_shares(node: ast.FunctionDef, rng, n_shares: int,
+                      dpf_key_split: bool = True,
+                      dpf_key_env: str = 'BR_DPF_K1',
+                      ctx=None):
     """Build two DPF Eval functions + an XOR combiner for `return x == CONST`.
 
     Emits two functions _br_dpf_<i>_<hex>(x) that each traverse the GGM tree
@@ -959,6 +962,21 @@ def _build_dpf_shares(node: ast.FunctionDef, rng, n_shares: int):
     n = max(alpha.bit_length(), _DPF_DOMAIN_BITS_MIN). For inputs x < 2**n
     the result equals (x == alpha); for x >= 2**n the result is undefined
     (matches (x mod 2**n) == alpha). See _DPF_DOMAIN_BITS_MIN above.
+
+    Phase G5: when ``dpf_key_split`` is True (default, secure), party 0's
+    key (k0) is embedded in the file as before, but party 1's key (k1) is
+    NOT shipped. Instead, name1's body reads the serialized key tuple from
+    the environment variable ``dpf_key_env`` (default ``BR_DPF_K1``) at
+    runtime. The operator must set that env var (hex-encoded key tuple) on
+    the machine that runs the obfuscated file. A 1-key adversary (only k0)
+    faces a GGM pseudorandom tree — alpha is hidden.
+
+    When ``dpf_key_split`` is False (legacy backward-compat), both keys
+    ship in the file (the pre-G5 behavior).
+
+    If ``ctx`` is provided and split is on, the serialized k1 hex is exposed
+    on ``ctx.dpf_k1_hex`` + ``ctx.dpf_key_env_name`` so the build path can
+    emit a ``.dpfkey`` sidecar (mirrors the binary capsule's ctx.capsule_key).
     """
     alpha, arg_name = _dpf_extract_alpha_and_arg(node)
     n = max(alpha.bit_length(), _DPF_DOMAIN_BITS_MIN) if alpha > 0 else _DPF_DOMAIN_BITS_MIN
@@ -976,6 +994,16 @@ def _build_dpf_shares(node: ast.FunctionDef, rng, n_shares: int):
 
     key0_repr = repr(_key_repr(k0))
     key1_repr = repr(_key_repr(k1))
+    # Phase G5: expose the serialized k1 hex for the build path to emit a
+    # sidecar / stderr (like the binary capsule key). When split is on,
+    # the file does NOT contain k1; the build path captures it from here.
+    try:
+        import json as _dpf_json
+        _k1_serialized = _dpf_json.dumps(_key_repr(k1)).encode('utf-8').hex()
+    except Exception:
+        _k1_serialized = repr(_key_repr(k1)).encode('utf-8').hex()
+    _dpf_k1_hex = _k1_serialized
+    _dpf_key_env_name = dpf_key_env
 
     # The emitted evaluator: parse the key tuple, traverse the tree, return a bit.
     # We embed a compact pure-Python DPF eval as source.
@@ -997,24 +1025,50 @@ def _build_dpf_shares(node: ast.FunctionDef, rng, n_shares: int):
         f"            _t = _tR ^ (_tcR if _t else 0)\n"
         f"    return _t\n"
     )
-    eval_src1 = (
-        f"def {name1}({arg_name}):\n"
-        f"    _seed, _t, _cws, _cwf = {key1_repr}\n"
-        f"    _s = bytes.fromhex(_seed); _n = len(_cws)\n"
-        f"    for _i in range(_n):\n"
-        f"        _h = __import__('hashlib').sha256(_s + b'\\x00dpf-ggm').digest()\n"
-        f"        _sL, _sR = _h[:16], _h[16:32]; _tL, _tR = _h[24] & 1, _h[25] & 1\n"
-        f"        _scw, _tcL, _tcR = _cws[_i]\n"
-        f"        _xi = ({arg_name} >> (_n - 1 - _i)) & 1\n"
-        f"        _scw_b = bytes.fromhex(_scw)\n"
-        f"        if _xi == 0:\n"
-        f"            _s = bytes(a ^ b for a, b in zip(_sL, _scw_b)) if _t else _sL\n"
-        f"            _t = _tL ^ (_tcL if _t else 0)\n"
-        f"        else:\n"
-        f"            _s = bytes(a ^ b for a, b in zip(_sR, _scw_b)) if _t else _sR\n"
-        f"            _t = _tR ^ (_tcR if _t else 0)\n"
-        f"    return _t ^ _cwf\n"
-    )
+    if dpf_key_split:
+        _env_repr = repr(dpf_key_env)
+        eval_src1 = (
+            f"def {name1}({arg_name}):\n"
+            f"    import os as _br_os\n"
+            f"    _k1_hex = _br_os.environ.get({_env_repr})\n"
+            f"    if not _k1_hex:\n"
+            f"        raise SystemExit('dpf: key missing -- set env ' + {_env_repr} + '=<hex> (see <output>.dpfkey sidecar) before running')\n"
+            f"    import json as _br_json\n"
+            f"    _seed, _t, _cws, _cwf = _br_json.loads(bytes.fromhex(_k1_hex).decode('utf-8'))\n"
+            f"    _s = bytes.fromhex(_seed); _n = len(_cws)\n"
+            f"    for _i in range(_n):\n"
+            f"        _h = __import__('hashlib').sha256(_s + b'\\x00dpf-ggm').digest()\n"
+            f"        _sL, _sR = _h[:16], _h[16:32]; _tL, _tR = _h[24] & 1, _h[25] & 1\n"
+            f"        _scw, _tcL, _tcR = _cws[_i]\n"
+            f"        _xi = ({arg_name} >> (_n - 1 - _i)) & 1\n"
+            f"        _scw_b = bytes.fromhex(_scw)\n"
+            f"        if _xi == 0:\n"
+            f"            _s = bytes(a ^ b for a, b in zip(_sL, _scw_b)) if _t else _sL\n"
+            f"            _t = _tL ^ (_tcL if _t else 0)\n"
+            f"        else:\n"
+            f"            _s = bytes(a ^ b for a, b in zip(_sR, _scw_b)) if _t else _sR\n"
+            f"            _t = _tR ^ (_tcR if _t else 0)\n"
+            f"    return _t ^ _cwf\n"
+        )
+    else:
+        eval_src1 = (
+            f"def {name1}({arg_name}):\n"
+            f"    _seed, _t, _cws, _cwf = {key1_repr}\n"
+            f"    _s = bytes.fromhex(_seed); _n = len(_cws)\n"
+            f"    for _i in range(_n):\n"
+            f"        _h = __import__('hashlib').sha256(_s + b'\\x00dpf-ggm').digest()\n"
+            f"        _sL, _sR = _h[:16], _h[16:32]; _tL, _tR = _h[24] & 1, _h[25] & 1\n"
+            f"        _scw, _tcL, _tcR = _cws[_i]\n"
+            f"        _xi = ({arg_name} >> (_n - 1 - _i)) & 1\n"
+            f"        _scw_b = bytes.fromhex(_scw)\n"
+            f"        if _xi == 0:\n"
+            f"            _s = bytes(a ^ b for a, b in zip(_sL, _scw_b)) if _t else _sL\n"
+            f"            _t = _tL ^ (_tcL if _t else 0)\n"
+            f"        else:\n"
+            f"            _s = bytes(a ^ b for a, b in zip(_sR, _scw_b)) if _t else _sR\n"
+            f"            _t = _tR ^ (_tcR if _t else 0)\n"
+            f"    return _t ^ _cwf\n"
+        )
 
     tree0 = ast.parse(eval_src).body[0]
     tree1 = ast.parse(eval_src1).body[0]
@@ -1039,6 +1093,14 @@ def _build_dpf_shares(node: ast.FunctionDef, rng, n_shares: int):
         name=node.name, args=combiner_args, body=combiner_body,
         decorator_list=[], returns=None, type_comment=None,
     )
+    # Phase G5: expose the serialized k1 hex on ctx for the build path to
+    # emit a .dpfkey sidecar (mirrors ctx.capsule_key for the binary capsule).
+    if ctx is not None and dpf_key_split:
+        try:
+            ctx.dpf_k1_hex = _dpf_k1_hex
+            ctx.dpf_key_env_name = dpf_key_env
+        except Exception:
+            pass
     return [tree0, tree1], combiner
 
 
@@ -1123,7 +1185,12 @@ def apply_fss(tree: ast.Module, ctx) -> ast.Module:
         elif mode == 'serialized':
             share_fns, combiner = _build_serialized_shares(node, rng, n_shares)
         elif mode == 'dpf':
-            share_fns, combiner = _build_dpf_shares(node, rng, n_shares)
+            # Phase G5: read split config from ctx (default: split on, secure).
+            _dpf_split = bool(getattr(ctx, 'dpf_key_split', True))
+            _dpf_env = str(getattr(ctx, 'dpf_key_env', 'BR_DPF_K1') or 'BR_DPF_K1')
+            share_fns, combiner = _build_dpf_shares(
+                node, rng, n_shares,
+                dpf_key_split=_dpf_split, dpf_key_env=_dpf_env, ctx=ctx)
         else:  # additive
             share_fns, combiner = _build_additive_shares(node, rng, 2)
 
@@ -1296,31 +1363,85 @@ def _smoke() -> None:
     # the same results as the crypto-core _dpf_eval across the full domain.
     # Domain for alpha=5 is 2**16 (the default _DPF_DOMAIN_BITS_MIN), so all
     # inputs in 0..255 are within range and `x == 5` semantics are exact.
+    #
+    # Phase G5: default dpf_key_split=True ships only k0 in the file; k1 is
+    # read from env (BR_DPF_K1). The build exposes the serialized k1 hex on
+    # ctx.dpf_k1_hex + ctx.dpf_key_env_name. The smoke test sets the env
+    # from there before exec, then verifies the refuse-run path when the env
+    # is missing (operator forgot to set it -> clean SystemExit, not a leak).
     tree_dpf = ast.parse("def is_special(x):\n    return x == 5\n")
     ctx_dpf = _Ctx()
     ctx_dpf.fss_mode = 'dpf'
     out_dpf = apply_fss(tree_dpf, ctx_dpf)
     assert ctx_dpf.fss_shared == 1, f"dpf should share 1 fn, got {ctx_dpf.fss_shared}"
-    ns_dpf = {}
-    exec(compile(ast.Module(body=out_dpf.body, type_ignores=[]), '<dpf>', 'exec'), ns_dpf)
-    for v in range(256):
-        got = ns_dpf['is_special'](v)
-        assert got is (v == 5), f"is_special({v}) = {got}, expected {v == 5}"
-    print("DPF AST: is_special(x)==(x==5) correct for x in 0..255 (16-bit domain)  OK")
+    # G5: split default-on -> k1 must NOT be embedded; env name + hex exposed.
+    _dpf_env_name = getattr(ctx_dpf, 'dpf_key_env_name', 'BR_DPF_K1')
+    _dpf_k1_hex = getattr(ctx_dpf, 'dpf_k1_hex', '')
+    assert _dpf_k1_hex, "G5: ctx.dpf_k1_hex must be exposed when split is on"
+    _dpf_src = ast.unparse(out_dpf)
+    assert 'os.environ' in _dpf_src or '_br_os.environ' in _dpf_src, \
+        "G5: split=on must read k1 from env"
+    # Refuse-run: with env unset, calling the function must SystemExit cleanly
+    # (no alpha leak) rather than crash with a confusing traceback.
+    _os.environ.pop(_dpf_env_name, None)
+    ns_refuse = {}
+    exec(compile(ast.Module(body=out_dpf.body, type_ignores=[]), '<dpf>', 'exec'), ns_refuse)
+    try:
+        ns_refuse['is_special'](5)
+        raise AssertionError("G5: missing env must refuse (SystemExit), not run")
+    except SystemExit as _e:
+        assert 'key missing' in str(_e), f"refuse msg must mention key missing: {_e}"
+    # Correctness with env set from the sidecar-equivalent hex.
+    _os.environ[_dpf_env_name] = _dpf_k1_hex
+    try:
+        ns_dpf = {}
+        exec(compile(ast.Module(body=out_dpf.body, type_ignores=[]), '<dpf>', 'exec'), ns_dpf)
+        for v in range(256):
+            got = ns_dpf['is_special'](v)
+            assert got is (v == 5), f"is_special({v}) = {got}, expected {v == 5}"
+    finally:
+        _os.environ.pop(_dpf_env_name, None)
+    print("DPF AST (split=on): is_special correct 0..255 with env k1; refuses when env missing  OK")
 
-    # Auto-mode picks dpf for `return x == CONST`:
+    # G5 backward-compat: dpf_key_split=False embeds BOTH keys (legacy path),
+    # no env required. Verifies the pre-G5 behavior still works for operators
+    # who opt out of the split.
+    tree_nosplit = ast.parse("def is_legacy(x):\n    return x == 7\n")
+    ctx_nosplit = _Ctx()
+    ctx_nosplit.fss_mode = 'dpf'
+    ctx_nosplit.dpf_key_split = False
+    out_nosplit = apply_fss(tree_nosplit, ctx_nosplit)
+    _nosplit_src = ast.unparse(out_nosplit)
+    assert 'os.environ' not in _nosplit_src and '_br_os.environ' not in _nosplit_src, \
+        "G5: split=off must NOT read from env"
+    assert not getattr(ctx_nosplit, 'dpf_k1_hex', ''), \
+        "G5: split=off must not expose a k1 sidecar hex"
+    ns_nosplit = {}
+    exec(compile(ast.Module(body=out_nosplit.body, type_ignores=[]), '<nosplit>', 'exec'), ns_nosplit)
+    for v in range(256):
+        assert ns_nosplit['is_legacy'](v) is (v == 7), f"is_legacy({v}) wrong"
+    print("DPF AST (split=off): is_legacy correct 0..255, both keys embedded, no env  OK")
+
+    # Auto-mode picks dpf for `return x == CONST` (G5 split default-on):
     tree_auto = ast.parse("def is_answer(x):\n    return x == 42\n")
     ctx_auto = _Ctx(); ctx_auto.fss_mode = 'auto'
     out_auto = apply_fss(tree_auto, ctx_auto)
     # In auto mode the point function should route to dpf.
     src_auto = ast.unparse(out_auto)
     assert 'bytes.fromhex' in src_auto, "auto mode should pick DPF for x==CONST"
-    ns_auto = {}
-    exec(compile(ast.Module(body=out_auto.body, type_ignores=[]), '<auto>', 'exec'), ns_auto)
-    # Correctness over 0..255 (all within the 2**16 domain).
-    for v in range(256):
-        assert ns_auto['is_answer'](v) is (v == 42), f"is_answer({v}) wrong"
-    print("DPF auto: is_answer routes to DPF + correct for x in 0..255  OK")
+    _auto_env = getattr(ctx_auto, 'dpf_key_env_name', 'BR_DPF_K1')
+    _auto_k1 = getattr(ctx_auto, 'dpf_k1_hex', '')
+    assert _auto_k1, "G5: auto+dpf must expose k1 hex for the sidecar"
+    _os.environ[_auto_env] = _auto_k1
+    try:
+        ns_auto = {}
+        exec(compile(ast.Module(body=out_auto.body, type_ignores=[]), '<auto>', 'exec'), ns_auto)
+        # Correctness over 0..255 (all within the 2**16 domain).
+        for v in range(256):
+            assert ns_auto['is_answer'](v) is (v == 42), f"is_answer({v}) wrong"
+    finally:
+        _os.environ.pop(_auto_env, None)
+    print("DPF auto (split=on): is_answer routes to DPF + correct for x in 0..255  OK")
 
     print("iO-2 SMOKE: PASS")
 
