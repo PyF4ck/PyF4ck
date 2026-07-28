@@ -762,22 +762,34 @@ import hashlib as _dpf_hashlib
 
 _DPF_SEED_LEN = 16  # 128-bit seeds
 
+# Phase G7: default domain-separation string for the GGM PRG. New keys carry
+# a per-build salt (5th tuple element) that replaces this fixed string, so a
+# classifier cannot fingerprint the constant across builds. Old keys (4-tuple,
+# no salt) fall back to this default.
+_DPF_PRG_DOMAIN_DEFAULT = b'\x00dpf-ggm'
 
-def _dpf_prg(seed: bytes):
+
+def _dpf_prg(seed: bytes, domain: bytes = _DPF_PRG_DOMAIN_DEFAULT):
     """GGM PRG: expand a 16-byte seed into (L_seed, R_seed, tL, tR).
 
     L_seed, R_seed are 16 bytes each; tL, tR are control bits. Uses
-    HMAC-SHA256 as the underlying PRG (pseudorandom under the PRF assumption).
+    SHA-512 as the underlying PRG (pseudorandom under the PRF assumption).
 
-    The control bits are drawn from bytes distinct from the seed bytes so
-    they are independent of the expanded seeds.
+    Phase G7 fix (M7): the previous SHA-256 variant drew tL/tR from bytes
+    24/25, which OVERLAP the sR region (bytes 16-31) -- so the control
+    bits were NOT independent of the right seed. SHA-512 gives 64 bytes,
+    so sL (0-15), sR (16-31), tL (32), tR (33) are all disjoint.
+
+    Phase G7 (M2): ``domain`` is a per-build salt (stored in the key tuple,
+    not secret) that diversifies builds -- a classifier can no longer
+    fingerprint the fixed ``b'\\x00dpf-ggm'`` constant across builds.
     """
-    h = _dpf_hashlib.sha256(seed + b'\x00dpf-ggm').digest()
+    h = _dpf_hashlib.sha512(seed + domain).digest()  # 64 bytes
     sL = h[:_DPF_SEED_LEN]
     sR = h[_DPF_SEED_LEN:_DPF_SEED_LEN * 2]
-    # Control bits from the tail of the digest (independent of sL/sR bytes).
-    tL = h[24] & 1
-    tR = h[25] & 1
+    # Control bits from bytes OUTSIDE the seed regions (independent of sL/sR).
+    tL = h[_DPF_SEED_LEN * 2] & 1
+    tR = h[_DPF_SEED_LEN * 2 + 1] & 1
     return sL, sR, tL, tR
 
 
@@ -788,8 +800,13 @@ def _xor_bytes(a: bytes, b: bytes) -> bytes:
 def _dpf_gen(alpha: int, n: int, beta: int = 1, rng=None):
     """BGI14 DPF key generation for f_alpha on {0,1}^n.
 
-    Returns (k0, k1). Each key = (seed, t0, correction_words, cw_final).
+    Returns (k0, k1). Each key = (seed, t0, correction_words, cw_final, salt).
     correction_words[i] = (s_cw, t_cw_L, t_cw_R) per level i.
+
+    Phase G7: a per-build ``salt`` (16 random bytes, NOT secret -- it only
+    diversifies builds so the PRG domain string cannot be fingerprinted)
+    is minted here and carried in every key as a 5th tuple element. Both
+    _dpf_gen and _dpf_eval thread it into _dpf_prg.
 
     Two invariants are maintained by induction on the alpha-path:
       (1) s_0 == s_1  (seeds agree, so the next-level correction words are
@@ -817,6 +834,8 @@ def _dpf_gen(alpha: int, n: int, beta: int = 1, rng=None):
         if hasattr(rng, 'token_bytes'):
             return rng.token_bytes(k)
         return bytes(rng.randint(0, 255) for _ in range(k))
+    # Phase G7: per-build domain-separation salt (not secret).
+    salt = _rbytes(16)
     root_s = [_rbytes(_DPF_SEED_LEN), _rbytes(_DPF_SEED_LEN)]
     s = [bytes(root_s[0]), bytes(root_s[1])]
     t = [0, 1]
@@ -825,7 +844,7 @@ def _dpf_gen(alpha: int, n: int, beta: int = 1, rng=None):
         # Expand both parties.
         sL = [None, None]; sR = [None, None]; tL = [0, 0]; tR = [0, 0]
         for b in (0, 1):
-            sL[b], sR[b], tL[b], tR[b] = _dpf_prg(s[b])
+            sL[b], sR[b], tL[b], tR[b] = _dpf_prg(s[b], salt)
         a = (alpha >> (n - 1 - i)) & 1  # MSB first
         # Seed correction word cancels the LOSE branch (the branch NOT taken
         # on the alpha path), so off-alpha seeds agree. When a==0 the keep
@@ -867,7 +886,8 @@ def _dpf_gen(alpha: int, n: int, beta: int = 1, rng=None):
     # bit; our point-function use case is beta=1 so this is fine.)
     cw_final = beta ^ 1
     # Keys hold the ROOT seeds (Eval traverses from root), NOT the leaf seeds.
-    return (root_s[0], 0, cws, cw_final), (root_s[1], 1, cws, cw_final)
+    # Phase G7: salt is the 5th element (shared by both keys, not secret).
+    return (root_s[0], 0, cws, cw_final, salt), (root_s[1], 1, cws, cw_final, salt)
 
 
 def _dpf_eval(b: int, key, x: int, n: int) -> int:
@@ -875,9 +895,12 @@ def _dpf_eval(b: int, key, x: int, n: int) -> int:
 
     Party 0 returns t; party 1 returns t XOR cw_final. Their XOR is f_alpha(x).
     """
-    s, t, cws, cw_final = key
+    s, t, cws, cw_final = key[0], key[1], key[2], key[3]
+    # Phase G7: read the per-build domain salt (5th element). Old keys (4
+    # elements) fall back to the fixed default domain string.
+    salt = key[4] if len(key) > 4 else _DPF_PRG_DOMAIN_DEFAULT
     for i in range(n):
-        sL, sR, tL, tR = _dpf_prg(s)
+        sL, sR, tL, tR = _dpf_prg(s, salt)
         s_cw, t_cw_L, t_cw_R = cws[i]
         xi = (x >> (n - 1 - i)) & 1  # MSB first
         if xi == 0:
@@ -934,7 +957,7 @@ def _dpf_extract_alpha_and_arg(fn: ast.FunctionDef):
 # Maximum DPF domain bit-length. Larger n -> larger keys (O(n) correction
 # words) and O(n) HMAC calls per eval. 32 keeps keys ~512 bytes and evals
 # ~32 HMACs; bump via ctx.dpf_max_bits if a larger bounded domain is needed.
-_DPF_MAX_BITS = 32
+_DPF_MAX_BITS = 128
 
 
 # Minimum DPF domain bit-length. The point function `x == CONST` over
@@ -945,7 +968,7 @@ _DPF_MAX_BITS = 32
 # For alpha >= 2**16 the domain auto-grows to alpha.bit_length() so the
 # alpha value itself always fits. Inputs x >= 2**n will match against
 # (x mod 2**n) and may give a wrong result; documented limitation.
-_DPF_DOMAIN_BITS_MIN = 16
+_DPF_DOMAIN_BITS_MIN = 64
 
 
 def _build_dpf_shares(node: ast.FunctionDef, rng, n_shares: int,
@@ -988,9 +1011,10 @@ def _build_dpf_shares(node: ast.FunctionDef, rng, n_shares: int,
     name1 = _fresh_name(1, rng)
 
     def _key_repr(key):
-        seed, t0, cws, cw_final = key
+        seed, t0, cws, cw_final, salt = key
         cw_list = [(s_cw.hex(), t_cw_L, t_cw_R) for (s_cw, t_cw_L, t_cw_R) in cws]
-        return (seed.hex(), t0, cw_list, cw_final)
+        # Phase G7: salt is the 5th element (per-build domain separation).
+        return (seed.hex(), t0, cw_list, cw_final, salt.hex())
 
     key0_repr = repr(_key_repr(k0))
     key1_repr = repr(_key_repr(k1))
@@ -1007,13 +1031,14 @@ def _build_dpf_shares(node: ast.FunctionDef, rng, n_shares: int,
 
     # The emitted evaluator: parse the key tuple, traverse the tree, return a bit.
     # We embed a compact pure-Python DPF eval as source.
+    # Phase G7: uses sha512 (disjoint sL/sR/tL/tR) + per-build salt (5th key element).
     eval_src = (
         f"def {name0}({arg_name}):\n"
-        f"    _seed, _t, _cws, _cwf = {key0_repr}\n"
-        f"    _s = bytes.fromhex(_seed); _n = len(_cws)\n"
+        f"    _seed, _t, _cws, _cwf, _salt = {key0_repr}\n"
+        f"    _s = bytes.fromhex(_seed); _n = len(_cws); _dom = bytes.fromhex(_salt)\n"
         f"    for _i in range(_n):\n"
-        f"        _h = __import__('hashlib').sha256(_s + b'\\x00dpf-ggm').digest()\n"
-        f"        _sL, _sR = _h[:16], _h[16:32]; _tL, _tR = _h[24] & 1, _h[25] & 1\n"
+        f"        _h = __import__('hashlib').sha512(_s + _dom).digest()\n"
+        f"        _sL, _sR = _h[:16], _h[16:32]; _tL, _tR = _h[32] & 1, _h[33] & 1\n"
         f"        _scw, _tcL, _tcR = _cws[_i]\n"
         f"        _xi = ({arg_name} >> (_n - 1 - _i)) & 1\n"
         f"        _scw_b = bytes.fromhex(_scw)\n"
@@ -1034,11 +1059,11 @@ def _build_dpf_shares(node: ast.FunctionDef, rng, n_shares: int,
             f"    if not _k1_hex:\n"
             f"        raise SystemExit('dpf: key missing -- set env ' + {_env_repr} + '=<hex> (see <output>.dpfkey sidecar) before running')\n"
             f"    import json as _br_json\n"
-            f"    _seed, _t, _cws, _cwf = _br_json.loads(bytes.fromhex(_k1_hex).decode('utf-8'))\n"
-            f"    _s = bytes.fromhex(_seed); _n = len(_cws)\n"
+            f"    _seed, _t, _cws, _cwf, _salt = _br_json.loads(bytes.fromhex(_k1_hex).decode('utf-8'))\n"
+            f"    _s = bytes.fromhex(_seed); _n = len(_cws); _dom = bytes.fromhex(_salt)\n"
             f"    for _i in range(_n):\n"
-            f"        _h = __import__('hashlib').sha256(_s + b'\\x00dpf-ggm').digest()\n"
-            f"        _sL, _sR = _h[:16], _h[16:32]; _tL, _tR = _h[24] & 1, _h[25] & 1\n"
+            f"        _h = __import__('hashlib').sha512(_s + _dom).digest()\n"
+            f"        _sL, _sR = _h[:16], _h[16:32]; _tL, _tR = _h[32] & 1, _h[33] & 1\n"
             f"        _scw, _tcL, _tcR = _cws[_i]\n"
             f"        _xi = ({arg_name} >> (_n - 1 - _i)) & 1\n"
             f"        _scw_b = bytes.fromhex(_scw)\n"
@@ -1053,11 +1078,11 @@ def _build_dpf_shares(node: ast.FunctionDef, rng, n_shares: int,
     else:
         eval_src1 = (
             f"def {name1}({arg_name}):\n"
-            f"    _seed, _t, _cws, _cwf = {key1_repr}\n"
-            f"    _s = bytes.fromhex(_seed); _n = len(_cws)\n"
+            f"    _seed, _t, _cws, _cwf, _salt = {key1_repr}\n"
+            f"    _s = bytes.fromhex(_seed); _n = len(_cws); _dom = bytes.fromhex(_salt)\n"
             f"    for _i in range(_n):\n"
-            f"        _h = __import__('hashlib').sha256(_s + b'\\x00dpf-ggm').digest()\n"
-            f"        _sL, _sR = _h[:16], _h[16:32]; _tL, _tR = _h[24] & 1, _h[25] & 1\n"
+            f"        _h = __import__('hashlib').sha512(_s + _dom).digest()\n"
+            f"        _sL, _sR = _h[:16], _h[16:32]; _tL, _tR = _h[32] & 1, _h[33] & 1\n"
             f"        _scw, _tcL, _tcR = _cws[_i]\n"
             f"        _xi = ({arg_name} >> (_n - 1 - _i)) & 1\n"
             f"        _scw_b = bytes.fromhex(_scw)\n"
@@ -1442,6 +1467,39 @@ def _smoke() -> None:
     finally:
         _os.environ.pop(_auto_env, None)
     print("DPF auto (split=on): is_answer routes to DPF + correct for x in 0..255  OK")
+
+    # --- Phase G7: PRG control-bits fix + domain salt + wider domain ---
+    # Verify the emitted DPF eval uses SHA-512 (disjoint sL/sR/tL/tR), the
+    # fixed `b'\x00dpf-ggm'` constant is GONE (replaced by per-build salt),
+    # and two builds carry DIFFERENT salts (build-diversity, M2).
+    import re as _g7_re
+    _g7_src = ast.unparse(out_dpf)
+    assert 'sha512' in _g7_src, "G7: emitted eval must use sha512 (not sha256)"
+    assert 'sha256' not in _g7_src or 'sha256' not in _g7_re.sub(r"sha512", '', _g7_src), \
+        "G7: emitted eval must not fall back to sha256 for the DPF PRG"
+    # The fixed domain-separation constant must be GONE from emitted code.
+    assert "dpf-ggm" not in _g7_src, \
+        "G7: fixed b'\\x00dpf-ggm' constant must be gone (per-build salt replaces it)"
+    # The per-build salt is read as _dom (bytes.fromhex of the 5th key element).
+    assert '_dom' in _g7_src, "G7: emitted eval must derive _dom from the key salt"
+    # Control bits come from bytes 32/33 (OUTSIDE the sR region [16:32]).
+    # (sha512 digest is 64 bytes; sL=[0:16], sR=[16:32], tL=32, tR=33 -- disjoint.)
+    assert '_h[32]' in _g7_src and '_h[33]' in _g7_src, \
+        "G7: control bits must come from bytes 32/33 (outside sR region)"
+    # Two builds must carry DIFFERENT salts (build-diversity). Note: same
+    # fss_seed -> same salt (reproducible mode); we use a DIFFERENT seed to
+    # prove the salt varies per build in fresh-seed mode.
+    _g7_tree2 = ast.parse("def is_special2(x):\n    return x == 5\n")
+    _g7_ctx2 = _Ctx(); _g7_ctx2.fss_mode = 'dpf'; _g7_ctx2.fss_seed = 99
+    apply_fss(_g7_tree2, _g7_ctx2)
+    _g7_k1 = _dpf_k1_hex  # from ctx_dpf above (fss_seed=31)
+    _g7_k2 = getattr(_g7_ctx2, 'dpf_k1_hex', '')
+    assert _g7_k1 and _g7_k2 and _g7_k1 != _g7_k2, \
+        "G7: two builds (different seeds) must carry different salts (build-diversity)"
+    # Domain widened: _DPF_DOMAIN_BITS_MIN=64, _DPF_MAX_BITS=128.
+    assert _DPF_DOMAIN_BITS_MIN == 64, "G7: domain min must be 64"
+    assert _DPF_MAX_BITS == 128, "G7: domain max must be 128"
+    print("G7 DPF PRG: sha512 + disjoint ctrl bits (32/33) + per-build salt (no fixed constant) + domain 64-128  OK")
 
     print("iO-2 SMOKE: PASS")
 

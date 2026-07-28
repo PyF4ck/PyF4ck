@@ -114,15 +114,16 @@ __all__ = [
 
 
 # DPF point-function bit-width. The DPF encodes the point function on
-# Z_{2^n}. We hash the bytes alpha down to an n-bit int, so 16 bits gives
-# a 65536-point domain (small enough that the DPF key stays compact at
-# ~16 correction words, and the per-eval cost is ~16 HMAC-SHA256 calls).
+# Z_{2^n}. We hash the bytes alpha down to an n-bit int, so 64 bits gives
+# a 2^64-point domain. Phase G7 widens 16 -> 64: with the G5 split-key
+# default, brute-forcing alpha needs 2^64 work (infeasible). Keys are ~64
+# correction words ~1KB per key; per-eval cost is ~64 SHA-512 calls.
 # Collisions in the hash-to-int step are astronomically unlikely for
 # distinct alphas under SHA-256, but if two distinct alphas collided the
 # point function would treat them as the same point (acceptable: the
 # obfuscated evaluator would return True for both, which is a minor
 # correctness relaxation, not a security issue).
-_DPF_POINT_BITS = 16
+_DPF_POINT_BITS = 64
 
 
 # --- Helpers ----------------------------------------------------------------
@@ -293,9 +294,10 @@ def build_point_func_ast_dpf(name: str, obf_params: dict,
     k1 = obf_params['k1']
 
     def _key_repr(key):
-        seed, t0, cws, cw_final = key
+        seed, t0, cws, cw_final, salt = key
         cw_list = [(s_cw.hex(), t_cw_L, t_cw_R) for (s_cw, t_cw_L, t_cw_R) in cws]
-        return (seed.hex(), t0, cw_list, cw_final)
+        # Phase G7: salt is the 5th element (per-build domain separation).
+        return (seed.hex(), t0, cw_list, cw_final, salt.hex())
 
     k0_repr = repr(_key_repr(k0))
     salt_repr = repr(salt)
@@ -343,12 +345,12 @@ def build_point_func_ast_dpf(name: str, obf_params: dict,
         f"    _br_pf_hh.update(_br_pf_val)\n"
         f"    _br_pf_x = int.from_bytes(_br_pf_hh.digest()[:(_br_pf_n + 7) // 8], 'big') & ((1 << _br_pf_n) - 1)\n"
         f"    def _br_dpf_eval(_b, _key, _x, _n):\n"
-        f"        _seed, _t, _cws, _cwf = _key\n"
-        f"        _s = bytes.fromhex(_seed)\n"
+        f"        _seed, _t, _cws, _cwf, _salt = _key\n"
+        f"        _s = bytes.fromhex(_seed); _dom = bytes.fromhex(_salt)\n"
         f"        for _i in range(_n):\n"
-        f"            _h = _br_pf_h.sha256(_s + b'\\x00dpf-ggm').digest()\n"
+        f"            _h = _br_pf_h.sha512(_s + _dom).digest()\n"
         f"            _sL, _sR = _h[:16], _h[16:32]\n"
-        f"            _tL, _tR = _h[24] & 1, _h[25] & 1\n"
+        f"            _tL, _tR = _h[32] & 1, _h[33] & 1\n"
         f"            _scw, _tcL, _tcR = _cws[_i]\n"
         f"            _scw_b = bytes.fromhex(_scw)\n"
         f"            _xi = (_x >> (_n - 1 - _i)) & 1\n"
@@ -800,20 +802,32 @@ def _smoke() -> None:
     # --- DPF 1-key hiding: a single key's Eval is NOT the point function ---
     # This is the security gain over the hash mode: an adversary holding
     # ONLY k0 (not k1) sees pseudorandom bits, not a spike at alpha.
+    # Phase G7: the 64-bit domain is too large to enumerate (2^64), so we
+    # sample a subset of points and verify the single-key share is NOT the
+    # point function (no spike at alpha_int) and looks pseudorandom (~half 1s).
     from _fss import _dpf_eval
+    import random as _hiding_rng
     n_dpf = obf_dpf['n']
     k0 = obf_dpf['k0']
-    s0_seq = [_dpf_eval(0, k0, x, n_dpf) for x in range(1 << n_dpf)]
-    # The single-key sequence should NOT equal the point function (which
-    # would be a single 1 at alpha_int and 0s elsewhere).
     alpha_int = obf_dpf['alpha_int']
-    f_seq = [1 if x == alpha_int else 0 for x in range(1 << n_dpf)]
+    _domain = 1 << n_dpf
+    _sample_sz = 4096
+    _sample_rng = _hiding_rng.Random(12345)  # deterministic for reproducibility
+    # Sample: alpha_int itself + random points (to check alpha isn't a spike).
+    _sample_pts = {alpha_int}
+    while len(_sample_pts) < _sample_sz:
+        _sample_pts.add(_sample_rng.randrange(_domain))
+    _sample_pts = sorted(_sample_pts)
+    s0_seq = [_dpf_eval(0, k0, x, n_dpf) for x in _sample_pts]
+    # The single-key sequence should NOT equal the point function on the
+    # sample (a spike at alpha_int would be 1 at alpha, 0 elsewhere).
+    f_seq = [1 if x == alpha_int else 0 for x in _sample_pts]
     assert s0_seq != f_seq, "single key alone must NOT equal the point function"
-    # And the number of 1s in the single-key sequence should be ~half
-    # (pseudorandom), not a single spike (which would leak alpha).
+    # The number of 1s in the sample should be ~half (pseudorandom), not a
+    # single spike (which would leak alpha).
     n_ones = sum(s0_seq)
     assert n_ones > 1, f"single-key has {n_ones} ones -- looks like a spike (alpha leak?)"
-    print(f"iO-4 DPF 1-key hiding: single share != f_alpha ({n_ones} ones, not a spike)  OK")
+    print(f"iO-4 DPF 1-key hiding: single share != f_alpha on {_sample_sz} sample pts ({n_ones} ones, not a spike)  OK")
 
     # --- DPF apply_pointfunc_obf with mode='dpf' decorator ---
     tree_dpf_apply = ast.parse("def is_valid_dpf(key):\n    return key == b'real_key'\n")
