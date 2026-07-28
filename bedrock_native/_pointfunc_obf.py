@@ -114,15 +114,16 @@ __all__ = [
 
 
 # DPF point-function bit-width. The DPF encodes the point function on
-# Z_{2^n}. We hash the bytes alpha down to an n-bit int, so 16 bits gives
-# a 65536-point domain (small enough that the DPF key stays compact at
-# ~16 correction words, and the per-eval cost is ~16 HMAC-SHA256 calls).
+# Z_{2^n}. We hash the bytes alpha down to an n-bit int, so 64 bits gives
+# a 2^64-point domain. Phase G7 widens 16 -> 64: with the G5 split-key
+# default, brute-forcing alpha needs 2^64 work (infeasible). Keys are ~64
+# correction words ~1KB per key; per-eval cost is ~64 SHA-512 calls.
 # Collisions in the hash-to-int step are astronomically unlikely for
 # distinct alphas under SHA-256, but if two distinct alphas collided the
 # point function would treat them as the same point (acceptable: the
 # obfuscated evaluator would return True for both, which is a minor
 # correctness relaxation, not a security issue).
-_DPF_POINT_BITS = 16
+_DPF_POINT_BITS = 64
 
 
 # --- Helpers ----------------------------------------------------------------
@@ -265,17 +266,27 @@ def obfuscate_point_function_dpf(alpha: bytes, *, salt: bytes = None,
 
 
 def build_point_func_ast_dpf(name: str, obf_params: dict,
-                              arg_name: str = 'x') -> ast.FunctionDef:
+                              arg_name: str = 'x',
+                              dpf_key_split: bool = True,
+                              dpf_key_env: str = 'BR_DPF_K1',
+                              ctx=None) -> ast.FunctionDef:
     """Build an AST function def for the DPF-based point-function evaluator.
 
     The generated function hashes the runtime input down to an n-bit int
     (same hash as obfuscate_point_function_dpf), evaluates both DPF shares,
-    and XORs them to recover the point-function bit. The salt and both DPF
-    keys are shipped as bytes literals in the function body.
+    and XORs them to recover the point-function bit. The salt and party 0's
+    DPF key (k0) are shipped as bytes literals in the function body.
 
-    Both keys ship in the SAME file (obfuscation-by-indirection, not
-    cryptographic hiding). For real hiding, ship only ONE key and require
-    the other via env / release server (Phase A key separation).
+    Phase G5: when ``dpf_key_split`` is True (default, secure), party 1's key
+    (k1) is NOT shipped. The function reads it at runtime from the
+    environment variable ``dpf_key_env`` (default ``BR_DPF_K1``) as a
+    hex-encoded JSON key tuple, raising a clean SystemExit if missing. The
+    build path exposes the serialized k1 hex on ``ctx.dpf_k1_hex`` +
+    ``ctx.dpf_key_env_name`` so a ``.dpfkey`` sidecar can be emitted
+    (mirrors the binary capsule's ctx.capsule_key).
+
+    When ``dpf_key_split`` is False (legacy backward-compat), both keys ship
+    in the SAME file (obfuscation-by-indirection, not cryptographic hiding).
     """
     salt = obf_params['salt']
     n = obf_params['n']
@@ -283,36 +294,63 @@ def build_point_func_ast_dpf(name: str, obf_params: dict,
     k1 = obf_params['k1']
 
     def _key_repr(key):
-        seed, t0, cws, cw_final = key
+        seed, t0, cws, cw_final, salt = key
         cw_list = [(s_cw.hex(), t_cw_L, t_cw_R) for (s_cw, t_cw_L, t_cw_R) in cws]
-        return (seed.hex(), t0, cw_list, cw_final)
+        # Phase G7: salt is the 5th element (per-build domain separation).
+        return (seed.hex(), t0, cw_list, cw_final, salt.hex())
 
     k0_repr = repr(_key_repr(k0))
-    k1_repr = repr(_key_repr(k1))
     salt_repr = repr(salt)
+
+    # Phase G5: serialize k1 for the env-var/sidecar path (hex of JSON).
+    try:
+        import json as _dpf_json
+        _k1_serialized = _dpf_json.dumps(_key_repr(k1)).encode('utf-8').hex()
+    except Exception:
+        _k1_serialized = repr(_key_repr(k1)).encode('utf-8').hex()
+    if ctx is not None and dpf_key_split:
+        try:
+            ctx.dpf_k1_hex = _k1_serialized
+            ctx.dpf_key_env_name = dpf_key_env
+        except Exception:
+            pass
 
     # Build the function body from a source template for clarity. The DPF
     # eval helper is emitted inline so the obfuscated function is self-
     # contained (no external _br_dpf_eval dependency).
+    if dpf_key_split:
+        _env_repr = repr(dpf_key_env)
+        _k1_load = (
+            f"    import os as _br_pf_os\n"
+            f"    _br_pf_k1_hex = _br_pf_os.environ.get({_env_repr})\n"
+            f"    if not _br_pf_k1_hex:\n"
+            f"        raise SystemExit('dpf: key missing -- set env ' + {_env_repr} + '=<hex> (see <output>.dpfkey sidecar) before running')\n"
+            f"    import json as _br_pf_json\n"
+            f"    _br_pf_k1 = _br_pf_json.loads(bytes.fromhex(_br_pf_k1_hex).decode('utf-8'))\n"
+        )
+    else:
+        _k1_repr = repr(_key_repr(k1))
+        _k1_load = f"    _br_pf_k1 = {_k1_repr}\n"
+
     fn_src = (
         f"def {name}({arg_name}):\n"
         f"    import hashlib as _br_pf_h\n"
         f"    _br_pf_salt = {salt_repr}\n"
         f"    _br_pf_n = {n}\n"
         f"    _br_pf_k0 = {k0_repr}\n"
-        f"    _br_pf_k1 = {k1_repr}\n"
+        + _k1_load +
         f"    _br_pf_val = {arg_name} if isinstance({arg_name}, bytes) else str({arg_name}).encode('utf-8')\n"
         f"    _br_pf_hh = _br_pf_h.sha256()\n"
         f"    _br_pf_hh.update(_br_pf_salt)\n"
         f"    _br_pf_hh.update(_br_pf_val)\n"
         f"    _br_pf_x = int.from_bytes(_br_pf_hh.digest()[:(_br_pf_n + 7) // 8], 'big') & ((1 << _br_pf_n) - 1)\n"
         f"    def _br_dpf_eval(_b, _key, _x, _n):\n"
-        f"        _seed, _t, _cws, _cwf = _key\n"
-        f"        _s = bytes.fromhex(_seed)\n"
+        f"        _seed, _t, _cws, _cwf, _salt = _key\n"
+        f"        _s = bytes.fromhex(_seed); _dom = bytes.fromhex(_salt)\n"
         f"        for _i in range(_n):\n"
-        f"            _h = _br_pf_h.sha256(_s + b'\\x00dpf-ggm').digest()\n"
+        f"            _h = _br_pf_h.sha512(_s + _dom).digest()\n"
         f"            _sL, _sR = _h[:16], _h[16:32]\n"
-        f"            _tL, _tR = _h[24] & 1, _h[25] & 1\n"
+        f"            _tL, _tR = _h[32] & 1, _h[33] & 1\n"
         f"            _scw, _tcL, _tcR = _cws[_i]\n"
         f"            _scw_b = bytes.fromhex(_scw)\n"
         f"            _xi = (_x >> (_n - 1 - _i)) & 1\n"
@@ -566,9 +604,15 @@ def apply_pointfunc_obf(tree: ast.Module, ctx) -> ast.Module:
             salt = secrets.token_bytes(32)
             obf_params = obfuscate_point_function_dpf(
                 alpha, salt=salt, n=_DPF_POINT_BITS, rng=dpf_rng)
+            # Phase G5: split k1 to env by default (secure posture). The
+            # operator sets BR_DPF_K1 (see <output>.dpfkey sidecar) before
+            # running. dpf_key_split=False embeds both keys (legacy path).
+            _dpf_split = bool(getattr(ctx, 'dpf_key_split', True))
+            _dpf_env = str(getattr(ctx, 'dpf_key_env', 'BR_DPF_K1') or 'BR_DPF_K1')
             new_fn = build_point_func_ast_dpf(
                 node.name, obf_params,
-                arg_name=node.args.args[0].arg if node.args.args else 'x')
+                arg_name=node.args.args[0].arg if node.args.args else 'x',
+                dpf_key_split=_dpf_split, dpf_key_env=_dpf_env, ctx=ctx)
         else:  # 'hash' (default)
             salt = secrets.token_bytes(32)
             delta = rng.randint(0, (1 << 16) - 1)
@@ -702,45 +746,88 @@ def _smoke() -> None:
     # over a sample of inputs (NOT the full 2**16 domain -- too slow at
     # build time; correctness of the underlying DPF is verified exhaustively
     # in _fss._smoke).
+    import os as _os
     alpha_dpf = b'secret_dpf_key'
     obf_dpf = obfuscate_point_function_dpf(alpha_dpf)
-    fn_dpf_ast = build_point_func_ast_dpf('check_dpf', obf_dpf)
+
+    # G5 split=on (default, secure): k1 read from env, refuse if missing.
+    ctx_split = _Ctx()
+    fn_dpf_ast = build_point_func_ast_dpf('check_dpf', obf_dpf, ctx=ctx_split)
+    _dpf_env = getattr(ctx_split, 'dpf_key_env_name', 'BR_DPF_K1')
+    _dpf_k1_hex = getattr(ctx_split, 'dpf_k1_hex', '')
+    assert _dpf_k1_hex, "G5: build_point_func_ast_dpf must expose k1 hex on ctx"
     mod_dpf = ast.Module(body=[fn_dpf_ast], type_ignores=[])
     ast.fix_missing_locations(mod_dpf)
-    ns_dpf = {}
-    exec(compile(mod_dpf, '<dpf>', 'exec'), ns_dpf)
-    check_dpf = ns_dpf['check_dpf']
-    assert check_dpf(b'secret_dpf_key') is True, "check_dpf(secret) should be True"
-    assert check_dpf('secret_dpf_key') is True, "check_dpf accepts str too"
-    # Wrong inputs return False.
-    assert check_dpf(b'wrong') is False
-    assert check_dpf(b'secret_dpf_ke') is False  # prefix
-    assert check_dpf(b'secret_dpf_keyy') is False  # suffix
-    assert check_dpf(123) is False
-    assert check_dpf('') is False
-    # Sample more inputs (verify the DPF bit-sum is 0 off-alpha).
-    for probe in [b'x', b'foo', b'bar', b'baz', b'qux', bytes([0, 1, 2]),
-                  b'zzz', b'aaa', bytes([0xff]) * 16, b'another_key']:
-        assert check_dpf(probe) is False, f"check_dpf({probe!r}) should be False"
-    print("iO-4 DPF correctness: O_dpf(secret)=True, 10 wrong inputs=False  OK")
+    # Refuse-run: env unset -> clean SystemExit (no alpha leak).
+    _os.environ.pop(_dpf_env, None)
+    ns_refuse = {}
+    exec(compile(mod_dpf, '<dpf>', 'exec'), ns_refuse)
+    try:
+        ns_refuse['check_dpf'](b'secret_dpf_key')
+        raise AssertionError("G5: missing env must refuse (SystemExit)")
+    except SystemExit as _e:
+        assert 'key missing' in str(_e), f"refuse msg: {_e}"
+    # Correctness with env set from the sidecar-equivalent hex.
+    _os.environ[_dpf_env] = _dpf_k1_hex
+    try:
+        ns_dpf = {}
+        exec(compile(mod_dpf, '<dpf>', 'exec'), ns_dpf)
+        check_dpf = ns_dpf['check_dpf']
+        assert check_dpf(b'secret_dpf_key') is True, "check_dpf(secret) should be True"
+        assert check_dpf('secret_dpf_key') is True, "check_dpf accepts str too"
+        assert check_dpf(b'wrong') is False
+        assert check_dpf(b'secret_dpf_ke') is False  # prefix
+        assert check_dpf(b'secret_dpf_keyy') is False  # suffix
+        assert check_dpf(123) is False
+        assert check_dpf('') is False
+        for probe in [b'x', b'foo', b'bar', b'baz', b'qux', bytes([0, 1, 2]),
+                      b'zzz', b'aaa', bytes([0xff]) * 16, b'another_key']:
+            assert check_dpf(probe) is False, f"check_dpf({probe!r}) should be False"
+    finally:
+        _os.environ.pop(_dpf_env, None)
+    print("iO-4 DPF correctness (split=on): O_dpf(secret)=True, 10 wrong=False; refuses w/o env  OK")
+
+    # G5 split=off (legacy): both keys embedded, no env required.
+    fn_nosplit = build_point_func_ast_dpf('check_dpf_legacy', obf_dpf,
+                                           dpf_key_split=False)
+    mod_nosplit = ast.Module(body=[fn_nosplit], type_ignores=[])
+    ast.fix_missing_locations(mod_nosplit)
+    ns_nosplit = {}
+    exec(compile(mod_nosplit, '<dpf_legacy>', 'exec'), ns_nosplit)
+    cl = ns_nosplit['check_dpf_legacy']
+    assert cl(b'secret_dpf_key') is True
+    assert cl(b'wrong') is False
+    print("iO-4 DPF correctness (split=off): both keys embedded, no env needed  OK")
 
     # --- DPF 1-key hiding: a single key's Eval is NOT the point function ---
     # This is the security gain over the hash mode: an adversary holding
     # ONLY k0 (not k1) sees pseudorandom bits, not a spike at alpha.
+    # Phase G7: the 64-bit domain is too large to enumerate (2^64), so we
+    # sample a subset of points and verify the single-key share is NOT the
+    # point function (no spike at alpha_int) and looks pseudorandom (~half 1s).
     from _fss import _dpf_eval
+    import random as _hiding_rng
     n_dpf = obf_dpf['n']
     k0 = obf_dpf['k0']
-    s0_seq = [_dpf_eval(0, k0, x, n_dpf) for x in range(1 << n_dpf)]
-    # The single-key sequence should NOT equal the point function (which
-    # would be a single 1 at alpha_int and 0s elsewhere).
     alpha_int = obf_dpf['alpha_int']
-    f_seq = [1 if x == alpha_int else 0 for x in range(1 << n_dpf)]
+    _domain = 1 << n_dpf
+    _sample_sz = 4096
+    _sample_rng = _hiding_rng.Random(12345)  # deterministic for reproducibility
+    # Sample: alpha_int itself + random points (to check alpha isn't a spike).
+    _sample_pts = {alpha_int}
+    while len(_sample_pts) < _sample_sz:
+        _sample_pts.add(_sample_rng.randrange(_domain))
+    _sample_pts = sorted(_sample_pts)
+    s0_seq = [_dpf_eval(0, k0, x, n_dpf) for x in _sample_pts]
+    # The single-key sequence should NOT equal the point function on the
+    # sample (a spike at alpha_int would be 1 at alpha, 0 elsewhere).
+    f_seq = [1 if x == alpha_int else 0 for x in _sample_pts]
     assert s0_seq != f_seq, "single key alone must NOT equal the point function"
-    # And the number of 1s in the single-key sequence should be ~half
-    # (pseudorandom), not a single spike (which would leak alpha).
+    # The number of 1s in the sample should be ~half (pseudorandom), not a
+    # single spike (which would leak alpha).
     n_ones = sum(s0_seq)
     assert n_ones > 1, f"single-key has {n_ones} ones -- looks like a spike (alpha leak?)"
-    print(f"iO-4 DPF 1-key hiding: single share != f_alpha ({n_ones} ones, not a spike)  OK")
+    print(f"iO-4 DPF 1-key hiding: single share != f_alpha on {_sample_sz} sample pts ({n_ones} ones, not a spike)  OK")
 
     # --- DPF apply_pointfunc_obf with mode='dpf' decorator ---
     tree_dpf_apply = ast.parse("def is_valid_dpf(key):\n    return key == b'real_key'\n")
@@ -761,14 +848,24 @@ def _smoke() -> None:
     assert 'bedrock_pointfunc' not in src_dpf_after, "decorator should be stripped"
     # Verify the DPF evaluator was emitted (look for DPF eval helper).
     assert '_br_dpf_eval' in src_dpf_after, "DPF mode should emit _br_dpf_eval helper"
-    # Functional test.
-    ns_dpf_apply = {}
-    exec(compile(ast.Module(body=out_dpf_apply.body, type_ignores=[]), '<dpf2>', 'exec'), ns_dpf_apply)
-    iv_dpf = ns_dpf_apply['is_valid_dpf']
-    assert iv_dpf(b'real_key') is True, "DPF is_valid(real_key) should be True"
-    assert iv_dpf(b'fake') is False
-    assert iv_dpf('real_key') is True  # str coercion
-    print("iO-4 DPF apply: mode='dpf' decorator detected, body replaced, functional  OK")
+    # G5: apply_pointfunc_obf with split default-on must read k1 from env.
+    assert '_br_pf_os.environ' in src_dpf_after or 'os.environ' in src_dpf_after, \
+        "G5: DPF apply must read k1 from env"
+    _apply_env = getattr(ctx, 'dpf_key_env_name', 'BR_DPF_K1')
+    _apply_k1 = getattr(ctx, 'dpf_k1_hex', '')
+    assert _apply_k1, "G5: apply_pointfunc_obf must expose k1 hex on ctx"
+    # Functional test with env set from the sidecar-equivalent hex.
+    _os.environ[_apply_env] = _apply_k1
+    try:
+        ns_dpf_apply = {}
+        exec(compile(ast.Module(body=out_dpf_apply.body, type_ignores=[]), '<dpf2>', 'exec'), ns_dpf_apply)
+        iv_dpf = ns_dpf_apply['is_valid_dpf']
+        assert iv_dpf(b'real_key') is True, "DPF is_valid(real_key) should be True"
+        assert iv_dpf(b'fake') is False
+        assert iv_dpf('real_key') is True  # str coercion
+    finally:
+        _os.environ.pop(_apply_env, None)
+    print("iO-4 DPF apply: mode='dpf' decorator, split=on (env k1), functional  OK")
 
     # --- DPF diversity: same alpha, different salt -> different keys ---
     obf_d1 = obfuscate_point_function_dpf(alpha_dpf, salt=b'A' * 32)

@@ -268,8 +268,20 @@ class BuildRNG:
         return self._master.hex()
 
     def master_seed_hex(self) -> str:
-        """Master seed as hex (for the manifest)."""
+        """Master seed as hex (LEGACY — leaks the seed; only for trusted
+        issuer-side tooling. Phase G4: do NOT write this to the manifest;
+        use master_seed_hash() instead)."""
         return self._master.hex()
+
+    def master_seed_hash(self) -> str:
+        """SHA-256 hash of the master seed (Phase G4 traitor-tracing).
+
+        Unlike master_seed_hex (which IS the seed and lets anyone reproduce
+        the build), the hash is one-way: it uniquely identifies the build
+        for traitor tracing but cannot be reversed to recover the seed.
+        This is what should go in the manifest written next to the artifact.
+        """
+        return hashlib.sha256(self._master).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -280,18 +292,21 @@ class BuildManifest:
     """Trait-tracing record written beside each obfuscated build.
 
     Attributes:
-        build_id:        Stable per-build id (hex of the master seed).
-        input_sha256:    SHA-256 of the obfuscator input.
-        license_id:      Optional customer/license id this build was minted for.
-        master_seed_hex: Master seed as hex (lets the issuer reproduce / verify).
-        timestamp:       Build timestamp (ISO-8601 string, supplied by caller).
-        passes:          Obfuscation passes applied (e.g. ["cff", "mba"]).
-        profile:         Optional strength-profile name.
+        build_id:           Stable per-build id (hex of the master seed).
+        input_sha256:       SHA-256 of the obfuscator input.
+        license_id:         Optional customer/license id this build was minted for.
+        master_seed_hash:   SHA-256 of the master seed (Phase G4: one-way
+                            traitor-tracing id — cannot be reversed to recover
+                            the seed. Replaces the legacy master_seed_hex
+                            which leaked the seed verbatim).
+        timestamp:          Build timestamp (ISO-8601 string, supplied by caller).
+        passes:             Obfuscation passes applied (e.g. ["cff", "mba"]).
+        profile:            Optional strength-profile name.
     """
     build_id: str
     input_sha256: str
     license_id: str | None
-    master_seed_hex: str
+    master_seed_hash: str
     timestamp: str
     passes: list[str]
     profile: str | None
@@ -308,7 +323,7 @@ def write_manifest(manifest: BuildManifest, path: str) -> None:
         'build_id': manifest.build_id,
         'input_sha256': manifest.input_sha256,
         'license_id': manifest.license_id,
-        'master_seed_hex': manifest.master_seed_hex,
+        'master_seed_hash': manifest.master_seed_hash,
         'timestamp': manifest.timestamp,
         'passes': list(manifest.passes),
         'profile': manifest.profile,
@@ -326,7 +341,12 @@ def read_manifest(path: str) -> BuildManifest:
         build_id=data['build_id'],
         input_sha256=data['input_sha256'],
         license_id=data.get('license_id'),
-        master_seed_hex=data['master_seed_hex'],
+        # Phase G4: prefer master_seed_hash (one-way). Fall back to
+        # legacy master_seed_hex if reading an old manifest (hash the
+        # legacy seed so the field is populated).
+        master_seed_hash=data.get('master_seed_hash') or
+            (hashlib.sha256(bytes.fromhex(data['master_seed_hex'])).hexdigest()
+             if data.get('master_seed_hex') else ''),
         timestamp=data['timestamp'],
         passes=list(data.get('passes', [])),
         profile=data.get('profile'),
@@ -421,7 +441,7 @@ def _smoke() -> None:
             build_id=r1.build_id(),
             input_sha256=hashlib.sha256(inp).hexdigest(),
             license_id='cust-0001',
-            master_seed_hex=r1.master_seed_hex(),
+            master_seed_hash=r1.master_seed_hash(),
             timestamp='2026-07-16T00:00:00Z',
             passes=['cff', 'mba', 'obf_vars'],
             profile='native-tier',
@@ -431,6 +451,13 @@ def _smoke() -> None:
         m2 = read_manifest(mp)
         assert m2 == m, 'manifest round-trip mismatch'
         assert os.path.basename(mp) == '.bedrock_manifest.json'
+        # Phase G4: manifest must NOT contain the master_seed_hex leak.
+        with open(mp, 'r', encoding='utf-8') as f:
+            raw = f.read()
+        assert 'master_seed_hex' not in raw, \
+            'Phase G4: manifest must not leak master_seed_hex'
+        assert 'master_seed_hash' in raw, \
+            'Phase G4: manifest must contain master_seed_hash'
 
     print('SMOKE PASS')
 

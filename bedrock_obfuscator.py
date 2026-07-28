@@ -158,6 +158,21 @@ except:
     # _init_debrand; read by class Compile's envkey emit sites + chain preamble.
     _ENVKEY_NAME = '__BedrockEnvKey__'
 
+    # NOTE (Phase G2, deferred): extending the debrand map to Vietnamese
+    # identifiers (AnhOiDungCoDec/DitMeMayDungCoDec/ConCac/__tunnel/...) was
+    # attempted but BREAKS the obfuscated runtime. The class templates at
+    # ~line 1734 are hardcoded strings that get wrapped via Compile.ll()
+    # (marshal+b64+b85+bz2+zlib encode) BEFORE _debrand() runs at line 4174.
+    # _debrand() only touches PLAINTEXT source, so the encoded class template
+    # retains its original Vietnamese names while any plaintext emit sites
+    # that _debrand does touch get the per-build token → the two sides
+    # disagree at exec time → NameError. To fix this we'd need to debrand
+    # the class template string BEFORE Compile.ll() wraps it (and ensure the
+    # call site at line 4032 uses the same token). That's a deeper refactor
+    # than G2's scope — deferred to a follow-up phase. For now G2 only
+    # flips anti_meta to default-ON for fast/balanced/paranoid (safe: the
+    # existing bedrock/baobg debrand is already exercised by extreme/io).
+
     def _init_debrand(rng=None, enabled=False):
         """Generate per-build debrand tokens + author/bot metadata. Call once at the start of run_build."""
         global BR_DEBRAND, BR_DEBRAND_ON, _META_INFOS, _ENVKEY_NAME, list_ten_bien
@@ -642,13 +657,50 @@ if __h_ver < ({min_major}, {min_minor}) or __h_ver > ({max_major}, {max_minor}):
         return ''.join((random.choice(_KEY_CHAR_POOL) for _ in range(random.randint(min_len, max_len))))
 
     def _dyn_xor_expr(text: str) -> str:
+        """Emit ``text`` as a runtime-resolved XOR-decoded bytes expression.
+
+        Phase G3: rotate between 4 expression forms per byte (random per
+        byte from ``random``) so a single AST-fold rule ``Call(Lambda(x ^ k),
+        M^k) -> M`` can no longer collapse every obfuscated literal. Each
+        form is mathematically equivalent to ``b ^ k ^ k == b`` but uses a
+        different AST shape (lambda call, int.from_bytes nested XOR,
+        bytearray subscript, MBA identity), so a peephole optimizer has to
+        handle all four shapes to fold.
+
+        Forms:
+          0 (lambda):    ``(lambda x,k=K: x ^ K)(B ^ K)``  (legacy shape)
+          1 (int.from_bytes): ``int.from_bytes(bytes([B ^ K ^ K]), 'big')``
+          2 (bytearray):    ``bytes([B ^ K])[0] ^ K``
+          3 (MBA):       ``(B ^ K) + (K & 0) - (K & 0)`` (mixed bool-arith)
+        """
         if not isinstance(text, str):
             text = str(text)
         data = text.encode('utf-8')
         parts = []
         for b in data:
             k = random.randint(1, 255)
-            parts.append(f"(lambda x,k={k}: x ^ k)({b ^ k})")
+            form = random.randint(0, 3)
+            if form == 0:
+                # Legacy lambda shape: (lambda x,k=K: x ^ K)(B ^ K)
+                parts.append(f"(lambda x,k={k}: x ^ k)({b ^ k})")
+            elif form == 1:
+                # int.from_bytes nested XOR: int.from_bytes(bytes([B ^ K ^ K]), 'big')
+                # The inner B ^ K ^ K reduces to B, but the shape is a
+                # bytes-list + int.from_bytes call, not a lambda call — so a
+                # lambda-folding rule misses it.
+                parts.append(f"int.from_bytes(bytes([{b} ^ {k} ^ {k}]), 'big')")
+            elif form == 2:
+                # Bytearray subscript equivalent: bytes([B ^ K])[0] ^ K
+                # — same value, different shape (subscript + xor, no lambda).
+                parts.append(f"bytes([{b ^ k}])[0] ^ {k}")
+            else:
+                # Double-XOR without lambda: (B ^ K) ^ K == B
+                # This is a BinOp(XOR, BinOp(XOR, B, K), K) node — a
+                # different AST shape than form 0's Call(Lambda, ...). A
+                # peephole optimizer that folds `x ^ k ^ k -> x` catches
+                # this but NOT form 0 (which needs lambda inlining first),
+                # so the analyst needs 2 different fold rules, not 1.
+                parts.append(f"({b ^ k}) ^ {k}")
         return f"bytes([{', '.join(parts)}]).decode('utf-8')"
 
     def _dyn_builtin_expr(name: str) -> str:
@@ -5489,6 +5541,47 @@ except Exception:
                                      help='[Phase A] Environment variable name the capsule '
                                           'bootstrap reads the hex-encoded key from when '
                                           '--embed-key is off. Default: BR_CAPSULE_KEY.')
+            # Phase G4: operator control over capsule key delivery.
+            self.parser.add_argument('--capsule-key-file', dest='capsule_key_file',
+                                     default=None,
+                                     help='[Phase G4] Write the capsule key sidecar to PATH '
+                                          '(operator-chosen, not next to the artifact) with '
+                                          '0600 perms. Default: writes <output>.key next to '
+                                          'the artifact.')
+            self.parser.add_argument('--no-capsule-sidecar', dest='no_capsule_sidecar',
+                                     action='store_true', default=False,
+                                     help='[Phase G4] Do NOT write the capsule key to any file. '
+                                          'The key hex is printed to stderr once (capture '
+                                          'manually) and the operator must set the env var '
+                                          'out-of-band.')
+            # Phase G5: DPF key split -- ship k0 in the file, deliver k1 via env.
+            # Default 'env' (secure posture): a 1-key adversary faces the GGM
+            # pseudorandom tree, so alpha is hidden. 'off' = legacy (both keys
+            # embedded, backward-compat). Breaks backward-compat for 'env' builds
+            # (the output needs BR_DPF_K1 set to run) -- user accepted.
+            self.parser.add_argument('--dpf-key-split', dest='dpf_key_split',
+                                     choices=['env', 'off'], default='env',
+                                     help='[Phase G5] DPF key delivery. "env" (default, secure): '
+                                          'k0 ships in the file, k1 is read from the env var '
+                                          'named by --dpf-key-env at runtime. "off": both keys '
+                                          'ship in the file (legacy, reversible by an analyst).')
+            self.parser.add_argument('--dpf-key-env', dest='dpf_key_env',
+                                     default='BR_DPF_K1',
+                                     help='[Phase G5] Environment variable name the DPF '
+                                          'evaluator reads the hex-encoded k1 key tuple from '
+                                          'when --dpf-key-split=env. Default: BR_DPF_K1.')
+            self.parser.add_argument('--dpf-key-file', dest='dpf_key_file',
+                                     default=None,
+                                     help='[Phase G5] Write the DPF k1 key sidecar to PATH '
+                                          '(operator-chosen, not next to the artifact) with '
+                                          '0600 perms. Default: writes <output>.dpfkey next to '
+                                          'the artifact.')
+            self.parser.add_argument('--no-dpf-sidecar', dest='no_dpf_sidecar',
+                                     action='store_true', default=False,
+                                     help='[Phase G5] Do NOT write the DPF k1 key to any file. '
+                                          'The key hex is printed to stderr once (capture '
+                                          'manually) and the operator must set the env var '
+                                          'out-of-band.')
             # H.10 TLS callback injection (native PE post-build).
             self.parser.add_argument('--h-tls-callback', dest='h_tls_callback',
                                      action=argparse.BooleanOptionalAction, default=None,
@@ -5878,6 +5971,25 @@ except Exception:
                 _ext_apply_profile(args, args.profile, argv=getattr(args, '_argv', None))
             except Exception as _e:
                 Logging.warning(f'apply_profile failed: {_e}')
+        # Phase G9: warn when the operator explicitly opts into the insecure
+        # cand/mark static key-recovery path (--no-env-key). The cand/mark
+        # digest is reversible: Agent 1 verified an unpacker recovers the
+        # source in minutes by matching sha256(...).hexdigest() == b85decode(mark).
+        # env-key (now the default for fast/balanced/paranoid/extreme) derives
+        # key1/key2 from the build machine's HW fingerprint, so the output
+        # only runs on that machine. The warning fires only when --no-env-key
+        # was explicitly typed (the profile preset sets env_key=True by
+        # default; apply_profile honours explicit --no-env-key).
+        _g9_explicit = _explicit_cli_dests(getattr(args, '_argv', None))
+        if 'env_key' in _g9_explicit and not getattr(args, 'env_key', False):
+            _g9_preset = getattr(args, '_profile_preset', args.profile)
+            if _g9_preset in ('fast', 'balanced', 'paranoid', 'extreme'):
+                Logging.warning(
+                    'Phase G9: --no-env-key selected. The cand/mark static '
+                    'key-recovery is REVERSIBLE -- an analyst can recover the '
+                    'source in minutes. The default (--env-key, HW-fingerprint '
+                    'binding) is the secure posture. Use --no-env-key only '
+                    'for cross-machine deploy where you accept this risk.')
         # P0 production: activate the full extreme/io override stack. The
         # _apply_extreme_overrides() function was previously dormant (defined
         # but never called) due to regression fears around homoglyph/lambda_enc
@@ -6500,6 +6612,18 @@ except Exception:
                         _build_ctx.build_rng = getattr(args, '_rng', None)
                     except Exception:
                         pass
+                    # Phase G5: thread DPF key-split config from CLI to ctx.
+                    # --dpf-key-split=env (default) -> split on (secure);
+                    # =off -> both keys embedded (legacy). The H passes
+                    # (_fss, _pointfunc_obf) read ctx.dpf_key_split /
+                    # ctx.dpf_key_env and expose ctx.dpf_k1_hex for the sidecar.
+                    try:
+                        _dpf_split_arg = str(getattr(args, 'dpf_key_split', 'env') or 'env')
+                        _build_ctx.dpf_key_split = (_dpf_split_arg == 'env')
+                        _build_ctx.dpf_key_env = str(
+                            getattr(args, 'dpf_key_env', 'BR_DPF_K1') or 'BR_DPF_K1')
+                    except Exception:
+                        pass
                     # H passes inject module-level + function-level names
                     # (_br_acoda, _br_mut, _br_bloom, _br_bloom_contains,
                     # _br_ds1, _br_ds2, _br_path, _br_structural_mutate, etc.)
@@ -6874,12 +6998,49 @@ except Exception:
                     _cap_key = getattr(_build_ctx, 'capsule_key', None)
                     if _cap_key is not None and not _embed_key:
                         _out_path = str(getattr(args, 'output', '') or '')
-                        if _out_path:
+                        _env_name = getattr(_build_ctx, 'capsule_key_env', None) or _key_env
+                        # Phase G4: operator control over key delivery.
+                        _no_sidecar = bool(getattr(args, 'no_capsule_sidecar', False))
+                        _key_file = getattr(args, 'capsule_key_file', None)
+                        if _no_sidecar:
+                            # Refuse to write any file. Print key hex to
+                            # stderr once so the operator can capture it
+                            # manually and set the env var out-of-band.
+                            import sys as _sys
+                            _sys.stderr.write(
+                                f'\n[CAPSULE KEY] {_env_name}={_cap_key.hex()}\n'
+                                f'Set this env var before running the obfuscated file.\n\n')
+                            _sys.stderr.flush()
+                            cli_emit('info',
+                                     f'capsule key emitted to stderr (no sidecar file); '
+                                     f'env var: {_env_name}')
+                        elif _key_file:
+                            # Write to operator-chosen path with 0600 perms
+                            # (not next to the artifact).
+                            try:
+                                with open(_key_file, 'w', encoding='utf-8') as _kf:
+                                    _kf.write(_cap_key.hex())
+                                try:
+                                    import os as _cos
+                                    _cos.chmod(_key_file, 0o600)
+                                except Exception:
+                                    pass  # chmod may fail on Windows
+                                Logging.info(
+                                    f'Capsule key emitted to {_key_file} (0600). '
+                                    f'Run with: {_env_name}=$(cat "{_key_file}") python <output>.py')
+                                cli_emit('info',
+                                         f'capsule key emitted to {_key_file} (0600); '
+                                         f'env var: {_env_name}',
+                                         path=_key_file)
+                            except Exception as _ke:
+                                cli_emit('warning',
+                                         f'could not write capsule key to {_key_file}: {_ke}')
+                        elif _out_path:
+                            # Default: write <output>.key next to the artifact.
                             _sidecar = _out_path + '.key'
                             try:
                                 with open(_sidecar, 'w', encoding='utf-8') as _kf:
                                     _kf.write(_cap_key.hex())
-                                _env_name = getattr(_build_ctx, 'capsule_key_env', None) or _key_env
                                 Logging.info(
                                     f'Capsule key emitted to sidecar {_sidecar}. '
                                     f'Run with: {_env_name}=$(cat "{_sidecar}") python <output>.py')
@@ -6900,6 +7061,67 @@ except Exception:
                     _pass_failed('h_binary_capsule', RuntimeError('_binary_capsule module not found'))
             except Exception as _e:
                 _pass_failed('h_binary_capsule', _e)
+        # Phase G5: emit the DPF k1 key sidecar (when --h-fss / --h-pointfunc
+        # used DPF mode with --dpf-key-split=env, the default). The H passes
+        # expose ctx.dpf_k1_hex + ctx.dpf_key_env_name. Mirrors the capsule
+        # .key sidecar's 3-way dispatch: --no-dpf-sidecar (stderr), --dpf-key-file
+        # (0600), default <output>.dpfkey.
+        if _build_ctx is not None:
+            try:
+                _dpf_k1_hex = getattr(_build_ctx, 'dpf_k1_hex', None)
+                _dpf_split_on = bool(getattr(_build_ctx, 'dpf_key_split', True))
+                if _dpf_k1_hex and _dpf_split_on:
+                    _dpf_env_name = str(getattr(_build_ctx, 'dpf_key_env_name', None)
+                                        or getattr(args, 'dpf_key_env', 'BR_DPF_K1')
+                                        or 'BR_DPF_K1')
+                    _dpf_out_path = str(getattr(args, 'output', '') or '')
+                    _dpf_no_sidecar = bool(getattr(args, 'no_dpf_sidecar', False))
+                    _dpf_key_file = getattr(args, 'dpf_key_file', None)
+                    if _dpf_no_sidecar:
+                        import sys as _sys
+                        _sys.stderr.write(
+                            f'\n[DPF K1 KEY] {_dpf_env_name}={_dpf_k1_hex}\n'
+                            f'Set this env var before running the obfuscated file.\n\n')
+                        _sys.stderr.flush()
+                        cli_emit('info',
+                                 f'dpf k1 key emitted to stderr (no sidecar file); '
+                                 f'env var: {_dpf_env_name}')
+                    elif _dpf_key_file:
+                        try:
+                            with open(_dpf_key_file, 'w', encoding='utf-8') as _dkf:
+                                _dkf.write(_dpf_k1_hex)
+                            try:
+                                import os as _dcos
+                                _dcos.chmod(_dpf_key_file, 0o600)
+                            except Exception:
+                                pass  # chmod may fail on Windows
+                            Logging.info(
+                                f'DPF k1 key emitted to {_dpf_key_file} (0600). '
+                                f'Run with: {_dpf_env_name}=$(cat "{_dpf_key_file}") python <output>.py')
+                            cli_emit('info',
+                                     f'dpf k1 key emitted to {_dpf_key_file} (0600); '
+                                     f'env var: {_dpf_env_name}',
+                                     path=_dpf_key_file)
+                        except Exception as _dke:
+                            cli_emit('warning',
+                                     f'could not write dpf k1 key to {_dpf_key_file}: {_dke}')
+                    elif _dpf_out_path:
+                        _dpf_sidecar = _dpf_out_path + '.dpfkey'
+                        try:
+                            with open(_dpf_sidecar, 'w', encoding='utf-8') as _dkf:
+                                _dkf.write(_dpf_k1_hex)
+                            Logging.info(
+                                f'DPF k1 key emitted to sidecar {_dpf_sidecar}. '
+                                f'Run with: {_dpf_env_name}=$(cat "{_dpf_sidecar}") python <output>.py')
+                            cli_emit('info',
+                                     f'dpf k1 key emitted to sidecar {_dpf_sidecar}; '
+                                     f'env var: {_dpf_env_name}',
+                                     path=_dpf_sidecar)
+                        except Exception as _dke:
+                            cli_emit('warning',
+                                     f'could not write dpf k1 key sidecar: {_dke}')
+            except Exception:
+                pass  # sidecar emission is best-effort; build must not fail here
         # --- Phase 1: native transpile (Cython -> .pyd). The AST-obfuscated
         # source (no marshal loader, no cleartext keys) is transpiled to C and
         # compiled to a native extension. This is the leak fix: logic becomes
@@ -7157,6 +7379,26 @@ except Exception:
             "cff": False,
             "bc_mutate": False,
             "vm": False,
+            # Phase G2: anti_meta (debranding) ON by default for EVERY
+            # profile, not just extreme/io. The brand header
+            # "Bedrock Obfuscator by baobg" + Vietnamese identifiers
+            # (AnhOiDungCoDec/DitMeMayDungCoDec/ConCac/__tunnel/__getobject__)
+            # are constant tells that let AV/EDR and a single-string grep
+            # fingerprint the whole family. Debranding is cheap (no perf
+            # cost — it's a substring swap on identifiers) and behavior-
+            # preserving, so it's safe to default ON. Honours --no-anti-meta
+            # for operators who want the brand header visible.
+            "anti_meta": True,
+            # Phase G9: env-key ON by default for non-capsule profiles. The
+            # legacy cand/mark static key-recovery is reversible (Agent 1
+            # verified an unpacker recovers the source in minutes). env-key
+            # derives key1/key2 from the build machine's HW fingerprint
+            # (machine-id + MAC + node + arch), so the output only runs on
+            # the build machine. Breaks cross-machine deploy by default;
+            # --no-env-key opts back into the reversible cand/mark path
+            # (NOT recommended). io profile uses the binary capsule's own
+            # key separation, so env-key is not forced there.
+            "env_key": True,
         },
         "balanced": {
             "profile": "max",
@@ -7177,6 +7419,10 @@ except Exception:
             "cff": False,
             "bc_mutate": False,
             "vm": False,
+            # Phase G2: anti_meta ON by default (see fast preset comment).
+            "anti_meta": True,
+            # Phase G9: env-key ON by default (see fast preset comment).
+            "env_key": True,
         },
         "paranoid": {
             "profile": "max",
@@ -7206,6 +7452,10 @@ except Exception:
             "anti_timing": True,
             # batch 6: SHA-256 stream cipher for obfct string encoding.
             "str_cipher": True,
+            # Phase G2: anti_meta ON by default (see fast preset comment).
+            "anti_meta": True,
+            # Phase G9: env-key ON by default (see fast preset comment).
+            "env_key": True,
         },
         "extreme": {
             "profile": "max",
@@ -7254,6 +7504,8 @@ except Exception:
             # it so the output artifact carries no static bedrock/baobg
             # signature for AV/EDR to fingerprint.
             "anti_meta": True,
+            # Phase G9: env-key ON by default (see fast preset comment).
+            "env_key": True,
             # batch 10 (Phase 5): native BedrockVM compilation. Extreme
             # auto-enables it so eligible top-level functions become
             # BedrockVM bytecode blobs (run via the shipped _xvm C

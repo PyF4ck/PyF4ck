@@ -44,3 +44,14 @@ Thumbs.db
 
 # ZCode agent internal (planning files, not source)
 .zcode/
+
+# Phase G build artifacts (native-VM fallbacks, scratch outputs, key sidecars)
+_*_vm_ref.py
+_pexp/
+_review_out/
+build_*.log
+out_balanced.py
+out_fast.py
+out_extreme.py
+*.key
+*.dpfkey
