@@ -1,6 +1,6 @@
 """Phase iO-7: Adversarial ML classifier test (pure stdlib).
 
-Runs TWO classifier experiments and reports accuracy with a Wilson 95%
+Runs THREE classifier experiments and reports accuracy with a Wilson 95%
 confidence interval for each:
 
   1. PRG-uniformity test (obfuscated vs os.urandom): measures whether the
@@ -13,6 +13,11 @@ confidence interval for each:
      of-obfuscation property. If the classifier can't tell obfuscations of
      two different equivalent programs apart better than chance, the iO
      property holds (at least for this program pair and this adversary).
+
+  3. build-diversity test (Phase G8): Obf(P0) fresh-seed builds split in
+     half and classified build-set-A vs build-set-B. If the classifier
+     separates two halves of the SAME program, a build-family fingerprint
+     exists (family detector). Near chance => build-diversity holds.
 
 Methodology fixes vs the original test (which was statistically vacuous):
   - N raised from 10 to 40 (test set ~40, Wilson SD ~7.9% vs ~15.8% at N=10).
@@ -205,15 +210,74 @@ def _select_top_bigrams(datas: list, k: int = 256) -> list:
     return top
 
 
+def _shannon_entropy(data: bytes) -> float:
+    """Shannon entropy of the byte distribution (0..8 bits/byte)."""
+    if not data:
+        return 0.0
+    n = len(data)
+    freq = collections.Counter(data)
+    ent = 0.0
+    for c in freq.values():
+        p = c / n
+        ent -= p * math.log2(p)
+    return ent
+
+
+def _bootstrap_regex_count(data: bytes) -> int:
+    """Phase G8 (M9): count bootstrap-fingerprint substrings in the file.
+
+    The binary-capsule bootstrap imports zlib/hashlib and uses decompressobj;
+    a classifier can fingerprint these. Counting occurrences gives the ML
+    test a feature that directly measures this leakage channel, so the
+    report can distinguish 'obf weak' (this feature is discriminative) from
+    'test weak' (no feature is discriminative).
+    """
+    needles = (b'import zlib', b'hashlib', b'decompressobj', b'bytes.fromhex',
+               b'base64.b85decode', b'b85decode', b'__import__')
+    total = 0
+    for needle in needles:
+        total += data.count(needle)
+    return total
+
+
 def _extract_features_with_bigrams(data: bytes, top_pairs: list) -> list:
-    """Full feature vector: 256 byte-histogram + 256 bigram-histogram."""
+    """Full feature vector.
+
+    Phase G8 (M2, M9): previously only 256 byte-histogram + 256 bigram
+    features, all NORMALIZED by length -- which discarded the length channel
+    (file size differs between profiles/programs). Now also appends:
+      - raw len(data) (NOT normalized -- closes the length-channel blind spot, M2)
+      - total Shannon entropy (bytes-level, 0..8)
+      - first-1KB Shannon entropy (positional, M9)
+      - last-1KB Shannon entropy (positional, M9)
+      - bootstrap-regex count (bootstrap-fingerprint substrings, M9)
+    """
     n = len(data)
     freq = collections.Counter(data)
     hist = [freq.get(b, 0) / n for b in range(256)]
     pc = _bigram_counts(data)
     nb = max(1, len(data) - 1)
     bigram = [pc.get(p, 0) / nb for p in top_pairs]
-    return hist + bigram
+    # Phase G8 new features. raw_len is scaled to ~1..10 (divide by a typical
+    # obfuscated file size) so it sits on the same order as the entropy
+    # features (0..8) and does NOT dominate the L2-regularized classifier.
+    raw_len = float(n) / 10000.0
+    total_ent = _shannon_entropy(data)
+    first_1k = data[:1024]
+    last_1k = data[-1024:] if len(data) >= 1024 else data
+    first_ent = _shannon_entropy(first_1k)
+    last_ent = _shannon_entropy(last_1k)
+    boot_re = float(_bootstrap_regex_count(data))
+    return hist + bigram + [raw_len, total_ent, first_ent, last_ent, boot_re]
+
+
+# Indices of the G8 scalar features within the feature vector (after the
+# 256 hist + 256 bigram = 512 histogram features).
+_N_HIST = 256
+_N_BIGRAM = 256
+_G8_SCALAR_OFFSET = _N_HIST + _N_BIGRAM  # 512
+_G8_SCALAR_NAMES = ('raw_len', 'total_entropy', 'first_1k_entropy',
+                     'last_1k_entropy', 'bootstrap_regex_count')
 
 
 def _sigmoid(x):
@@ -316,14 +380,16 @@ def _run_classifier(X_obf, X_cmp, label_a, label_b, gate_label):
               f"CI upper {ci_hi:.1%} >= {ACC_TARGET:.0%} -- classifier may "
               f"distinguish {label_a} from {label_b} (acc {accuracy:.1%})")
 
-    # Feature importance (which bytes/bigrams betray the construction?)
+    # Feature importance (which bytes/bigrams/scalars betray the construction?)
     top_features = sorted(enumerate(clf.w), key=lambda x: abs(x[1]), reverse=True)[:5]
     print(f"  Top-5 discriminative features:")
     for idx, weight in top_features:
-        if idx < 256:
+        if idx < _N_HIST:
             kind = f"byte 0x{idx:02x}"
+        elif idx < _N_HIST + _N_BIGRAM:
+            kind = f"bigram#{idx - _N_HIST}"
         else:
-            kind = f"bigram#{idx - 256}"
+            kind = _G8_SCALAR_NAMES[idx - _G8_SCALAR_OFFSET]
         direction = label_b if weight > 0 else label_a
         print(f"    {kind}: weight={weight:+.6f} ({direction})")
     return accuracy, (ci_lo, ci_hi)
@@ -415,11 +481,34 @@ def main():
             X_obf_p0, X_obf_p1, "obf(P0)", "obf(P1)",
             gate_label="iO-property gate")
 
+        # ---- Step 5c: build-diversity test (Phase G8, M9) ----
+        # Build P0 N times with fresh seeds -> N diverse builds of the SAME
+        # program. Split them in half and classify build-set-A vs build-set-B.
+        # If the classifier can tell two halves of the same program apart
+        # better than chance, there is a BUILD-INVARIANT fingerprint (family
+        # detector). If near chance, build-diversity holds. This catches the
+        # case where the iO test passes (P0 vs P1 indistinguishable) but the
+        # obfuscator leaves a per-build-family signature.
+        print(f"\n--- Step 5c: build-diversity test (Obf(P0) half-A vs half-B) ---")
+        print("  (Same program, fresh-seed diverse builds split in half. If the")
+        print("   classifier separates the halves, a build-family fingerprint exists.)")
+        half = len(X_obf_p0) // 2
+        X_p0_a = X_obf_p0[:half]
+        X_p0_b = X_obf_p0[half:]
+        acc_bd, ci_bd = _run_classifier(
+            X_p0_a, X_p0_b, "build-A(P0)", "build-B(P0)",
+            gate_label="build-diversity gate")
+
         # ---- summary ----
         print("\n" + "=" * 60)
         print(f"Phase iO-7 adversarial ML: {PASSES}/{PASSES + len(FAILS)} passed")
         print(f"  PRG-uniformity: acc={acc_prg:.1%} CI=[{ci_prg[0]:.1%}, {ci_prg[1]:.1%}]")
         print(f"  iO-property:    acc={acc_io:.1%} CI=[{ci_io[0]:.1%}, {ci_io[1]:.1%}]")
+        print(f"  build-diversity: acc={acc_bd:.1%} CI=[{ci_bd[0]:.1%}, {ci_bd[1]:.1%}]")
+        # Honest reporting: distinguish 'obf weak' vs 'test weak'. If accuracy
+        # is near chance AND no scalar feature dominates, the test is just
+        # weak (small N); if a specific feature (e.g. raw_len or
+        # bootstrap_regex_count) drives accuracy, the obf has a real leak.
         if FAILS:
             print("FAILURES:")
             for f in FAILS:
