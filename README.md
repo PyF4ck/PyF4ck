@@ -117,10 +117,40 @@ and verified by the behavioral gate (`fib(10)=55`, `final_result: 221`).
 | 3 | Debug poison + metamorphic | ALL functions | `--debug-poison`, `--metamorphic` |
 | 4 | Anti-meta debranding | ALL strings | `--anti-meta` |
 | 5 | Native VM (BedrockVM) | VM-eligible subset | `_bedrock_vm.c`, `_xvm.pyd` |
-| 7 | Hardening (env-key, adv-requests) | ALL | `--env-key`, `--adv-requests` |
+| 7 | Hardening (env-key default, adv-requests) | ALL | `--env-key` (DEFAULT since G9), `--adv-requests` |
 | G | Key release + TPM attestation | license-bound | `_key_release.py` (TPM is a placeholder) |
 | H | Esoteric (11 passes) | ALL functions | `_identifier_poison.py` … `_exc_table_vm.c` |
+| **G** | **Deobf-hardening (G1-G9 + G1+): hex/base85 blob, anti-meta default, num_obf 4-form, capsule key delivery, DPF split, opaque structural mix, DPF PRG/domain, ML test features, env-key default** | **capsule + non-capsule** | **`_binary_capsule.py`, `_fss.py`, `_opaque_crypto.py`, `_pointfunc_obf.py`, `_io_adversarial_ml.py`** |
 | **io** | **Encrypted-source capsule + value secret sharing + opaque predicates** | **ALL** | **`_fss.py` (value secret sharing, NOT BGI FSS), `_opaque_crypto.py`, `_pointfunc_obf.py`, `_lookup_obf.py`, `_entropy_pad.py`, `_binary_capsule.py`** |
+
+## Phase G deobfuscation-hardening (G1-G9 + G1+)
+
+A full hardening sweep against deobfuscation, driven by 3 independent
+sub-agents that confirmed 12 findings (verified by 3 Explore agents).
+**11 of 12 fixed; 1 deferred.** Default posture is now secure-by-default
+(capsule key not in file, DPF k1 via env, env-key default for non-capsule
+profiles) — outputs require env vars to run. This is intentional.
+
+| Phase | Fix | Breaks backward-compat? |
+|-------|-----|:---:|
+| **G1** | Capsule blob as hex/base85 literal (kills the 0x5c byte spike that distinguished obf from urandom at 100%) + per-build bootstrap randomization + blob padding (closes length channel) | no |
+| **G1+** | Bootstrap structural tells (`import zlib, hashlib`, `exec(zlib.decompressobj`) randomized: zlib aliased per-build, import/exec/XOR shapes vary across 4/3/2 forms — no single regex matches every io file | no |
+| **G2** | `anti_meta` default ON for all profiles; sentinel prefixes (`_LCAN_`/`_MARK_`/`_SLOT_`) randomized | no |
+| **G3** | `num_obf` rotates across 4 AST forms per byte — one fold rule no longer collapses every obfuscated literal | no |
+| **G4** | `--capsule-key-file` (0600), `--no-capsule-sidecar`, `master_seed_hex` stripped from manifest (replaced by `master_seed_hash`) | no |
+| **G5** | DPF key split DEFAULT: k0 in file, k1 via env `BR_DPF_K1` (`.dpfkey` sidecar) — 1-key adversary faces the GGM tree | **yes** |
+| **G6** | Opaque predicates branch on `v & 1` between two different-shape tautologies (not foldable `v-v`/`f(x)==f(x)`) | no |
+| **G7** | DPF PRG control bits from out-of-seed bytes (SHA-512, disjoint sL/sR/tL/tR); per-build domain salt; domain widened to 64/128 bits | no |
+| **G8** | ML test keeps `len(data)` raw, adds entropy/positional/bootstrap-regex features, 3rd experiment (build-diversity), feature-importance report | no |
+| **G9** | `--env-key` DEFAULT for fast/balanced/paranoid/extreme — payload key is HW-fingerprint-derived, not reversible cand/mark | **yes** |
+
+**Recovery-attack posture (re-verified after Phase G):** cand/mark static
+key-recovery FAILS (G9); capsule key from file prefix FAILS (G1+G4); DPF
+reconstruct FAILS (G5); bootstrap signature regex GONE (G1+).
+
+**Remaining deobf gaps (honest):** M4 (Vietnamese-identifier + sentinel
+debrand, deferred — `Compile.ll` encoding constraint); CFF dispatch-table
+structure not yet randomized (L3 — opaque predicates feeding it ARE hardened).
 
 ---
 
@@ -128,7 +158,9 @@ and verified by the behavioral gate (`fib(10)=55`, `final_result: 221`).
 
 The `io` profile encrypts the obfuscated source so the output file's byte
 distribution approaches uniform. This is a **PRG-uniformity** property, not
-the cryptographic iO property (see the honesty note above):
+the cryptographic iO property (see the honesty note above). Phase G
+deobf-hardening (G1-G9 + G1+) closes the bootstrap signature that used to
+leak here — see the Phase G section below.
 
 | Metric | Pre-capsule | Capsule | Random baseline |
 |--------|--------|--------|-----------------|
@@ -145,9 +177,14 @@ claimed but unimplemented). The rewritten test
 (`bedrock_native/_io_adversarial_ml.py`) uses N≥40, Wilson 95% CIs, both
 byte-histogram and byte-pair features, a stratified split, and an honest
 PRG-uniformity gate. **It now sometimes FAILS** at the strict gate — which
-is the correct behaviour, because the capsule's bootstrap (~0.1% of the
-file, containing `import zlib, hashlib` and `exec(zlib.decompress`) is a
-greppable structural signature that the bigram features can pick up.
+is the correct behaviour: at small N the strict Wilson gate has low
+statistical power. The bootstrap itself is NO LONGER a constant
+structural signature: Phase G1+ aliases `zlib` to a per-build random token
+and randomizes the import-line / decompress-call / XOR-expression shapes
+across 4 / 3 / 2 forms per build, so no single regex matches every io
+file. (Before G1+ the bootstrap's `import zlib, hashlib` and
+`exec(zlib.decompressobj().decompress(` were 100%-reliable tells — found
+via a 6-layer deobf analysis of the released challenge. Both are GONE.)
 
 Full spec: **[bedrock_native/IO_SPEC.md](bedrock_native/IO_SPEC.md)**
 
@@ -269,6 +306,15 @@ bedrock_spec.html              Full interactive spec (93 KB)
 ## Commit History (key milestones)
 
 ```
+9b7766f  fix(G1+): randomize bootstrap structural tells (import line + exec call + xor shape)
+9dd25a3  chore: gitignore Phase G build artifacts (vm_ref fallbacks, key sidecars, scratch dirs)
+8e8aadf  fix(G9): default --env-key for non-capsule profiles + warn on --no-env-key
+5f608b1  fix(G8): ML test add length/entropy/positional features + 3rd build-diversity experiment
+045fd0a  fix(G7): DPF PRG control-bits fix + per-build domain salt + widen domain 64-128
+238a231  fix(G6): opaque predicate structural mix - drop v-v / f(x)==f(x) tautologies
+6b18371  fix(G5): DPF key split default - k0 in file, k1 via env BR_DPF_K1
+7fe1ebc  fix(G4): capsule key delivery + strip master_seed_hex manifest
+542c0d2  fix(G1-G3): capsule hardening + anti_meta default + num_obf diversify
 d17f12e  app.py: io profile sandbox-safe flags + latin-1 preview
 cedfbdd  Phase iO-7: adversarial ML classifier (accuracy 40% < chance 50%)
 197a57c  iO-7: N=20 scale test + calibrated chi gate (random baseline 651±25)
@@ -298,16 +344,20 @@ The `io` profile targets:
   obfuscated source by running the file's own ~10-line bootstrap — this is
   trivial and defeats any adversary, nation-state or otherwise.
 
-For a stronger posture the capsule key must NOT ship in the file. Two
-options, both opt-in:
+For a stronger posture the capsule key must NOT ship in the file. This is
+now the DEFAULT, not opt-in:
 
-1. **Env-key (default since Phase A)**: the build emits a sidecar
+1. **Env-key (DEFAULT since Phase G9)**: the build emits a sidecar
    `<output>.key` and the bootstrap reads it from `$BR_CAPSULE_KEY` at
    runtime. The source is genuinely encrypted at rest; the key lives in
-   the runtime environment, not the artifact. This raises the bar from
-   "grep the file" to "read the process environment / dump the decrypted
-   in-process source" — still defeatable by a debugger, but no longer
-   trivially recoverable from the file alone.
+   the runtime environment, not the artifact. For non-capsule profiles
+   (fast/balanced/paranoid/extreme) the payload key is likewise derived
+   from the building machine's hardware fingerprint (G9) instead of the
+   reversible cand/mark digest. This raises the bar from "grep the file"
+   to "read the process environment / dump the decrypted in-process
+   source" — still defeatable by a debugger, but no longer trivially
+   recoverable from the file alone. Pass `--no-env-key` to opt back into
+   the reversible cand/mark path (a warning is printed — NOT recommended).
 2. **Release-server (Phase G, opt-in via `--release-server`)**: the master
    seed lives on a license server; the VM key is derived per-build and
    released only after license + (placeholder) TPM attestation. This is
