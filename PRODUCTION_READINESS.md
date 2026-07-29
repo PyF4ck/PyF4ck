@@ -1,13 +1,58 @@
-# Bedrock Obfuscator — Production Readiness Report (Phase 5 + Phase 7 + iO)
+# Bedrock Obfuscator — Production Readiness Report (Phases 1-5, 7, G, H, iO)
 
 ## Status: PRODUCTION-READY with documented limitations
 
-The obfuscator (Phases 1-5 + Phase 7 hardening + Phase H esoteric + Phase iO)
-is safe to deploy in production with the flags and constraints documented
-below. The native VM (Phase 5) is an **opt-in enhancement layer**; the core
-obfuscation (Phases 1-4) protects ALL code regardless of VM eligibility. The
-`io` profile adds Practical Indistinguishability Obfuscation (binary capsule)
-for the strongest protection.
+The obfuscator (Phases 1-5 + Phase 7 hardening + Phase G deobf-hardening
+(G1-G9 + G1+) + Phase H esoteric + Phase iO) is safe to deploy in production
+with the flags and constraints documented below. The native VM (Phase 5) is
+an opt-in enhancement layer; the core obfuscation (Phases 1-4) protects ALL
+code regardless of VM eligibility. The io profile adds the encrypted-source
+capsule (binary capsule) for the strongest protection.
+
+NOTE: Phase G hardening (2026-07-28/29) is a full deobfuscation-hardening
+sweep driven by 3 independent sub-agents that confirmed 12 findings,
+verified by 3 Explore agents. 11 of 12 fixed (G1-G9 + G1+); 1 deferred
+(M4: Vietnamese-identifier + sentinel debrand, blocked by a Compile.ll
+encoding constraint). See the Phase G hardening section below.
+
+## Phase G deobfuscation-hardening (G1-G9 + G1+)
+
+A full hardening sweep against deobfuscation, driven by 3 independent
+sub-agents that confirmed 12 findings (verified by 3 Explore agents).
+11 of 12 fixed; 1 deferred (M4: Vietnamese-identifier + sentinel debrand,
+blocked by a `Compile.ll` encoding constraint).
+
+### What each phase fixes
+
+| Phase | Finding(s) | What it does |
+|-------|-----------|--------------|
+| **G1** | C1, C6, M2 | Capsule blob emitted as hex/base85 literal (no latin-1 escaping) — kills the 0x5c/0x30/0x78 byte-distribution spike that let a single-histogram-bin classifier distinguish obf from urandom at 100%. Per-build bootstrap skeleton randomization + blob padding closes the length channel. |
+| **G1+** | (G1 follow-up, found via 6-layer deobf analysis of the released challenge) | The bootstrap left `import zlib, hashlib` and `exec(zlib.decompressobj().decompress(` as **constant structural tells** (100%-reliable single-regex fingerprints). G1+ aliases `zlib` to a per-build random token (never bare) and randomizes the import-line / decompress-call / XOR-expression shapes across 4 / 3 / 2 forms per build — no single regex matches every io file. |
+| **G2** | C7, M3 | `anti_meta` default ON for all profiles (not just extreme/io); extended debrand map; sentinel prefixes (`_LCAN_`/`_MARK_`/`_SLOT_`) randomized. `grep -c "bedrock\|baobg\|_LCAN_\|_MARK_\|_SLOT_"` = 0. |
+| **G3** | M5 | `num_obf` now rotates across 4 AST forms per byte (lambda Call, `int.from_bytes`, bytearray-subscript, double-XOR) — one AST-fold rule no longer collapses every obfuscated literal. |
+| **G4** | C4 | Capsule key delivery: `--capsule-key-file PATH` (0600 perms), `--no-capsule-sidecar` (print key to stderr once, no file), strip `master_seed_hex` from the manifest (replaced by `master_seed_hash` SHA-256 for traitor-tracing). |
+| **G5** | C3 | DPF key split is the DEFAULT: k0 ships in the file, k1 is read from env `BR_DPF_K1` at runtime (`.dpfkey` sidecar). A 1-key adversary now faces the GGM pseudorandom tree. **Breaks backward-compat** (output won't run without the env var) — intentional posture-by-default. |
+| **G6** | C5 | Opaque predicates no longer use foldable tautologies (`v-v`, `f(x)==f(x)`). They now branch on `v & 1` to pick between two different-shape tautologies — a CSE/peephole pass cannot fold because the two branches differ. |
+| **G7** | M7, M1 | DPF PRG control bits drawn from out-of-seed bytes (switched to SHA-512 so sL/sR/tL/tR are disjoint); per-build domain-separation salt; domain widened from 16/32 bits to 64/128 bits (brute-force infeasible with G5's split key). |
+| **G8** | M2, M9 | ML adversarial test now keeps `len(data)` as a raw feature (was normalized away), adds Shannon entropy + positional entropy + bootstrap-regex-count, and runs a 3rd experiment (build-diversity: classify build-A vs build-B of the same program). Feature-importance report labels scalar features by name. |
+| **G9** | C2 | `--env-key` is now the DEFAULT for non-capsule profiles (fast/balanced/paranoid/extreme). The payload key is derived from the building machine's hardware fingerprint, NOT the reversible cand/mark digest. Agent 1's cand/mark unpacker now FAILS. `--no-env-key` opts back into the reversible path (with a warning). |
+
+### Recovery-attack posture (re-verified after Phase G)
+
+| Attack | Before Phase G | After Phase G |
+|--------|----------------|---------------|
+| cand/mark static key-recovery (Agent 1 unpacker) | recovers source in minutes | **FAILS** (G9: key now HW-fingerprint-derived, no cand/mark digest to match) |
+| Capsule key from 32-byte file prefix | recovers source (embed-key mode) | **FAILS** by default (G1+G4: key not in file, hex/base85 encoding, sidecar 0600) |
+| DPF reconstruct (Eval(0,k0,x) XOR Eval(1,k1,x)) | both keys in one file | **FAILS** (G5: k1 via env, missing → refuse-run) |
+| Bootstrap signature regex (`import zlib, hashlib`) | 100%-reliable tell | **GONE** (G1+: zlib aliased, 4/3/2 shape randomization) |
+
+### Known remaining gaps (honest)
+
+1. **M4 (deferred)** — Vietnamese identifiers (`AnhOiDungCoDec`, `DitMeMayDungCoDec`, etc.) + sentinel debrand are not yet randomized. Blocked by a `Compile.ll` encoding constraint in the native-VM build path. Non-Vietnamese debrand (bedrock/baobg) IS randomized (G2).
+2. **CFF dispatch signature (L3)** — control-flow flattening dispatch-table structure is not yet randomized. The opaque predicates feeding it ARE hardened (G6), but the dispatch table itself has a predictable shape.
+3. **`--profile io` build time** — ~100-180s per build (full Phase G + Phase H + Phase iO pipeline). The ML test at N=40 takes ~48min. Use `--no-native-vm` or a smaller N for CI.
+
+---
 
 ---
 
@@ -21,7 +66,8 @@ for the strongest protection.
 | **Phase 4: Anti-meta debranding** (`--anti-meta`) | ALL output strings | `grep -ic bedrock` = 0 |
 | **Phase 5: Native VM** (`--native-vm`) | VM-eligible subset only | 16/16 harness + real-world (see Verification gates — `_c_interp_test` / `_integration_test` need an isolated `_xvm` build on `PYTHONPATH`) |
 | **Phase H: Esoteric** (11 passes) | ALL functions | `_phase_h_test.py` 11 individual + combined-9 |
-| **Phase iO: Practical iO** (`--profile io`) | ALL | `_io_distinguish_test.py` 27/27 (N=20, chi-square gate), `_io_adversarial_ml.py` 5/5 (ML accuracy 40% < chance 50%) |
+| **Phase iO: Practical iO** (`--profile io`) | ALL | `_io_distinguish_test.py` 27/27 (N=20, chi-square gate), `_io_adversarial_ml.py` 3 experiments (PRG-uniformity + iO-property + build-diversity) |
+| **Phase G: deobf-hardening** (G1-G9 + G1+) | capsule + non-capsule | 6 module smoke tests PASS (capsule/fss/opaque/pointfunc/build_rng/io_ml); 3 recovery attacks FAIL (cand-mark, capsule key, DPF reconstruct) |
 
 The core obfuscation (Phases 1-4) protects **every function** — capsule
 runtime, encrypted const pool, HMAC chain, debug poison, metamorphic
@@ -57,27 +103,39 @@ python "bedrock_obfuscator.py" -f input.py -o output.py \
     --profile balanced --anti-meta --adv-requests off
 ```
 
-### Full stack (env-keyed, chained, metamorphic)
+### Full stack (chained, metamorphic) — env-key is now the DEFAULT
 ```
 python "bedrock_obfuscator.py" -f input.py -o output.py \
-    --profile extreme --native-vm --anti-meta --chain --env-key \
+    --profile extreme --native-vm --anti-meta --chain \
     --metamorphic --debug-poison --adv-requests off
 ```
-⚠ `--env-key` ties output to the building machine's hardware fingerprint.
-Test on the TARGET machine, not just the build machine.
+NOTE: since Phase G9, `--env-key` is the DEFAULT for non-capsule profiles
+(fast/balanced/paranoid/extreme). The payload key is derived from the
+building machine's hardware fingerprint (machine-id + MAC + node + arch,
+SHA-256'd), NOT the reversible cand/mark digest. Output now runs ONLY on
+the building machine. Pass `--no-env-key` to opt back into the legacy
+reversible cand/mark path (a warning is printed — NOT recommended). The
+explicit `--env-key` flag is retained for clarity but is a no-op now.
 
-### iO profile (Practical Indistinguishability Obfuscation)
+⚠ env-key ties output to the building machine's hardware fingerprint.
+Test on the TARGET machine, not just the build machine. A wrong
+fingerprint produces silent garbage decrypt (by design).
+
+### io profile (encrypted-source capsule + Phase G + Phase H)
 ```
 python "bedrock_obfuscator.py" -f input.py -o output.py \
     --profile io --anti-vm off --anti-debug off --no-debug-poison \
     --no-metamorphic --no-native-vm --no-cache --overwrite \
     --adv-requests off --no-anti-timing --quiet
 ```
-The `io` profile layers all of `extreme` + Phase H esoteric (11 passes) +
-Phase iO extensions (FSS, crypto opaque, pointfunc, lookup, entropy pad,
-**binary capsule**). The binary capsule encrypts the entire source, achieving
-statistical indistinguishability from random data (chi-square 501 ≈ random
-baseline 510, ML classifier accuracy 40% < chance 50%).
+The `io` profile layers all of `extreme` + **Phase G deobf-hardening
+(G1-G9 + G1+)** + Phase H esoteric (11 passes) + the 7 capsule phases
+(iO-1..iO-7: FSS, crypto opaque, pointfunc, lookup, entropy pad, binary
+capsule). The binary capsule encrypts the entire source, achieving
+encrypted-output uniformity (chi-square 501 ≈ random baseline 510; the
+ML PRG-uniformity accuracy is no longer a single 40% number — Phase G8
+rewrote the test to report 3 experiments with Wilson 95% CIs and
+feature-importance breakdowns; see the table below).
 
 Sandbox-safe flags (`--anti-vm off`, `--anti-debug off`) are required in
 CI/sandbox. In production, remove them to enable the full anti-VM/anti-debug
@@ -177,14 +235,34 @@ reference interpreter ships (73x slower but functional).
    functions on 3.12+ (adaptive interpreter opcodes). Skip-on-unknown
    is safe (fallback). Test on the target Python version before deploy.
 
-5. **`--env-key` machine binding** — output runs only on machines with
-   matching hardware fingerprint. Test on the TARGET machine. A wrong
-   fingerprint → silent garbage decrypt (by design).
+5. **`--env-key` machine binding (DEFAULT since G9)** — output runs
+   only on machines with a matching hardware fingerprint
+   (machine-id + MAC + node + arch, SHA-256'd). Test on the TARGET
+   machine. A wrong fingerprint → silent garbage decrypt (by design).
+   Pass `--no-env-key` to opt back into the reversible cand/mark path
+   (a warning is printed — NOT recommended).
 
 6. **Per-build RNG** — every build produces different bytecode + perm +
    key. Outputs are never byte-identical across builds. This is by
    design (anti-fingerprinting); regression tests compare behavior, not
    bytes.
+
+7. **M4 (deferred Phase G finding)** — Vietnamese identifiers
+   (`AnhOiDungCoDec`, `DitMeMayDungCoDec`, `ConCac`, `__tunnel`,
+   `__getobject__`) + sentinel debrand are not yet randomized. Blocked
+   by a `Compile.ll` encoding constraint in the native-VM build path.
+   Non-Vietnamese debrand (bedrock/baobg) IS randomized (G2).
+
+8. **CFF dispatch signature (L3)** — control-flow flattening
+   dispatch-table structure is not yet randomized. The opaque
+   predicates feeding it ARE hardened (G6, structural mix), but the
+   dispatch table itself has a predictable shape — a structural
+   signature is still detectable by a determined analyst.
+
+9. **`--profile io` build time** — ~100-180s per build (full Phase G
+   + Phase H + Phase iO pipeline). The ML adversarial test at N=40
+   takes ~48min. Use `--no-native-vm` or a smaller N (BR_ML_N=8) for
+   CI. This is a build-cost property, not a security gap.
 
 ---
 
@@ -254,9 +332,11 @@ isolated smoke `add(3,4)=7` through a v2 blob confirms the C path.
 - [ ] Run `_phase5_harness.py` → 16/16 ALL PASS (harness builds its own `_xvm`)
 - [ ] Run `_c_interp_test.py` + `_integration_test.py` with an isolated `_xvm` on `PYTHONPATH` (see Verification gates)
 - [ ] Run real-world test on YOUR code → output matches baseline
-- [ ] If `--env-key`: test on the TARGET machine (not build machine)
+- [ ] Run Phase G smoke tests (all 6 modules, ~30s): `python bedrock_native/_binary_capsule.py`, `bedrock_native/_fss.py`, `bedrock_native/_opaque_crypto.py`, `bedrock_native/_pointfunc_obf.py`, `bedrock_native/_build_rng.py`, `bedrock_native/_io_adversarial_ml.py` (the last at `BR_ML_N=8` for speed)
+- [ ] Run the Phase G grep gate: `grep -c "bedrock\|baobg\|_LCAN_\|_MARK_\|_SLOT_\|import zlib, hashlib\|exec(zlib.decompressobj"` on output dir = 0
+- [ ] env-key is the DEFAULT (since G9): test on the TARGET machine (not build machine). A wrong fingerprint → silent garbage decrypt. Pass `--no-env-key` only if you accept the reversible cand/mark path (warning printed).
+- [ ] For the `io` profile: capture the capsule key sidecar (`<output>.key`, 0600) and set `BR_CAPSULE_KEY` at runtime. If DPF triggers (point-function equality), also capture `<output>.dpfkey` and set `BR_DPF_K1`.
 - [ ] If no C compiler: verify reference fallback runs (73x slower)
-- [ ] Check `grep -ic bedrock` on output dir = 0 (with `--anti-meta`)
 - [ ] Benchmark hot functions — if >10k calls/sec, don't VM-compile them
 - [ ] Ship: `out.py` + `_xvm*.pyd` (or `_bedrock_vm_ref.py`) in same dir
 
@@ -264,13 +344,18 @@ isolated smoke `add(3,4)=7` through a v2 blob confirms the C path.
 
 ## TL;DR
 
-**Safe to deploy** with `--profile extreme --native-vm --anti-meta --adv-requests off`.
-Core obfuscation (Phases 1-4) protects ALL code. VM (Phase 5) adds stronger
+**Safe to deploy** with `--profile extreme --native-vm --anti-meta --adv-requests off`
+(env-key is now the default — output runs only on the building machine). Core
+obfuscation (Phases 1-4) protects ALL code. VM (Phase 5) adds stronger
 protection for the subset it can compile; the rest falls back safely. The
 most dangerous failure mode (silent wrong output from try/except) is
 prevented by exception-table detection.
 
 **For maximum protection** (nation-state threat model, no perf constraint),
-use `--profile io` with sandbox-safe flags. The binary capsule (iO-7) makes
-the output statistically indistinguishable from random data. Test on YOUR
-code + YOUR platform before shipping.
+use `--profile io` (layers Phase G deobf-hardening G1-G9+G1+ + Phase H + the
+encrypted-source capsule). The binary capsule encrypts the entire source; the
+key is NOT shipped (read from `BR_CAPSULE_KEY` at runtime). The output's byte
+distribution approaches uniform. Honest caveat: this is encrypted-output
+uniformity (a PRG property), NOT the cryptographic iO property. Test on YOUR
+code + YOUR platform before shipping. See `bedrock_native/IO_SPEC.md` for the
+full threat model and the remaining deobf gaps (M4, CFF dispatch).
