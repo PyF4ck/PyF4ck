@@ -598,12 +598,18 @@ anti-VM/anti-debug stack.
 
 2. **Bootstrap structural bytes**: The ~10-line bootstrap has structural
    bytes (Python keywords, import statements) that create a small signature.
-   This is <0.1% of the file and doesn't affect the chi-square gate, but a
-   dedicated adversary can fingerprint the bootstrap pattern with a regex
-   (`import zlib, hashlib` + `exec(zlib.decompress`) at 100% accuracy. The
-   rewritten `_io_adversarial_ml.py` (Phase D) uses byte-pair features that
-   CAN pick this up; the strict gate now sometimes fails at small N as a
-   result - which is correct.
+   This is <0.1% of the file and doesn't affect the chi-square gate.
+   HISTORICALLY (through Phase D) a dedicated adversary could fingerprint
+   the bootstrap pattern with a single regex (`import zlib, hashlib` +
+   `exec(zlib.decompress`) at 100% accuracy. Phase G1+ closes this: `zlib`
+   is now always aliased to a per-build random token (never bare), and the
+   import-line + exec-call + XOR-expression shapes are randomized across
+   4 / 3 / 2 forms per build, so no single regex matches every io file.
+   The rewritten `_io_adversarial_ml.py` (Phase D, extended in G8) uses
+   byte-pair + scalar features that CAN still pick up residual substrings
+   (`bytes.fromhex`, `b85decode`, `__import__`); the bootstrap-regex-count
+   feature now varies across builds, making the build-diversity experiment
+   (G8 exp 3) more informative.
 
 3. **Build-time RNG (CORRECTED in Phase C.2)**: The per-build RNG seed
    determines the capsule key, pad bytes, and name choices. Two builds with

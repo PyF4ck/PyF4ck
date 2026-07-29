@@ -326,10 +326,17 @@ def _random_var_map(rng) -> dict:
     This destroys the offset-0 family fingerprint: no two io builds share
     the same bootstrap variable names, so a one-regex detector for
     `import zlib, hashlib as _h` cannot match every io file.
+
+    Phase G1+: ``zlib`` is now aliased too (the legacy bootstrap left it
+    bare, which kept `import zlib, hashlib` and `zlib.decompressobj` as
+    100%-reliable structural tells). ``do``/``xa``/``xb`` back the
+    exec-shape and XOR-shape randomization in ``_build_bootstrap``.
     """
     return {
         'blob':   _random_token(rng, '_bd', 5),   # the encrypted blob
-        'hash':   _random_token(rng, '_hh', 5),   # hashlib alias
+        'hash':   _random_token(rng, '_hh', 5),   # hashlib alias (sha256)
+        'zlib':   _random_token(rng, '_zz', 5),   # zlib module alias (G1+)
+        'do':     _random_token(rng, '_dd', 5),   # decompressobj alias (G1+)
         'key':    _random_token(rng, '_kk', 5),   # the decryption key
         'stream': _random_token(rng, '_ss', 5),   # keystream bytearray
         'counter': _random_token(rng, '_cc', 5),  # counter
@@ -337,6 +344,8 @@ def _random_var_map(rng) -> dict:
         'os':     _random_token(rng, '_oo', 5),   # os alias (env mode)
         'envval': _random_token(rng, '_ee', 5),   # env value (env mode)
         'salt':   _random_token(rng, '_lt', 5),   # per-build salt
+        'xa':     _random_token(rng, '_xa', 4),   # xor loop var a (zip form)
+        'xb':     _random_token(rng, '_xb', 4),   # xor loop var b (zip form)
     }
 
 
@@ -430,19 +439,72 @@ def _build_bootstrap(enc_blob: bytes, *, embed_key: bool = False,
     # Derived integrity flag (no literal `__BR_INTEGRITY_OFF__` in source).
     integ = _integrity_flag_expr()
 
+    # Phase G1+: randomize the import-line STRUCTURE so no single regex
+    # matches every io build. The legacy `import zlib, hashlib as _h` was a
+    # 100%-reliable tell: zlib was bare (only the hashlib *suffix* varied).
+    # Now zlib is aliased too, AND the import statement shape varies across
+    # 4 forms. Form 3 hides the module names entirely via hex-decoded
+    # __import__ so even `import zlib` / `'zlib'` literals don't match.
+    z = v['zlib'].encode()    # zlib module alias (never bare `zlib` in body)
+    h = v['hash'].encode()    # hashlib alias (sha256)
+    import_form = rng.randint(0, 3) if hasattr(rng, 'randint') else 0
+    if import_form == 0:
+        import_line = b'import zlib as ' + z + b', hashlib as ' + h + b'\n'
+    elif import_form == 1:
+        import_line = b'import zlib as ' + z + b'; import hashlib as ' + h + b'\n'
+    elif import_form == 2:
+        import_line = b'import hashlib as ' + h + b'; import zlib as ' + z + b'\n'
+    else:
+        # import-less: hide module names via hex-decoded __import__.
+        # 'zlib' -> 7a6c6962, 'hashlib' -> 686173686c6962
+        import_line = (z + b" = __import__(bytes.fromhex('7a6c6962').decode()); "
+                       + h + b" = __import__(bytes.fromhex('686173686c6962').decode())\n")
+
+    # Phase G1+: randomize the exec/decompress call shape so the constant
+    # `exec(zlib.decompressobj().decompress(` tell is gone. zlib is now
+    # aliased (z), so `zlib.decompressobj` never appears; the call shape
+    # varies across 3 forms.
+    decompress_form = rng.randint(0, 2) if hasattr(rng, 'randint') else 0
+    if decompress_form == 0:
+        decompress_setup = b''
+        decompress_call = z + b'.decompressobj().decompress(' + v['plain'].encode() + b')'
+    elif decompress_form == 1:
+        # alias the unbound method, call through the alias
+        decompress_setup = v['do'].encode() + b' = ' + z + b'.decompressobj\n'
+        decompress_call = v['do'].encode() + b'().decompress(' + v['plain'].encode() + b')'
+    else:
+        # alias the instance, call .decompress on it
+        decompress_setup = v['do'].encode() + b' = ' + z + b'.decompressobj()\n'
+        decompress_call = v['do'].encode() + b'.decompress(' + v['plain'].encode() + b')'
+
+    # Phase G1+: randomize the XOR/plain expression shape so the constant
+    # `int.from_bytes(...).to_bytes(...)` tell varies. Both forms produce
+    # identical plaintext (blob XOR keystream-prefix).
+    xor_form = rng.randint(0, 1) if hasattr(rng, 'randint') else 0
+    if xor_form == 0:
+        plain_expr = (b'(int.from_bytes(' + v['blob'].encode() + b", 'big') ^ int.from_bytes("
+                      + v['stream'].encode() + b'[:len(' + v['blob'].encode() + b")], 'big')).to_bytes(len("
+                      + v['blob'].encode() + b"), 'big')")
+    else:
+        # zip-based XOR: bytes(a ^ b for a, b in zip(blob, stream[:len(blob)]))
+        xa = v['xa'].encode()
+        xb = v['xb'].encode()
+        plain_expr = (b'bytes(' + xa + b' ^ ' + xb + b' for ' + xa + b', ' + xb
+                      + b' in zip(' + v['blob'].encode() + b', ' + v['stream'].encode()
+                      + b'[:len(' + v['blob'].encode() + b')]))')
+
     bootstrap = (
         b'# -*- coding: latin-1 -*-\n'
-        b'import zlib, hashlib as ' + v['hash'].encode() + b'\n'
-        + v['blob'].encode() + b' = ' + blob_literal + b'\n'
+        + import_line +
+        v['blob'].encode() + b' = ' + blob_literal + b'\n'
         + key_line +
         v['stream'].encode() + b' = bytearray()\n'
         + v['counter'].encode() + b' = 0\n'
         b'while len(' + v['stream'].encode() + b') < len(' + v['blob'].encode() + b'):\n'
         b'    ' + v['stream'].encode() + b'.extend(' + ks_expr + b'); ' + v['counter'].encode() + b' += 1\n'
-        + v['plain'].encode() + b' = (int.from_bytes(' + v['blob'].encode() + b", 'big') ^ int.from_bytes("
-        + v['stream'].encode() + b'[:len(' + v['blob'].encode() + b")], 'big')).to_bytes(len("
-        + v['blob'].encode() + b"), 'big')\n"
-        b'exec(zlib.decompressobj().decompress(' + v['plain'].encode() + b"), {'__name__': '__main__', '__file__': __file__, "
+        + v['plain'].encode() + b' = ' + plain_expr + b'\n'
+        + decompress_setup +
+        b'exec(' + decompress_call + b", {'__name__': '__main__', '__file__': __file__, "
         + integ + b": True})\n"
     )
     return bootstrap
@@ -761,15 +823,54 @@ def _smoke() -> None:
     capsule_b2 = apply_binary_capsule(source, ctx_b2, embed_key=True)
     assert capsule != capsule_b2, \
         "Phase G1: different seeds must produce different bootstraps (randomized skeleton)"
-    # The legacy constant tell line must be GONE (var name randomized).
-    assert b'import zlib, hashlib as _h\n' not in capsule, \
-        "Phase G1: legacy `import zlib, hashlib as _h` constant tell must be gone"
-    assert b'import zlib, hashlib as _h\n' not in capsule_b2, \
-        "Phase G1: legacy constant tell must be gone in build 2 too"
+    # Phase G1+: the constant STRUCTURAL tells must be GONE, not just the
+    # `_h` suffix. The legacy bootstrap had two 100%-reliable fingerprints
+    # (found by attacker analysis of the released challenge):
+    #   (1) `import zlib, hashlib`  -- combined import, zlib bare
+    #   (2) `exec(zlib.decompressobj().decompress(` -- zlib bare in exec
+    # Both must be absent: zlib is now aliased AND the line shapes vary.
+    assert b'import zlib, hashlib' not in capsule, \
+        "Phase G1+: legacy `import zlib, hashlib` combined tell must be gone"
+    assert b'exec(zlib.decompressobj' not in capsule, \
+        "Phase G1+: legacy `exec(zlib.decompressobj` tell must be gone (zlib aliased)"
+    assert b'import zlib, hashlib' not in capsule_b2, \
+        "Phase G1+: legacy combined tell must be gone in build 2 too"
+    assert b'exec(zlib.decompressobj' not in capsule_b2, \
+        "Phase G1+: legacy exec tell must be gone in build 2 too"
+    # `zlib` as a bare module reference (`zlib.` attribute access) must NOT
+    # appear in the body -- it is always aliased to a random token.
+    assert b'zlib.' not in capsule, \
+        "Phase G1+: bare `zlib.` attribute access must be gone (always aliased)"
     # The literal `__BR_INTEGRITY_OFF__` must be GONE (now derived via chr()).
     assert b"__BR_INTEGRITY_OFF__" not in capsule, \
         "Phase G1: `__BR_INTEGRITY_OFF__` literal must be gone (now derived via chr())"
-    print("capsule G1: per-build skeleton randomized (no constant tell line, no integrity flag literal)  OK")
+    print("capsule G1: per-build skeleton randomized (no structural tell, no integrity flag literal)  OK")
+
+    # --- Phase G1+: structural shape diversity across builds ---
+    # Across 16 builds, the import-line SHAPE and the xor-expression SHAPE
+    # must vary (not all builds use the same form). This is what defeats a
+    # signature detector: there is no single regex matching every io file.
+    import_forms, xor_forms = set(), set()
+    for s in (1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14, 15, 16, 17, 18):
+        c = _Ctx()
+        c.capsule_seed = s
+        cap = apply_binary_capsule(source, c, embed_key=True)
+        if b"__import__(bytes.fromhex" in cap:
+            import_forms.add("importless")
+        elif b"; import hashlib" in cap:
+            import_forms.add("split-zlib-first")
+        elif b"; import zlib" in cap:
+            import_forms.add("split-hashlib-first")
+        elif b"import zlib as" in cap:
+            import_forms.add("combined-aliased")
+        if b"int.from_bytes(" in cap and b".to_bytes(len(" in cap:
+            xor_forms.add("int-arith")
+        if b" in zip(" in cap and b" ^ " in cap:
+            xor_forms.add("zip-gen")
+    assert len(import_forms) > 1,         f"Phase G1+: import shapes must vary across builds, got {import_forms}"
+    assert len(xor_forms) > 1,         f"Phase G1+: xor shapes must vary across builds, got {xor_forms}"
+    print(f"capsule G1+: structural diversity seen "
+          f"(import={sorted(import_forms)}, xor={sorted(xor_forms)})  OK")
 
     # --- Phase G1: padding closes the length channel ---
     # Two builds of DIFFERENT-sized sources whose compressed sizes both fall
