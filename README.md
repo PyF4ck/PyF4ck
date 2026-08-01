@@ -46,6 +46,11 @@ BR_CAPSULE_KEY=$(cat obf.py.key) python obf.py
 # 3. Verify the encrypted-output uniformity test (PRG + iO-property, ~30 min)
 python bedrock_native/_io_distinguish_test.py
 BR_ML_N=40 python bedrock_native/_io_adversarial_ml.py
+
+# 4. Prefer a guided UI? `tui.py` is an interactive picker (Vietnamese) for
+#    non-experts: pick a profile + anti-AI / anti-meta options, it builds and
+#    runs the file for you. No flags to memorize.
+python tui.py
 ```
 
 > **What these tests measure.** `_io_distinguish_test.py` measures
@@ -348,6 +353,11 @@ bedrock_native/
                                "iO" terminology correction + limitations.
   VM_SPEC.md                   BedrockVM spec
   KEY_RELEASE_SPEC.md          Phase G key release spec
+
+tui.py                         Interactive TUI (Vietnamese) for non-experts.
+                               Pick a profile + anti-AI / anti-meta options via
+                               a guided menu; it builds and runs the file. Uses
+                               rich + prompt_toolkit (no flags to memorize).
 
 PRODUCTION_READINESS.md        Production readiness report
 bedrock_spec.html              Full interactive spec (93 KB)
