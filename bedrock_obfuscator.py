@@ -5469,6 +5469,22 @@ except Exception:
                                           'serialized (any repr-safe) shares. Phase iO-2 '
                                           'extends the original H.9 (2-share additive int) to '
                                           'bool + serialized + n-share + all-eligible. Default off.')
+            # H.A Anti-AI deobfuscation.
+            self.parser.add_argument('--h-anti-ai', dest='h_anti_ai',
+                                     action=argparse.BooleanOptionalAction, default=None,
+                                     help='[Phase H.A] Anti-AI deobfuscation: decoys + token-disruption '
+                                          '+ prompt-injection + context-overflow targeting LLM/ML/'
+                                          'AI-symbolic analysis. Behavior-preserving. Grounded in the '
+                                          'Acoda paper (arXiv:2606.11755, 70% ASR cross-model). '
+                                          'Default off (extreme/io auto-on). Caveat: causes aligned '
+                                          'LLMs to REFUSE/TRUNCATE analysis — do not use --h-anti-ai '
+                                          'output with your own LLM maintenance tooling.')
+            self.parser.add_argument('--anti-ai-count', dest='anti_ai_count', type=int, default=0,
+                                     help='[Phase H.A] Number of decoy functions to inject (B1 lost-in-'
+                                          'middle burial). 0 = profile default (balanced=200, '
+                                          'extreme/io=80 to avoid build timeout on heavy profiles). '
+                                          'Higher = stronger context-overflow but slower build + '
+                                          'larger file. Default 0.')
             # Phase iO-2: FSS extensions
             self.parser.add_argument('--fss-mode', dest='fss_mode', default='auto',
                                      choices=['auto', 'additive', 'additive_n', 'bool', 'serialized'],
@@ -5751,6 +5767,7 @@ except Exception:
             ('h_branchless', True), ('h_bloom', True),
             ('h_dag_cff', True), ('h_selfcheck_cf', True),
             ('h_fss', True),
+            ('h_anti_ai', True),  # Phase H.A: anti-AI deobfuscation
         ):
             # Honour explicit --no-<flag> CLI disables. Previously this block
             # only checked `getattr(args, attr, False)`, which is False after
@@ -6573,7 +6590,8 @@ except Exception:
         if any(getattr(args, _h, False) for _h in (
                 'h_id_poison', 'h_acoda', 'h_metamorphic', 'h_branchless',
                 'h_bloom', 'h_dag_cff', 'h_selfcheck_cf', 'h_fss',
-                'h_pointfunc', 'h_lookup', 'h_crypto_opaque')):
+                'h_pointfunc', 'h_lookup', 'h_crypto_opaque',
+                'h_anti_ai')):
             try:
                 import importlib as _h_imp
                 import os as _h_os, sys as _h_sys
@@ -6598,7 +6616,7 @@ except Exception:
                 for _h_mod in ('_identifier_poison', '_acoda', '_metamorphic',
                                '_branchless', '_bloom_obf', '_dag_cff',
                                '_selfcheck_cf', '_fss', '_opaque_crypto',
-                               '_pointfunc_obf', '_lookup_obf'):
+                               '_pointfunc_obf', '_lookup_obf', '_anti_ai'):
                     try:
                         _h_modules[_h_mod] = _h_imp.import_module(_h_mod)
                     except Exception as _e:
@@ -6622,6 +6640,18 @@ except Exception:
                         _build_ctx.dpf_key_split = (_dpf_split_arg == 'env')
                         _build_ctx.dpf_key_env = str(
                             getattr(args, 'dpf_key_env', 'BR_DPF_K1') or 'BR_DPF_K1')
+                    except Exception:
+                        pass
+                    # Phase H.A: thread anti-ai decoy count into ctx. If the
+                    # user set --anti-ai-count > 0, honor it; else scale by
+                    # profile (balanced=200 for max burial; extreme/io=80 to
+                    # avoid build timeout on the heavy Phase G+H+iO pipeline).
+                    try:
+                        _aa_cnt = int(getattr(args, 'anti_ai_count', 0) or 0)
+                        if _aa_cnt <= 0:
+                            _aa_p = str(getattr(args, 'profile', 'balanced') or 'balanced')
+                            _aa_cnt = 80 if _aa_p in ('extreme', 'io', 'paranoid') else 200
+                        _build_ctx.anti_ai_count = _aa_cnt
                     except Exception:
                         pass
                     # H passes inject module-level + function-level names
@@ -6648,6 +6678,11 @@ except Exception:
                             '_br_lt_raw', '_br_lt_h', '_br_lt_ast',
                             # Phase iO-5: lookup-table evaluator names
                             '_br_pad',  # Phase iO-6: entropy pad dummy var
+                            # Phase H.A: anti-AI weave sentinels (so obf_vars
+                            # doesn't rename _br_ai_weave_seed before the
+                            # anti-AI AST pass can register its own decoy names)
+                            '_br_ai_weave_seed', '_br_ai_weave_step_a',
+                            '_br_ai_weave_step_b', '_br_ai_weave_consume',
                         })
                         _build_ctx.keep_names = _kn
                     except Exception:
@@ -6697,6 +6732,16 @@ except Exception:
                     # Gated on --h-lookup (auto-on for io).
                     ('h_lookup', 'h_lookup', '_lookup_obf',
                      'apply_lookup_obf', 'before'),
+                    # Phase H.A: anti-AI deobfuscation (decoys + homoglyph
+                    # twins + long-range weaving). Runs 'after' obf_vars so
+                    # injected decoy strings are encrypted by the later
+                    # obf_strings pass; decoy names self-register into
+                    # ctx.keep_names (see _anti_ai.apply_anti_ai). The
+                    # plaintext AI payloads (prompt-injection, EOS, safety
+                    # vocab) are emitted by a SEPARATE source-level hook
+                    # after h_style (post-unparse, plaintext).
+                    ('h_anti_ai', 'h_anti_ai', '_anti_ai',
+                     'apply_anti_ai'),
                 ]
                 for _h_spec in _h_pass_specs:
                     _h_label, _h_flag, _h_mod_name, _h_fn_name = _h_spec[:4]
@@ -6926,6 +6971,43 @@ except Exception:
                     report.record_pass('plugins:post_compile', int((time.perf_counter() - _hook_t0) * 1000), status='ok')
             except Exception as _e:
                 _pass_failed('plugins:post_compile', _e)
+        # Phase H.A: anti-AI deobfuscation — SOURCE-LEVEL pass (post-compile).
+        # The AST pass (apply_anti_ai) ran earlier in the pipeline; this second
+        # stage emits the PLAINTEXT AI-targeting payloads (prompt-injection
+        # comments, EOS-token blocks, vulnerability decoys, zero-width/bidi
+        # padding, safety-trigger vocabulary, false-comment counter-narrative)
+        # AFTER the operations loop (which includes Compile.Obfuscate, whose
+        # compile() would otherwise strip comments). Runs here so an LLM
+        # reading the SOURCE TEXT encounters the payloads. All payloads are
+        # comments or constant-false-guarded dead literals -> never execute ->
+        # behavior-preserving. The subsequent _refresh_native_integrity re-patches
+        # the file hash automatically. For capsule profiles (io) these comments
+        # get encrypted into the capsule (LLM must decrypt first to see them);
+        # the AST decoys survive in the encrypted source regardless.
+        if getattr(args, "h_anti_ai", False) and _build_ctx is not None \
+                and not getattr(args, 'transpile', False):
+            try:
+                import importlib as _aa_imp
+                import os as _aa_os, sys as _aa_sys
+                _aa_here = _aa_os.path.dirname(_aa_os.path.abspath(
+                    globals().get("__file__", "") or __file__))
+                _aa_mod = None
+                for _cand in (_aa_os.path.join(_aa_here, "bedrock_native"),
+                              _aa_os.path.join(_aa_os.getcwd(), "bedrock_native"),
+                              _aa_here, _aa_os.getcwd()):
+                    if _cand and _aa_os.path.isdir(_cand) and \
+                            _aa_os.path.isfile(_aa_os.path.join(_cand, "_anti_ai.py")):
+                        if _cand not in _aa_sys.path:
+                            _aa_sys.path.insert(0, _cand)
+                        _aa_mod = _aa_imp.import_module("_anti_ai")
+                        break
+                if _aa_mod is not None:
+                    _build_ctx.build_rng = getattr(args, "_rng", None)
+                    _aa_src = output if isinstance(output, str) else \
+                        output.decode('latin-1', errors='replace')
+                    output = _aa_mod.apply_anti_ai_source(_aa_src, _build_ctx)
+            except Exception as _e:
+                _pass_failed("h_anti_ai_source", _e)
         # Re-patch __H_FILE_HASH__ if post-compile plugin hooks mutated the
         # output (the wrapper / wrappers ran pre-compile above, so the hash is
         # already correct by default; this only fires when a plugin touched it).
