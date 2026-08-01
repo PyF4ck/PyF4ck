@@ -52,6 +52,39 @@ blocked by a `Compile.ll` encoding constraint).
 2. **CFF dispatch signature (L3)** — control-flow flattening dispatch-table structure is not yet randomized. The opaque predicates feeding it ARE hardened (G6), but the dispatch table itself has a predictable shape.
 3. **`--profile io` build time** — ~100-180s per build (full Phase G + Phase H + Phase iO pipeline). The ML test at N=40 takes ~48min. Use `--no-native-vm` or a smaller N for CI.
 
+### Phase H.A: Anti-AI deobfuscation (LLM / ML / AI-symbolic)
+
+A defense pass against AI-assisted deobfuscation — the AI equivalent of the
+existing anti-debug (against humans) and anti-RE (against static tools).
+Makes obfuscated output resistant to three classes of AI analysis: LLM-
+semantic (refusal via prompt-injection comments, EOS-tokens, vulnerability
+decoys, safety-trigger vocab), LLM-attention + tokenization (lost-in-middle
+burial via 200 decoy functions, homoglyph identifier twins, zero-width/bidi
+token fragmentation), and AI-symbolic + context exhaustion (long-range
+dependency weaving, token-budget padding, false-comment counter-narrative).
+
+Grounded in published research: Acoda (arXiv:2606.11755, ICSE 2026, 70% ASR
+cross-model on GPT-4o/DeepSeek/Qwen/Llama/Gemma), Lost in the Middle
+(arXiv:2307.03172), Trojan Source (CVE-2021-42574), Bad Characters
+(arXiv:2106.09898), and "semantic displacement" (arXiv:2606.31725).
+
+Two-stage pass: `apply_anti_ai` (AST, 'after' obf_vars) injects decoys +
+homoglyph twins + weave network; `apply_anti_ai_source` (post-compile
+source pass, after `Compile.Obfuscate` so comments survive) injects
+prompt-injection comments + EOS-tokens + vuln decoys + zero-width/bidi +
+safety-trigger vocab + false-comments. All payloads are comments or
+constant-false-guarded dead literals, behavior-preserving. Auto-on for
+`extreme`/`io`. CLI: `--h-anti-ai`, `--anti-ai-count N` (200 balanced /
+80 extreme-io). Smoke test: `python bedrock_native/_anti_ai.py` (round-trip
++ 10 heuristics). Verified on balanced + extreme builds (behavioral gate
+PASS, heuristics present, `--no-h-anti-ai` clean).
+
+**Honest caveat:** causes aligned LLMs to REFUSE/TRUNCATE analysis (that
+is its goal). Do NOT use `--h-anti-ai` output with your own LLM-assisted
+maintenance tooling. Verified by heuristic checks only (no ML/LLM test
+harness; the existing `_io_adversarial_ml.py` measures byte-uniformity,
+not AI-deobf resistance).
+
 ---
 
 ---

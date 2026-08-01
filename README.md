@@ -120,6 +120,7 @@ and verified by the behavioral gate (`fib(10)=55`, `final_result: 221`).
 | 7 | Hardening (env-key default, adv-requests) | ALL | `--env-key` (DEFAULT since G9), `--adv-requests` |
 | G | Key release + TPM attestation | license-bound | `_key_release.py` (TPM is a placeholder) |
 | H | Esoteric (11 passes) | ALL functions | `_identifier_poison.py` … `_exc_table_vm.c` |
+| **H.A** | **Anti-AI deobfuscation: decoys + homoglyph twins + prompt-injection + EOS-tokens + zero-width/bidi + safety-trigger vocab + long-range weaving** | **ALL** | **`_anti_ai.py`** |
 | **G** | **Deobf-hardening (G1-G9 + G1+): hex/base85 blob, anti-meta default, num_obf 4-form, capsule key delivery, DPF split, opaque structural mix, DPF PRG/domain, ML test features, env-key default** | **capsule + non-capsule** | **`_binary_capsule.py`, `_fss.py`, `_opaque_crypto.py`, `_pointfunc_obf.py`, `_io_adversarial_ml.py`** |
 | **io** | **Encrypted-source capsule + value secret sharing + opaque predicates** | **ALL** | **`_fss.py` (value secret sharing, NOT BGI FSS), `_opaque_crypto.py`, `_pointfunc_obf.py`, `_lookup_obf.py`, `_entropy_pad.py`, `_binary_capsule.py`** |
 
@@ -151,6 +152,61 @@ reconstruct FAILS (G5); bootstrap signature regex GONE (G1+).
 **Remaining deobf gaps (honest):** M4 (Vietnamese-identifier + sentinel
 debrand, deferred — `Compile.ll` encoding constraint); CFF dispatch-table
 structure not yet randomized (L3 — opaque predicates feeding it ARE hardened).
+
+---
+
+## Phase H.A: Anti-AI deobfuscation (against LLM / ML / AI-symbolic analysis)
+
+A new defense pass against AI-assisted deobfuscation — the AI equivalent of
+the existing anti-debug (against humans) and anti-RE (against static tools).
+Makes obfuscated output resistant to **three classes of AI analysis**:
+
+| Threat class | Adversary | Defense |
+|--------------|-----------|---------|
+| **LLM-semantic** | GPT/Claude/Copilot fed the `.py` as text, asked to explain / recover logic | Prompt-injection comments, EOS-token blocks, vulnerability-decoys, safety-trigger vocabulary (→ refusal/truncation) |
+| **LLM-attention + tokenization** | Long-context burial, token-flooding | 200 decoy functions (lost-in-middle), homoglyph identifier twins, zero-width/bidi token fragmentation |
+| **AI-symbolic + context exhaustion** | AI-guided symbolic execution, context-window overflow | Long-range dependency weaving, token-budget padding, false-comment counter-narrative |
+
+**Grounded in published research:**
+- **Acoda** (arXiv:2606.11755, ICSE 2026): adversarial code obfuscation vs
+  LLM-based analysis — 70% attack-success-rate on GPT-4o/DeepSeek/Qwen/
+  Llama/Gemma with cross-model transferability. The most-selected Acoda
+  method is comment-layer prompt injection (triggers refusal *before*
+  analysis completes). 7 of 8 Acoda methods are AST-implementable.
+- **Lost in the Middle** (arXiv:2307.03172): U-shaped attention — relevant
+  info at ~50% of a long context is least attended, even for long-context
+  models. Decoy padding buries genuine logic in the low-recall middle.
+- **Trojan Source** (CVE-2021-42574): homoglyph + bidi control chars. Python
+  accepts confusable Unicode identifiers (PEP 3131); zero-width chars are
+  fine in strings/comments (PEP 672 rejects them only in identifiers).
+- **Bad Characters** (arXiv:2106.09898): invisible-char injection
+  "functionally breaks" NLP models with a few injections.
+- **"Do Machines Struggle Where Humans Do?"** (arXiv:2606.31725): adversarial
+  identifier renaming disrupts LLM comprehension via "semantic displacement".
+
+**Two-stage pass:**
+
+| Stage | Function | Runs | What it injects |
+|-------|----------|------|------------------|
+| **AST** | `apply_anti_ai(tree, ctx)` | 'after' obf_vars | 200 decoy `def`s (B1), homoglyph twins (B3), long-range weave network (C2) |
+| **Source** | `apply_anti_ai_source(code, ctx)` | post-compile (after `Compile.Obfuscate`, before integrity re-patch) | prompt-injection comments (A1), EOS-token block (A2), vuln decoys (A3), zero-width/bidi padding (B4), safety-trigger vocab (C1), token-budget header (C3), false-comment counter-narrative (C4) |
+
+The source pass runs **after** `Compile.Obfuscate` (whose `compile()` would
+otherwise strip comments) — mirroring the entropy-pad / binary-capsule
+post-compile hook position. All payloads are comments or constant-false-
+guarded dead literals → never execute → behavior-preserving.
+
+**CLI:** `--h-anti-ai` (auto-on for `extreme`/`io`), `--anti-ai-count N`
+(default 200 balanced / 80 extreme/io — tuned to avoid build timeout on the
+heavy Phase G+H+iO pipeline; higher = stronger burial but slower build).
+
+**Honest caveat:** This pass causes aligned LLMs to **REFUSE or TRUNCATE**
+analysis (that is its goal). Consequence: do NOT run your own LLM-assisted
+maintenance tooling on output built with `--h-anti-ai` — it will also
+refuse/mislead. Build without the flag when you need AI-assisted review of
+the output. Verified by heuristic checks only (no ML/LLM test harness — per
+scope decision; the existing `_io_adversarial_ml.py` measures byte-uniformity,
+not AI-deobf resistance).
 
 ---
 
@@ -229,6 +285,9 @@ python bedrock_native/_binary_capsule.py
 # Entropy pad smoke test (entropy + correctness + diversity, <1s)
 python bedrock_native/_entropy_pad.py
 
+# Anti-AI smoke test (round-trip + all 10 heuristics, <1s)
+python bedrock_native/_anti_ai.py
+
 # Individual capsule-phase smoke tests
 python bedrock_native/_fss.py
 python bedrock_native/_opaque_crypto.py
@@ -276,6 +335,12 @@ bedrock_native/
   _fss.py                      H.9: FSS 2-share
   _tls_callback.py             H.10: TLS callback injection
   _exc_table_vm.c              H.11: Exception-table VM
+  _anti_ai.py                  H.A: Anti-AI deobfuscation (decoys + homoglyph
+                               twins + prompt-injection + EOS-tokens + zero-width/
+                               bidi + safety-trigger vocab + long-range weaving).
+                               Two stages: AST pass (apply_anti_ai) + post-compile
+                               source pass (apply_anti_ai_source). Grounded in
+                               Acoda (arXiv:2606.11755, 70% ASR cross-model).
   _bedrock_vm.c                BedrockVM C interpreter
   _bedrock_vm_ref.py           BedrockVM reference interpreter (Python)
   ESOTERIC_SPEC.md             Phase H spec (11 passes)
