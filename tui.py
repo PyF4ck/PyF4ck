@@ -5,7 +5,7 @@ Giao diện dòng lệnh tương tác (TUI) giúp người không rành code v�
 
 Run:
     python tui.py
-    pip install rich prompt_toolkit   # nếu chưa có
+    pip install rich   # nếu chưa có
 """
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ import tempfile
 import time
 from pathlib import Path
 
-from prompt_toolkit.shortcuts import radiolist_dialog, checkboxlist_dialog, input_dialog, yes_no_dialog, message_dialog
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -61,10 +60,102 @@ OPTIONS = [
 ]
 
 
+# --- Simple stdlib-based input helpers (replaces prompt_toolkit) -----------
+
+def _prompt_choice(title: str, text: str, options: list[tuple[str, str]]) -> str | None:
+    """Hiển thị menu chọn 1 mục, trả về giá trị đã chọn hoặc None nếu hủy."""
+    console.print()
+    console.print(Panel(f"[bold]{title}[/bold]\n\n{text}", border_style="cyan"))
+    for i, (_, label) in enumerate(options, 1):
+        console.print(f"  [bold cyan]{i}[/bold cyan]. {label}")
+    console.print(f"  [dim]0. Hủy[/dim]")
+    console.print()
+
+    while True:
+        try:
+            raw = input("👉 Chọn (0-{}): ".format(len(options))).strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return None
+        if raw == "0" or raw.lower() in ("q", "quit", "hủy"):
+            return None
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                return options[idx][0]
+        except ValueError:
+            pass
+        console.print("[red]❌ Chọn số từ 0 đến {}[/red]".format(len(options)))
+
+
+def _prompt_checkbox(title: str, text: str, options: list[tuple[str, str, str]],
+                     defaults: list[str] | None = None) -> dict:
+    """Hiển thị menu chọn nhiều mục (tick/untick), trả về dict {key: bool}."""
+    defaults = defaults or []
+    state = {key: (key in defaults) for key, _, _ in options}
+
+    while True:
+        console.print()
+        console.print(Panel(f"[bold]{title}[/bold]\n\n{text}", border_style="cyan"))
+        for i, (key, label, _desc) in enumerate(options, 1):
+            mark = "[green]✅[/green]" if state[key] else "[dim]⬜[/dim]"
+            console.print(f"  {mark} [bold cyan]{i}[/bold cyan]. {label}")
+        console.print()
+        console.print(f"  [bold cyan]0[/bold cyan]. Xong ✓")
+        console.print()
+
+        try:
+            raw = input("👉 Chọn số để bật/tắt (0 để xác nhận): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return state
+
+        if raw == "0" or raw.lower() in ("q", "ok", "done", "xong"):
+            return state
+
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                key = options[idx][0]
+                state[key] = not state[key]
+                mark = "✅" if state[key] else "⬜"
+                console.print(f"  {mark} {options[idx][1]}")
+                continue
+        except ValueError:
+            pass
+        console.print("[red]❌ Chọn số từ 0 đến {}[/red]".format(len(options)))
+
+
+def _prompt_input(title: str, text: str) -> str | None:
+    """Hiển thị hộp nhập text, trả về giá trị hoặc None."""
+    console.print()
+    console.print(Panel(f"[bold]{title}[/bold]\n\n{text}", border_style="cyan"))
+    try:
+        raw = input("👉 ").strip().strip('"').strip("'")
+    except (EOFError, KeyboardInterrupt):
+        console.print()
+        return None
+    return raw if raw else None
+
+
+def _prompt_yesno(title: str, text: str) -> bool:
+    """Hỏi Yes/No, trả về True/False."""
+    console.print()
+    console.print(Panel(f"[bold]{title}[/bold]\n\n{text}", border_style="cyan"))
+    try:
+        raw = input("👉 (y/n): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        console.print()
+        return False
+    return raw in ("y", "yes", "có", "c")
+
+
+# --- Main flow steps -------------------------------------------------------
+
 def _banner():
     """Hiển thị banner chào mừng."""
     console.print()
-    console.print(Align.center(Text("🛡️  BEDROCK OBFUSCATOR", style="bold cyan", size=60)))
+    console.print(Align.center(Text("🛡️  BEDROCK OBFUSCATOR", style="bold cyan")))
     console.print(Align.center(Text("Công cụ bảo vệ code Python", style="dim")))
     console.print(Align.center(Text("— TUI cho người ít chuyên về code —", style="dim italic")))
     console.print()
@@ -72,26 +163,22 @@ def _banner():
 
 def _choose_source() -> str | None:
     """Bước 1: chọn nguồn code (paste hoặc file path)."""
-    choice = radiolist_dialog(
-        title="Bước 1: Chọn nguồn code",
-        text="Bạn muốn obfuscate code từ đâu?",
-        values=[
+    choice = _prompt_choice(
+        "Bước 1: Chọn nguồn code",
+        "Bạn muốn obfuscate code từ đâu?",
+        [
             ("paste", "✍️  Dán code trực tiếp"),
             ("file", "📂 Chọn file .py có sẵn"),
         ],
-    ).run()
+    )
 
     if choice is None:
         return None
 
     if choice == "file":
-        path = input_dialog(
-            title="Nhập đường dẫn file",
-            text="Đường dẫn đến file .py cần obfuscate:",
-        ).run()
+        path = _prompt_input("Nhập đường dẫn file", "Đường dẫn đến file .py cần obfuscate:")
         if not path:
             return None
-        path = path.strip().strip('"').strip("'")
         if not os.path.isfile(path):
             console.print(f"[red]❌ Không tìm thấy file: {path}[/red]")
             return None
@@ -105,7 +192,7 @@ def _choose_source() -> str | None:
     console.print()
     console.print(Panel(
         "[yellow]Dán code Python của bạn vào đây.[/yellow]\n"
-        "[dim]Nhấn Enter để xuống dòng, Ctrl+D (hoặc Esc hai lần) để kết thúc.[/dim]",
+        "[dim]Nhấn Enter để xuống dòng, gõ dòng trống để kết thúc.[/dim]",
         title="Dán code",
         border_style="yellow",
     ))
@@ -113,6 +200,8 @@ def _choose_source() -> str | None:
     try:
         while True:
             line = input()
+            if line == "" and lines:
+                break
             lines.append(line)
     except (EOFError, KeyboardInterrupt):
         pass
@@ -125,25 +214,21 @@ def _choose_source() -> str | None:
 
 def _choose_profile() -> str | None:
     """Bước 2: chọn mức bảo vệ."""
-    values = [(p[0], f"{p[1]}\n    {p[2]}") for p in PROFILES]
-    return radiolist_dialog(
-        title="Bước 2: Chọn mức bảo vệ",
-        text="Chọn mức độ obfuscation (dùng ↑↓ để chọn, Enter để xác nhận):",
-        values=values,
-    ).run()
+    return _prompt_choice(
+        "Bước 2: Chọn mức bảo vệ",
+        "Chọn mức độ obfuscation:",
+        [(p[0], f"{p[1]}  —  {p[2]}") for p in PROFILES],
+    )
 
 
 def _choose_options() -> dict:
     """Bước 3: chọn tùy chọn."""
-    values = [(o[0], f"{o[1]}\n    {o[2]}") for o in OPTIONS]
-    chosen = checkboxlist_dialog(
-        title="Bước 3: Tùy chọn bổ sung",
-        text="Chọn các tùy chọn (Space để tick, Enter để xác nhận):",
-        values=values,
-    ).run()
-    if chosen is None:
-        chosen = []
-    return {opt: (opt in chosen) for opt, _, _ in OPTIONS}
+    state = _prompt_checkbox(
+        "Bước 3: Tùy chọn bổ sung",
+        "Chọn số để bật/tắt, 0 để xác nhận:",
+        [(o[0], o[1], o[2]) for o in OPTIONS],
+    )
+    return state
 
 
 def _build(source: str, profile: str, options: dict) -> dict:
@@ -175,9 +260,13 @@ def _build(source: str, profile: str, options: dict) -> dict:
     else:
         cmd.append("--no-h-anti-ai")
 
-    # embed-key for io (so output runs without env var in this demo TUI)
+    # io profile: no-metamorphic only. NOTE: --embed-key is NOT added here
+    # — it ships the capsule key in the plaintext file (key = blob[:32]),
+    # making the capsule trivially statically recoverable (see the
+    # WALKTHROUGH.md "Layer 1" strip). The secure default emits the key to
+    # a <output>.key sidecar + reads it from BR_CAPSULE_KEY at runtime.
     if profile == "io":
-        cmd.extend(["--no-metamorphic", "--embed-key"])
+        cmd.append("--no-metamorphic")
 
     # io/extreme + anti-AI + anti-meta can take several minutes (io is the
     # heaviest profile — encrypted capsule + all passes + 200 decoys). 600s
@@ -326,10 +415,7 @@ def main():
 
         # Hỏi tiếp
         console.print()
-        again = yes_no_dialog(
-            title="Tiếp tục?",
-            text="Bạn muốn obfuscate file khác không?",
-        ).run()
+        again = _prompt_yesno("Tiếp tục?", "Bạn muốn obfuscate file khác không?")
         if not again:
             console.print()
             console.print(Align.center(Text("👋 Cảm ơn đã dùng Bedrock Obfuscator!", style="bold cyan")))

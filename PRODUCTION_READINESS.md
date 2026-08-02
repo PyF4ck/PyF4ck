@@ -85,6 +85,48 @@ maintenance tooling. Verified by heuristic checks only (no ML/LLM test
 harness; the existing `_io_adversarial_ml.py` measures byte-uniformity,
 not AI-deobf resistance).
 
+### io capsule runtime-attack hardening (T1/T2/T3)
+
+Three defenses against the runtime deobfuscation chain demonstrated in
+`WALKTHROUGH.md` (where an io-obfuscated 24 MB file was statically stripped
++ dynamically traced + guard no-op'd):
+
+**T1 — `--embed-key` now double-opt-in (closes the exploited vector).**
+The walkthrough's "Layer 1" static strip was made possible exclusively by
+`--embed-key` (key = `blob[:32]` in the plaintext file). A bare `--embed-key`
+is now rejected with an error; `--allow-insecure-embed-key` is required to
+opt in. The TUI no longer adds `--embed-key` for io — it uses the secure
+default (key via `BR_CAPSULE_KEY` env var + sidecar file). Capsule crypto
+itself (SHA-256 CTR + zlib) is sound; only the insecure key-delivery mode
+was the gap.
+
+**T2 — before-load marshal re-verify at the true chokepoint + `compile` pin.**
+The payload unmarshals at `RemoveLayers` L1719 (`code = __sr_m.loads(code)`)
+— this runs in the OUTER loader, BEFORE any guard in the inner `_co_pl`
+fires. The existing `__bedrock_pin_callable__('marshal','loads')` guard
+runs AFTER the unmarshal (inside `_co_pl`), so it can't defend it. T2 adds
+an inline re-verify of `marshal.loads` attributes (callable / `__module__==
+'marshal'` / no `__wrapped__` / `BuiltinFunctionType`) immediately before
+L1719 — hard-exit via `os._exit(1)` if spoofed. Also pins `compile`
+(2nd builtin the capsule+payload paths both use).
+
+**T3 — build-time-baked guard code-object digest (defeats `CodeType.replace`).**
+`co.replace(co_consts=...)` to no-op a guard was undefended (no code-object
+integrity existed for the obfuscator's own guards). T3 bakes a SHA-256
+digest of 5 critical guard functions' bytecode at build time, patched into
+`_co_pl.co_consts` post-compile. The runtime verifier
+`__br_verify_guard_integrity__` re-hashes the live `__code__` and compares
+to the baked digest — mismatch → `__bedrock_self_destruct__` + `os._exit(1)`.
+Under capsule the digest is encrypted until runtime, so the attacker can't
+read the expected value. No masking needed (digest is a module-level string
+referenced via global name lookup, not in any guard's `co_consts`).
+
+**Honest limitation:** T2/T3 raise the bar for an operator-attacker who runs
+the file (has the key). T1 is the real fix for the file-only attacker
+(walkthrough vector). Encryption can't stop someone who has the key from
+decrypting — T2/T3 increase the cost of dynamic tracing and guard
+neutralization, not the crypto itself.
+
 ---
 
 ---
