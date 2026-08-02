@@ -1716,6 +1716,28 @@ except:
                 except KeyError:
                     pass
             code = module__.decompress(code)
+            # T2: re-verify marshal.loads is authentic at the TRUE before-load
+            # chokepoint. This runs in the OUTER loader, under the capsule,
+            # BEFORE any guard inside _co_pl fires (the guard block is bytecode
+            # INSIDE the code object unmarshalled here). The guard-block
+            # __bedrock_pin_callable__('marshal','loads') runs AFTER this line
+            # and so cannot defend it. __bedrock_self_destruct__ is not yet
+            # defined here (it lives in _co_pl) → hard-exit via os._exit,
+            # forcing the attacker to also hook os._exit. Predicate mirrors
+            # __bedrock_pin_callable__ (callable / __module__=='marshal' /
+            # no __wrapped__ / BuiltinFunctionType-or-MethodDescriptorType).
+            try:
+                _br_m = globals()['__sr_m']
+                _br_f = getattr(_br_m, 'loads', None)
+                if (not callable(_br_f)
+                        or getattr(_br_f, '__module__', '') != 'marshal'
+                        or hasattr(_br_f, '__wrapped__')
+                        or not isinstance(_br_f, (type(len), type(list.append)))):
+                    __import__('os')._exit(1)
+            except BaseException as _br_e:
+                if type(_br_e).__name__ == 'SystemExit':
+                    raise
+                __import__('os')._exit(1)
             code = globals()['__sr_m'].loads(code)
             # Force a collection so the decompressed intermediate buffers and
             # any transient code-object refs become reclaimable immediately.
@@ -1759,6 +1781,7 @@ except:
             # 1. Mã hóa chuỗi thông báo một lần duy nhất ở đây.
             obfuscated_self_destruct_msg = Pycloak().encode("phát hiện thay đổi infos tác giả=>tự huỷ file")
             integrity_placeholder = f"__BEDROCK_HASH_{random.randint(10**8, 10**9)}__"
+            gi_placeholder = f"__BR_GI_MARK_{random.randint(10**8, 10**9)}__"  # T3: guard code-object digest (patched post-compile)
             integrity_marker = "." * 64
             integrity_var = rand_cn_name(8)
             integrity_fn = rand_cn_name(8)
@@ -3309,6 +3332,54 @@ try:
         except:
             pass
 
+    # T3: Guard code-object integrity — bake the SHA-256 digest of the 5
+    # critical guard functions' bytecode at build time, verify at runtime.
+    # Defeats `types.CodeType.replace(co_consts=...)` no-op attacks: the
+    # guard `def` binds the (potentially mutated) __code__, and the verifier
+    # hashes it against the build-time-baked digest. Under capsule the
+    # digest is encrypted until runtime. The digest lives in a MODULE-LEVEL
+    # string (global name lookup via co_names), NOT in any guard's co_consts
+    # → no chicken-and-egg, no masking needed.
+    __BR_GI_HASH__ = "{gi_placeholder}"
+    def __br_verify_guard_integrity__():
+        import hashlib as _gi_h
+        # Recursive code-object hasher — avoids repr(code_object) which
+        # embeds a per-process memory address (0x...) that differs between
+        # the build-time process and the runtime process, causing false
+        # positives. Nested code objects (list comprehensions, etc.) are
+        # hashed by their fields; non-code consts by their repr.
+        def _gi_hcode(_c):
+            _acc = (_c.co_code + b'|' + _gi_hconsts(_c.co_consts)
+                    + b'|' + repr(getattr(_c, 'co_names', ())).encode()
+                    + b'|' + repr(getattr(_c, 'co_varnames', ())).encode()
+                    + b'|' + repr(getattr(_c, 'co_freevars', ())).encode()
+                    + b'|' + repr(getattr(_c, 'co_exceptiontable', b'')).encode('latin-1'))
+            return _acc
+        def _gi_hconsts(consts):
+            _parts = []
+            for _k in consts:
+                if hasattr(_k, 'co_code'):
+                    _parts.append(_gi_hcode(_k))
+                else:
+                    _parts.append(repr(_k).encode('utf-8', 'replace'))
+            return b','.join(_parts)
+        _gi_targets = (__h_check_self_integrity, __bedrock_self_destruct__,
+                       __bedrock_check_loader_shape__, __bedrock_pin_callable__,
+                       {integrity_fn})
+        _gi_acc = b''
+        for _gi_g in _gi_targets:
+            _gi_c = getattr(_gi_g, '__code__', None)
+            if _gi_c is None:
+                continue
+            _gi_acc += _gi_hcode(_gi_c)
+        _gi_d = _gi_h.sha256(_gi_acc + b'|gi').hexdigest()
+        if _gi_d != __BR_GI_HASH__:
+            try:
+                __bedrock_self_destruct__('guard integrity failed')
+            except BaseException:
+                pass
+            __import__('os')._exit(1)
+
     # RUN CHECKS - Each in isolated try/except
     try:
         __bedrock_lock_trace__()
@@ -3346,6 +3417,15 @@ try:
         pass
     try:
         __bedrock_pin_callable__('zlib', 'decompress')
+    except:
+        pass
+    try:
+        # T2: also pin `compile` — the capsule bootstrap and the inner
+        # payload both go through exec(compile(...)) paths; an attacker
+        # who replaces `compile` with a custom C function spoofing
+        # BuiltinFunctionType could re-route. __module__=='builtins'
+        # for the real builtin.
+        __bedrock_pin_callable__('builtins', 'compile')
     except:
         pass
     try:
@@ -3429,6 +3509,10 @@ try:
     except:
         pass
     try:
+        __br_verify_guard_integrity__()
+    except:
+        pass
+    try:
         __bedrock_verify_modules_snapshot__()
     except:
         pass
@@ -3493,6 +3577,67 @@ except Exception:
                     _co_pl = _ext_mutate_code(_co_pl, _bx2)
                 except Exception:
                     pass
+            # T3: Bake the guard code-object digest into _co_pl. Walk the
+            # code object tree, find the 5 guard functions by co_name, hash
+            # their bytecode (same fields as the runtime verifier
+            # __br_verify_guard_integrity__), then patch the gi_placeholder
+            # string in _co_pl.co_consts with the real digest. Must run AFTER
+            # bc_mutate (which changes co_code/co_consts) so the digest
+            # matches what ships. The placeholder is a unique marker string
+            # (only appears once, in the __BR_GI_HASH__ assignment), so a
+            # plain identity swap in the top-level co_consts is safe.
+            try:
+                import types as _gi_t
+                # Apply _debrand to the fixed guard names: self_check_code
+                # was debranded at L3480 BEFORE compile, so co_name on the
+                # compiled code objects carries the debranded names. The
+                # integrity_fn (rand_cn_name) is already non-debranded.
+                _gi_guard_names = ('__h_check_self_integrity',
+                                   _debrand('__bedrock_self_destruct__'),
+                                   _debrand('__bedrock_check_loader_shape__'),
+                                   _debrand('__bedrock_pin_callable__'),
+                                   integrity_fn)
+                _gi_found = {}
+                def _gi_walk(_co):
+                    for _c in _co.co_consts:
+                        if isinstance(_c, _gi_t.CodeType):
+                            if _c.co_name in _gi_guard_names:
+                                _gi_found[_c.co_name] = _c
+                            _gi_walk(_c)
+                _gi_walk(_co_pl)
+                # Recursive hasher — must EXACTLY match the runtime verifier
+                # __br_verify_guard_integrity__. Avoids repr(code_object)
+                # which embeds a per-process memory address (differs between
+                # build-time and runtime processes → false positives).
+                def _gi_hconsts(consts):
+                    _parts = []
+                    for _k in consts:
+                        if hasattr(_k, 'co_code'):
+                            _parts.append(_gi_hcode(_k))
+                        else:
+                            _parts.append(repr(_k).encode('utf-8', 'replace'))
+                    return b','.join(_parts)
+                def _gi_hcode(_c):
+                    return (_c.co_code + b'|' + _gi_hconsts(_c.co_consts)
+                            + b'|' + repr(getattr(_c, 'co_names', ())).encode()
+                            + b'|' + repr(getattr(_c, 'co_varnames', ())).encode()
+                            + b'|' + repr(getattr(_c, 'co_freevars', ())).encode()
+                            + b'|' + repr(getattr(_c, 'co_exceptiontable', b'')).encode('latin-1'))
+                _gi_acc = b''
+                for _gn in _gi_guard_names:
+                    _gc = _gi_found.get(_gn)
+                    if _gc is None:
+                        continue
+                    _gi_acc += _gi_hcode(_gc)
+                _gi_digest = hashlib.sha256(_gi_acc + b'|gi').hexdigest()
+                _gi_new_consts = tuple(
+                    _gi_digest if (isinstance(_c, str) and _c == gi_placeholder) else _c
+                    for _c in _co_pl.co_consts
+                )
+                if _gi_new_consts != _co_pl.co_consts:
+                    _co_pl = _co_pl.replace(co_consts=_gi_new_consts)
+            except Exception:
+                pass
             code__ = Compile.serializer.dumps(_co_pl)
             # Phase 4: when anti-meta is ON, emit per-build random var names +
             # values (from _META_INFOS, set in _init_debrand). When OFF,
@@ -5552,6 +5697,14 @@ except Exception:
                                           'key is read from the env var named by --capsule-key-env '
                                           'at runtime, and emitted to a sidecar <output>.key file '
                                           'during build.')
+            self.parser.add_argument('--allow-insecure-embed-key',
+                                     dest='allow_insecure_embed_key',
+                                     action='store_true', default=False,
+                                     help='[Phase A] Explicit opt-in for the insecure --embed-key '
+                                          'mode. Required to actually use --embed-key: a bare '
+                                          '--embed-key is rejected with an error so the insecure '
+                                          'mode can never be triggered accidentally (the TUI and '
+                                          'casual CLI never set this).')
             self.parser.add_argument('--capsule-key-env', dest='capsule_key_env',
                                      default='BR_CAPSULE_KEY',
                                      help='[Phase A] Environment variable name the capsule '
@@ -7070,6 +7223,23 @@ except Exception:
                     # opts into the legacy insecure mode.
                     _embed_key = bool(getattr(args, 'embed_key', False))
                     _key_env = str(getattr(args, 'capsule_key_env', 'BR_CAPSULE_KEY') or 'BR_CAPSULE_KEY')
+                    if _embed_key and not getattr(args, 'allow_insecure_embed_key', False):
+                        # Reject the insecure embed mode unless the operator
+                        # explicitly opts in. --embed-key ships the capsule
+                        # key in the plaintext file (key = blob[:32]), making
+                        # the capsule trivially statically recoverable by a
+                        # ~10-line decoder (the WALKTHROUGH.md "Layer 1"
+                        # strip). The secure default (no --embed-key) emits
+                        # the key to a sidecar + reads it from BR_CAPSULE_KEY.
+                        Logging.error('--embed-key is insecure: it ships the '
+                                      'capsule key in the file and makes the '
+                                      'source statically recoverable without '
+                                      'running the output. To use it anyway '
+                                      '(you accept the security risk), pass '
+                                      '--allow-insecure-embed-key together '
+                                      'with --embed-key. For the secure mode '
+                                      'just omit --embed-key.')
+                        raise SystemExit(2)
                     output = _bc_mod.apply_binary_capsule(
                         output, _build_ctx,
                         embed_key=_embed_key, key_env=_key_env)

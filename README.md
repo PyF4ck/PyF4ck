@@ -40,8 +40,8 @@ python bedrock_obfuscator.py -f input.py -o obf.py --profile io \
 # 2. Run the obfuscated file (must provide the key via env)
 BR_CAPSULE_KEY=$(cat obf.py.key) python obf.py
 #    Without the env var the file refuses to run and the source stays
-#    encrypted on disk. (Pass --embed-key at build time for the legacy
-#    insecure mode where the key ships in the file — NOT recommended.)
+#    encrypted on disk. (--embed-key ships the key in the file — INSECURE,
+#    statically recoverable; requires --allow-insecure-embed-key to opt in.)
 
 # 3. Verify the encrypted-output uniformity test (PRG + iO-property, ~30 min)
 python bedrock_native/_io_distinguish_test.py
@@ -90,8 +90,9 @@ python tui.py
 - Phase H esoteric passes (H.1-H.11)
 - The 7 capsule phases (iO-1 through iO-7)
 - The encrypted-source capsule (byte-distribution randomization). The
-  capsule key is **read from env at runtime by default** (secure); pass
-  `--embed-key` for the legacy insecure mode where the key ships in the
+  capsule key is **read from env at runtime by default** (secure); `--embed-key`
+  ships the key in the file (INSECURE, statically recoverable — now requires
+  `--allow-insecure-embed-key` to opt in).
   file.
 
 ---
@@ -127,6 +128,7 @@ and verified by the behavioral gate (`fib(10)=55`, `final_result: 221`).
 | H | Esoteric (11 passes) | ALL functions | `_identifier_poison.py` … `_exc_table_vm.c` |
 | **H.A** | **Anti-AI deobfuscation: decoys + homoglyph twins + prompt-injection + EOS-tokens + zero-width/bidi + safety-trigger vocab + long-range weaving** | **ALL** | **`_anti_ai.py`** |
 | **G** | **Deobf-hardening (G1-G9 + G1+): hex/base85 blob, anti-meta default, num_obf 4-form, capsule key delivery, DPF split, opaque structural mix, DPF PRG/domain, ML test features, env-key default** | **capsule + non-capsule** | **`_binary_capsule.py`, `_fss.py`, `_opaque_crypto.py`, `_pointfunc_obf.py`, `_io_adversarial_ml.py`** |
+| **io hardening** | **T1 `--embed-key` double-opt-in + T2 before-load marshal re-verify + `compile` pin + T3 build-time-baked guard code-object digest (anti `CodeType.replace`)** | **io + extreme/paranoid loaders** | **`bedrock_obfuscator.py` (T1 gate L7071, T2 L1719+L3366, T3 verifier + L3569 build patch)** |
 | **io** | **Encrypted-source capsule + value secret sharing + opaque predicates** | **ALL** | **`_fss.py` (value secret sharing, NOT BGI FSS), `_opaque_crypto.py`, `_pointfunc_obf.py`, `_lookup_obf.py`, `_entropy_pad.py`, `_binary_capsule.py`** |
 
 ## Phase G deobfuscation-hardening (G1-G9 + G1+)
@@ -212,6 +214,25 @@ refuse/mislead. Build without the flag when you need AI-assisted review of
 the output. Verified by heuristic checks only (no ML/LLM test harness — per
 scope decision; the existing `_io_adversarial_ml.py` measures byte-uniformity,
 not AI-deobf resistance).
+
+## io capsule runtime-attack hardening (T1/T2/T3)
+
+Three defenses against the runtime deobfuscation chain demonstrated in
+`WALKTHROUGH.md` (an io-obfuscated 24 MB file was statically stripped +
+dynamically traced + guard no-op'd — all three attacks confirmed working
+against an actual io output):
+
+| Tier | Attack closed | What changed |
+|------|--------------|--------------|
+| **T1** | static capsule strip via `--embed-key` (key = `blob[:32]` in file) | A bare `--embed-key` is now rejected; `--allow-insecure-embed-key` required to opt in. TUI no longer adds `--embed-key` for io — uses the secure default (key via `BR_CAPSULE_KEY` env + sidecar). Capsule crypto (SHA-256 CTR + zlib) is sound; only the insecure key-delivery mode was the gap. |
+| **T2** | dynamic trace (hook `marshal.loads` after guard snapshot, before payload unmarshal) | Inline re-verify of `marshal.loads` attributes at `RemoveLayers` L1719 (the true before-load chokepoint, runs in the OUTER loader before any inner `_co_pl` guard fires) — hard-exit via `os._exit(1)` if spoofed. Also pins `compile`. |
+| **T3** | `CodeType.replace(co_consts=...)` to no-op a guard | Build-time-baked SHA-256 digest of 5 critical guard functions' bytecode, patched into `_co_pl.co_consts` post-compile. Runtime verifier `__br_verify_guard_integrity__` re-hashes live `__code__` → mismatch → `__bedrock_self_destruct__` + `os._exit(1)`. Digest is a module-level string (not in any guard's `co_consts`), so no masking needed. Under capsule the digest is encrypted until runtime. |
+
+**Honest limitation:** T1 is the real fix for the file-only attacker
+(walkthrough vector). T2/T3 raise the bar for an operator-attacker who runs
+the file (has the key) — encryption can't stop someone who has the key from
+decrypting, but T2/T3 increase the cost of dynamic tracing and guard
+neutralization.
 
 ---
 
