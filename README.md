@@ -234,6 +234,117 @@ the file (has the key) — encryption can't stop someone who has the key from
 decrypting, but T2/T3 increase the cost of dynamic tracing and guard
 neutralization.
 
+### Security review — 3 deeper findings (post-T1/T2/T3)
+
+A follow-up security review of the T1/T2/T3 hardening surfaced three points
+that T1/T2/T3 don't fully close. They are documented here as honest gaps with
+mitigations, not as fixes that have shipped.
+
+#### 1. Key lifecycle (RAM persistence, copies, dump extraction)
+
+**Finding.** The capsule bootstrap (`_binary_capsule.py:496-509`) holds the
+key, the keystream, and the decompressed plaintext in module globals for the
+duration of the `exec()` — and after it. Concretely:
+
+- `key` (32 bytes), the SHA-256 keystream `stream`, and `plain` (the
+  decompressed obfuscated source) stay reachable in the capsule module's
+  globals until the process exits.
+- Under `--embed-key` (now double-opt-in via T1) the key is also in the
+  file prefix, so this is moot. Under the **secure** env-key path the key is
+  read from `BR_CAPSULE_KEY` — but it is still copied into a module-global
+  `bytes` object and never wiped.
+- `RemoveLayers` (the outer loader, `bedrock_obfuscator.py:1714`) does
+  `del __sr_m` (drops its marshal alias) — but the capsule bootstrap does NOT
+  mirror this: no `del key, stream, plain` after `exec()`.
+
+**Exposure.** A memory dump of the running process (e.g. a live-core dump,
+`gcore`, or a debugger reading the module dict) recovers the plaintext
+obfuscated source AND the key. This is the same residual risk the Threat
+Model already acknowledges ("an adversary who can run the file and inspect
+the decrypted source in memory"). The key-lifecycle gap widens the window:
+from "only during `exec()`" to "until process exit".
+
+**Mitigation (recommended, NOT yet shipped).** Add `del key, stream, plain`
++ `gc.collect()` immediately after the `exec()` in the capsule bootstrap,
+mirroring the `del __sr_m` pattern in `RemoveLayers`. This shrinks the
+plaintext-in-RAM window from process-lifetime to the duration of `exec()`.
+It does NOT defeat a debugger that sets a breakpoint *during* `exec()` —
+that requires T2/T3 + the existing anti-debug stack, and is acknowledged as
+unbeatable for an operator who has the key. The recommendation is purely
+hygiene: minimize the window, don't claim it's closed.
+
+#### 2. VM / runtime integrity (bytecode verify, opcode-table tamper, interpreter patching)
+
+**Finding.** Three sub-surfaces, assessed separately:
+
+- **Native BedrockVM bytecode** (`_xvm.pyd`, Phase 5): the loader verifies
+  a SHA-256 of the shipped `.pyd` against the `__VM_EXTHASH__` header
+  constant (`bedrock_obfuscator.py:3232`, Integrity section). A patched
+  interpreter (modified `.pyd`) is detected. The bytecode blob itself is
+  OFB-encrypted (v2) and length+checksum guarded. **This surface is
+  reasonably hardened.** Residual gap: the in-memory interpreter can still be
+  hooked at runtime (function pointers swapped) — no code-object pin exists
+  for the native interpreter's entry point (it's a C function, not a Python
+  callable, so T3-style `__code__` hashing doesn't apply).
+- **Python-level opcode table / `dis` tampering:** the obfuscator does NOT
+  defend CPython's opcode mapping at runtime. An attacker who patches
+  `dis.opmap` or installs a custom `sys.settrace`/`sys.setprofile` with
+  opcode rewriting is caught by the existing `lock_trace` / anti-inject /
+  `verify_metapath_snapshot` checks — but only *after* those guards fire,
+  i.e. inside `_co_pl`. A pre-`exec` opcode rewrite applied to the capsule
+  bootstrap itself is NOT caught (the bootstrap is plain Python with no
+  guards).
+- **Interpreter patching (in-memory `marshal.loads`/`compile` rewrite):**
+  this is exactly what T2 defends. T2's inline re-verify at L1719 + the
+  `compile` pin close the Python-callable surface. The residual gap is a
+  hook applied to the *C-level* `PyMarshal_ReadObjectFromString` /
+  `PyEval_EvalCode` via ctypes/cffi before the capsule runs — T2's
+  `BuiltinFunctionType` check would pass (the C function's identity is
+  unchanged), so a native-level hook evades. Defending this requires a
+  `ctypes.pythonapi`/`sys.gettrace`-level audit, which is out of scope.
+
+**Assessment.** The native-VM surface is the best-defended (SHA-256 `.pyd`
+hash + OFB-encrypted bytecode). The Python-callable surface is hardened by
+T2. The C-level native-hook surface (ctypes patching of `PyMarshal_*` /
+`PyEval_*`) is UNDEFENDED and is acknowledged as a residual gap an
+operator-attacker with the key can exploit. The default io profile ships
+with `--no-native-vm` (native VM is OFF), so the `.pyd` integrity path is
+not exercised — the entire runtime is plain Python, leaving only the
+Python-callable surface (T2) as the active defense.
+
+#### 3. Anti-tamper fail modes (self-destruct leaks check position; alternatives)
+
+**Finding.** The tamper reaction table (`bedrock_spec.html` §16) lists 4
+modes. The security review notes that `self-destruct` (the default) and
+`fail-closed` both **exit immediately**, which leaks *which check fired*
+to an attacker observing the process — narrowing the search for the next
+check to bypass. `poison` and `warn` are stealthier but have their own
+trade-offs:
+
+| Mode | Stealth | Attacker signal | Risk |
+|------|---------|-----------------|------|
+| `self-destruct` (default) | low | exit+file-overwrite at the failing check → attacker learns which guard fired, and the file is destroyed (may be undesired in CI) | irrecoverable; check-position leak |
+| `fail-closed` (`SystemExit`) | low | clean exit at the failing check → same check-position leak, but file intact | check-position leak |
+| `poison` | **high** | program keeps running, downstream decrypt → garbage; attacker sees "working" output that's subtly wrong | **attacker may not notice** → ships wrong results; harder to debug |
+| `warn` | high | prints a message, returns; program continues correctly | **defeat the purpose** — the guarded invariant isn't actually enforced |
+
+**Trade-off.** `poison` is the stealthiest and is recommended when the goal
+is "attacker gets a runnable but wrong program" (matches the existing
+`--debug-poison` posture). `self-destruct` is the most disruptive but leaks
+the most. There is **no single best mode** — the choice depends on whether
+stealth (poison) or denial (self-destruct) is the priority. The existing
+`--tamper-mode` flag already lets the operator pick; the gap is that the
+*default* is `self-destruct`, which leaks position. A future hardening could
+default `io` to `poison` to avoid the leak, at the cost of silent-wrong-output.
+
+**Honest note.** None of these modes defeats an attacker who has the key
+AND can read memory — they just change the observable signal. The T3 digest
+mismatch currently routes through `__bedrock_self_destruct__`, so it leaks
+position by default; routing it through `__h_poison` instead (when
+`--debug-poison` is set) is already supported by the existing tamper-mode
+plumbing. The recommendation is documentation, not new code: tell operators
+that `--debug-poison` makes T3 silent.
+
 ---
 
 ## Encrypted-output uniformity (formerly "iO Highlights")

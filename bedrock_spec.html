@@ -268,7 +268,7 @@ hr{border:none;border-top:1px solid var(--border);margin:24px 0}
 <a href="#phase3">9. Phase 3 — Poison+Meta</a>
 <a href="#phase4">10. Phase 4 — Anti-meta</a>
 <a href="#phase5">11. Phase 5 — Native VM</a>
-<a href="#io">11¾. Phase iO — Practical iO</a>
+<a href="#io">11¾. Phase iO — uniformity capsule</a>
 <a href="#showcase">11½. Before/After</a>
 <div class="nav-group-label">VM internals</div>
 <a href="#vm-isa">12. BedrockVM ISA</a>
@@ -276,8 +276,10 @@ hr{border:none;border-top:1px solid var(--border);margin:24px 0}
 <a href="#crypto">14. Crypto</a>
 <div class="nav-group-label">Defense</div>
 <a href="#anti-debug">15. Anti-debug</a>
+<a href="#io-hardening" class="lvl2">15½. io hardening (T1/T2/T3)</a>
 <a href="#tamper">16. Tamper modes</a>
 <a href="#integrity">17. Integrity</a>
+<a href="#sec-review" class="lvl2">17½. Security review (deeper)</a>
 <a href="#traps">18. Decompiler traps</a>
 <div class="nav-group-label">Operations</div>
 <a href="#deploy">19. Deployment</a>
@@ -717,11 +719,15 @@ hr{border:none;border-top:1px solid var(--border);margin:24px 0}
 
 <!-- iO -->
 <section id="io">
-<h2>11¾. Phase iO — Practical Indistinguishability Obfuscation</h2>
-<p>Phase iO nâng obfuscator lên <strong>Practical iO grade</strong> — hai builds của cùng chương trình <em>computationally indistinguishable</em> từ random data. Target: nation-state + academic adversaries. No performance constraint.</p>
+<h2>11¾. Phase iO — Encrypted-output uniformity capsule</h2>
+<p>Phase iO encrypts the obfuscated source so the output file's byte distribution approaches uniform (a <strong>PRG-uniformity</strong> property, NOT the cryptographic iO property — see the honesty note in <code>README.md</code> / <code>IO_SPEC.md</code>). Target: nation-state + academic adversaries. No performance constraint.</p>
+
+<div class="callout callout-warn">
+<strong>Terminology correction:</strong> earlier versions marketed this as "Practical Indistinguishability Obfuscation (iO)". That was incorrect — iO in cryptography means obfuscations of two <em>different but functionally-equivalent</em> programs are indistinguishable. The capsule only ensures the <em>output file's byte distribution</em> is uniform (a property of any encryption/PRG output). The metric is now labelled "encrypted-output uniformity".
+</div>
 
 <div class="callout callout-ok">
-<strong>Kết quả iO-7 (binary capsule):</strong> Shannon entropy <strong>7.96 bits/byte</strong>, pairwise chi-square mean <strong>501</strong> (random baseline ~510±35), ML classifier accuracy <strong>40%</strong> (<chance 50%). Full spec: <a href="bedrock_native/IO_SPEC.md">IO_SPEC.md</a>.
+<strong>Kết quả iO-7 (binary capsule):</strong> Shannon entropy <strong>7.96 bits/byte</strong>, pairwise chi-square mean <strong>501</strong> (random baseline ~510±35), ML PRG-uniformity accuracy <strong>40%</strong> (<chance 50%). Full spec: <a href="bedrock_native/IO_SPEC.md">IO_SPEC.md</a>.
 </div>
 
 <h3>The 7 iO Phases</h3>
@@ -741,9 +747,10 @@ hr{border:none;border-top:1px solid var(--border);margin:24px 0}
 <ol>
 <li><strong>Compress</strong> the source (zlib level 9).</li>
 <li><strong>Encrypt</strong> with a per-build 32-byte key (SHA-256 CTR-mode XOR keystream).</li>
-<li><strong>Prepend</strong> the key to the encrypted blob (first 32 bytes = key, rest = encrypted data).</li>
-<li><strong>Embed</strong> as a latin-1 triple-quoted string literal in a ~10-line bootstrap.</li>
-<li>The bootstrap reads the blob, extracts the key, decrypts, decompresses, and <code>exec</code>s the original source.</li>
+<li><strong>Key delivery (DEFAULT — secure):</strong> the key is NOT written into the file. It is emitted to a sidecar <code><output>.key</code> (0600) and read from the <code>BR_CAPSULE_KEY</code> environment variable at runtime. The ciphertext alone goes into the file as a latin-1 literal.</li>
+<li><strong>Key delivery (legacy — INSECURE, double-opt-in):</strong> <code>--embed-key</code> prepends the key to the encrypted blob (first 32 bytes = key, rest = ciphertext). This is statically recoverable in ~10 lines, so a bare <code>--embed-key</code> is now <strong>rejected</strong>; it requires <code>--allow-insecure-embed-key</code> to opt in. The TUI no longer adds <code>--embed-key</code> for io — it uses the secure env-key path. <em>This closes the walkthrough vector (T1, see §15½).</em></li>
+<li><strong>Embed</strong> the ciphertext as a latin-1 triple-quoted string literal in a per-build-randomized bootstrap (Phase G1+: zlib aliased to a per-build token; import/exec/XOR shapes vary across 4/3/2 forms — no single regex matches every io file).</li>
+<li>The bootstrap reads the blob, obtains the key (env or embedded), decrypts, decompresses, and <code>exec</code>s the original source.</li>
 </ol>
 <p>The resulting file is <strong>~99.9% encrypted data</strong> (uniform byte distribution) and ~0.1% bootstrap. The pairwise chi-square approaches the expected value for two independent random samples (~510), achieving statistical indistinguishability from random data.</p>
 
@@ -765,7 +772,19 @@ hr{border:none;border-top:1px solid var(--border);margin:24px 0}
 
 <h3>Composition</h3>
 <div class="callout callout-warn">
-<strong>Binary capsule auto-disables:</strong> <code>runtime_dec</code> + <code>chain</code> (capsule already encrypts everything; redundant chain causes intermittent hang), <code>h_entropy_pad</code> (encrypted blob IS high-entropy), <code>integrity</code> (encryption provides implicit integrity).
+<strong>Binary capsule auto-disables:</strong> <code>runtime_dec</code> + <code>chain</code> (capsule already encrypts everything; redundant chain causes intermittent hang), <code>h_entropy_pad</code> (encrypted blob IS high-entropy). File-integrity + loader-shape checks are <strong>gated off</strong> under capsule (<code>__BR_INTEGRITY_OFF__=True</code>) — they would false-positive on the encrypted file bytes. Runtime-attack surface is instead defended by T1/T2/T3 (see §15½).
+</div>
+
+<h3>io capsule runtime-attack hardening (T1/T2/T3)</h3>
+<p>Three defenses against the runtime deobfuscation chain demonstrated in <code>WALKTHROUGH.md</code> (an io-obfuscated 24 MB file was statically stripped + dynamically traced + guard no-op'd — all three attacks confirmed working against an actual io output):</p>
+<table class="compact">
+<tr><th>Tier</th><th>Attack closed</th><th>What changed</th></tr>
+<tr><td><strong>T1</strong></td><td>static capsule strip via <code>--embed-key</code> (key = <code>blob[:32]</code> in file)</td><td>A bare <code>--embed-key</code> is now rejected; <code>--allow-insecure-embed-key</code> required to opt in. TUI no longer adds <code>--embed-key</code> for io — uses the secure default (key via <code>BR_CAPSULE_KEY</code> env + sidecar, 0600). Capsule crypto (SHA-256 CTR + zlib) is sound; only the insecure key-delivery mode was the gap.</td></tr>
+<tr><td><strong>T2</strong></td><td>dynamic trace (hook <code>marshal.loads</code> after guard snapshot, before payload unmarshal)</td><td>Inline re-verify of <code>marshal.loads</code> attributes at <code>RemoveLayers</code> L1719 (the true before-load chokepoint — runs in the OUTER loader before any inner <code>_co_pl</code> guard fires) — hard-exit via <code>os._exit(1)</code> if spoofed. Also pins <code>compile</code> (2nd builtin the capsule+payload paths both use).</td></tr>
+<tr><td><strong>T3</strong></td><td><code>CodeType.replace(co_consts=...)</code> to no-op a guard</td><td>Build-time-baked SHA-256 digest of 5 critical guard functions' bytecode, patched into <code>_co_pl.co_consts</code> post-compile. Runtime verifier <code>__br_verify_guard_integrity__</code> re-hashes live <code>__code__</code> → mismatch → <code>__bedrock_self_destruct__</code> + <code>os._exit(1)</code>. Digest is a module-level string (not in any guard's <code>co_consts</code>), so no masking needed. Under capsule the digest is encrypted until runtime.</td></tr>
+</table>
+<div class="callout callout-info">
+<strong>Honest limitation:</strong> T1 is the real fix for the file-only attacker (walkthrough vector). T2/T3 raise the bar for an operator-attacker who runs the file (has the key) — encryption can't stop someone who has the key from decrypting, but T2/T3 increase the cost of dynamic tracing and guard neutralization. See §17½ for the deeper security-review findings (key lifecycle, VM integrity, anti-tamper fail modes).
 </div>
 </section>
 
@@ -1202,6 +1221,43 @@ def _vm_derive_key(_raw):
 </div>
 </details>
 
+<details><summary>🔍 T3: Guard code-object integrity (anti <code>CodeType.replace</code>)</summary>
+<div class="content">
+<p><strong>Threat:</strong> <code>co.replace(co_consts=...)</code> to no-op a guard function at runtime. Before T3, no check hashed the obfuscator's <em>own guard</em> <code>__code__</code> — file-integrity (§17) checks file bytes (unchanged by in-memory <code>co.replace</code>); <code>_br_fp_ext</code> (L2726) is a runtime snapshot (defeated by pre-snapshot mutation). The walkthrough's no-op was applied to the code object <strong>before</strong> exec, so the guard <code>def</code> bound the mutated <code>__code__</code>.</p>
+<table class="compact">
+<tr><th>Component</th><th>Role</th></tr>
+<tr><td><code>__BR_GI_HASH__</code></td><td>Module-level string (NOT in any guard's <code>co_consts</code>). Placeholder at compile time → patched to real SHA-256 digest post-compile. Under capsule, encrypted until runtime → attacker can't read expected value.</td></tr>
+<tr><td><code>__br_verify_guard_integrity__</code></td><td>Runtime verifier (ungated — runs under capsule). Re-hashes live <code>__code__</code> of 5 critical guards, compares to <code>__BR_GI_HASH__</code>. Mismatch → <code>__bedrock_self_destruct__</code> + <code>os._exit(1)</code>.</td></tr>
+<tr><td>Recursive hasher <code>_gi_hcode</code> / <code>_gi_hconsts</code></td><td>Hashes <code>co_code | co_consts (recursive for nested code objects, by field not <code>repr()</code> — <code>repr(code)</code> includes per-process memory address → false positives) | co_names | co_varnames | co_freevars | co_exceptiontable</code>. Identical in verifier template AND build-time patch.</td></tr>
+<tr><td>5 protected guards</td><td><code>__h_check_self_integrity</code>, <code>__bedrock_self_destruct__</code>, <code>__bedrock_check_loader_shape__</code>, <code>__bedrock_pin_callable__</code>, <code>{integrity_fn}</code> — the guards worth no-op'ing. Guard names are <code>_debrand</code>'d at build time (bedrock→CJK), so build-time walk uses debranded <code>co_name</code>.</td></tr>
+</table>
+<h4>Build-time patch (visual)</h4>
+<div class="pyd-flow reveal">
+<div class="pyd-step sentinel">Compile with<br><code>__BR_GI_HASH__ = "placeholder"</code></div>
+<span class="flow-arrow">→</span>
+<div class="pyd-step patch">Walk <code>_co_pl.co_consts</code><br>find 5 guards by <code>co_name</code></div>
+<span class="flow-arrow">→</span>
+<div class="pyd-step patch">Hash each guard's<br><code>__code__</code> → SHA-256</div>
+<span class="flow-arrow">→</span>
+<div class="pyd-step verify">Patch placeholder<br>→ real digest</div>
+</div>
+<div class="pyd-flow" style="margin-top:4px">
+<span class="flow-arrow">↘</span>
+<div class="pyd-step pass">Re-compile → digest baked in<br>(guards byte-identical: digest is module-level, not in guard <code>co_consts</code>)</div>
+<span style="margin:0 20px"></span>
+<div class="pyd-step fail">Runtime: <code>co.replace</code> mutation → live <code>__code__</code> hash ≠ baked digest</div>
+<span class="flow-arrow">↘</span>
+<div class="pyd-step poison">self_destruct + <code>os._exit(1)</code></div>
+</div>
+<div class="callout callout-info">
+<strong>No masking needed:</strong> guards reference the digest via global name lookup (<code>co_names</code>), NOT as a literal in their own <code>co_consts</code>. So hashing a guard's <code>__code__</code> never includes the module digest → no chicken-and-egg (simpler than file-integrity §17 which masks both hashes to dots). And a <code>co.replace</code> mutation applied to <code>_co_pl.co_consts[i]</code> before exec shows up as a changed <code>__code__</code> when the <code>def</code> binds it → detected.
+</div>
+<div class="callout callout-warn">
+<strong>Residual gap (honest):</strong> the verifier itself is NOT self-protected (can't meaningfully be — a no-op'd verifier won't run). Attacker must no-op BOTH the verifier AND a target guard in the tiny window between <code>_co_pl</code> exec-start and the verifier call. Other guards (marshal pin, builtins snapshot) still independently catch hooks.
+</div>
+</div>
+</details>
+
 <details><summary>🔍 Debugger / trace detection</summary>
 <div class="content">
 <table class="compact">
@@ -1220,8 +1276,9 @@ def _vm_derive_key(_raw):
 <div class="content">
 <table class="compact">
 <tr><th>Check</th><th>Phát hiện</th><th>Reaction</th></tr>
-<tr><td><code>pin_callable</code></td><td>marshal.loads / zlib.decompress: not callable, wrong __module__, has __wrapped__</td><td>abort</td></tr>
+<tr><td><code>pin_callable</code></td><td><strong>marshal.loads / zlib.decompress / compile</strong>: not callable, wrong <code>__module__</code>, has <code>__wrapped__</code>, not <code>BuiltinFunctionType</code></td><td>abort</td></tr>
 <tr><td><code>guard_marshal</code></td><td>marshal.loads hooked → seal fresh marshal module</td><td>abort</td></tr>
+<tr><td><code><strong>T2: before-load marshal re-verify</strong></code></td><td>Inline re-verify of <code>marshal.loads</code> attributes at <code>RemoveLayers</code> L1719 (OUTER loader, BEFORE any inner <code>_co_pl</code> guard fires — the existing <code>pin_callable</code> runs AFTER the unmarshal). Checks: callable / <code>__module__=='marshal'</code> / no <code>__wrapped__</code> / <code>BuiltinFunctionType</code>. Failure → <code>os._exit(1)</code> (bypasses cleanup; <code>__bedrock_self_destruct__</code> not yet defined at this point)</td><td><code>os._exit(1)</code></td></tr>
 <tr><td><code>check_builtins</code></td><td>__builtins__ replaced, 26 builtins not BuiltinFunctionType, 15 types not type</td><td>abort</td></tr>
 <tr><td><code>snapshot_builtins</code></td><td>Capture id() của 24 critical builtins</td><td>snapshot</td></tr>
 <tr><td><code>verify_builtins_snapshot</code></td><td>Re-read id() → mismatch = replacement</td><td>abort</td></tr>
@@ -1259,6 +1316,54 @@ def _vm_derive_key(_raw):
 </table>
 </div>
 </details>
+</section>
+
+<!-- IO HARDENING -->
+<section id="io-hardening">
+<h2>15½. io capsule runtime-attack hardening (T1/T2/T3)</h2>
+<p>Three defenses against the runtime deobfuscation chain demonstrated in <code>WALKTHROUGH.md</code> — an actual io-obfuscated 24 MB file was statically stripped + dynamically traced + guard no-op'd (all three attacks confirmed working against a real io output). Each tier closes a distinct gap:</p>
+
+<div class="threat-flow reveal">
+<div class="threat-node"><strong>File-only attacker</strong> (no execution)<br>static strip via <code>--embed-key</code></div>
+<div class="threat-arrow">↓ <span class="threat-label tamper">T1</span></div>
+<div class="threat-node final"><strong>T1: key not in file</strong><br><code>--embed-key</code> double-opt-in; TUI uses env+sidecar</div>
+<div style="height:12px"></div>
+<div class="threat-node"><strong>Operator-attacker</strong> (has key, runs file)<br>dynamic trace: hook <code>marshal.loads</code></div>
+<div class="threat-arrow">↓ <span class="threat-label tamper">T2</span></div>
+<div class="threat-node final"><strong>T2: before-load re-verify</strong><br>inline check at L1719 + <code>compile</code> pin</div>
+<div style="height:12px"></div>
+<div class="threat-node"><strong>Operator-attacker</strong> (has key, runs file)<br><code>CodeType.replace</code> to no-op guard</div>
+<div class="threat-arrow">↓ <span class="threat-label tamper">T3</span></div>
+<div class="threat-node final"><strong>T3: baked guard digest</strong><br>SHA-256 of guard <code>__code__</code>, mismatch → self_destruct</div>
+</div>
+
+<table class="compact">
+<tr><th>Tier</th><th>Attack</th><th>Where documented</th><th>Failure action</th></tr>
+<tr><td><strong>T1</strong></td><td>static capsule strip (<code>key = blob[:32]</code>)</td><td>§11¾ (Binary Capsule — key delivery); <code>bedrock_obfuscator.py</code> gate ~L7071</td><td><code>SystemExit(2)</code> at build time (bare <code>--embed-key</code> rejected)</td></tr>
+<tr><td><strong>T2</strong></td><td>dynamic trace (hook <code>marshal.loads</code> before payload unmarshal)</td><td>§15 (anti-debug table — <code>pin_callable</code> + T2 row); <code>bedrock_obfuscator.py</code> L1719 inline + L3366 <code>compile</code> pin</td><td><code>os._exit(1)</code> (no <code>__bedrock_self_destruct__</code> yet — runs in OUTER loader)</td></tr>
+<tr><td><strong>T3</strong></td><td><code>CodeType.replace(co_consts=...)</code> to no-op a guard</td><td>§15 (anti-debug — T3 details block); <code>bedrock_obfuscator.py</code> verifier template + L3569 build patch</td><td><code>__bedrock_self_destruct__</code> + <code>os._exit(1)</code></td></tr>
+</table>
+
+<div class="callout callout-warn">
+<strong>Honest limitation:</strong> T1 is the real fix for the file-only attacker (walkthrough vector). T2/T3 raise the bar for an operator-attacker who runs the file (has the key) — encryption can't stop someone who has the key from decrypting, but T2/T3 increase the cost of dynamic tracing and guard neutralization. See §17½ for the deeper security-review findings (key lifecycle, VM integrity, anti-tamper fail modes) that T1/T2/T3 don't fully close.
+</div>
+
+<h3>Guard execution sequence (where T2/T3 fire)</h3>
+<pre><code>capsule bootstrap (plain Python, no guards)
+  → key from env/embed  → keystream  → XOR  → zlib decompress  → exec(plain)
+     ↓
+outer loader (RemoveLayers, AnhOiDungCoDec)
+  → <strong>T2: inline re-verify marshal.loads</strong> @ L1719  ← before-load chokepoint
+  → marshal.loads(code)  → exec(_co_pl)
+     ↓
+inner _co_pl guard block fires (L3300-3438):
+  → __BR_INTEGRITY_OFF__ = True (file-integrity + loader-shape SKIPPED under capsule)
+  → pin_callable: marshal.loads, zlib.decompress, <strong>compile</strong> (T2)
+  → snapshot_builtins → verify_builtins_snapshot
+  → <strong>T3: __br_verify_guard_integrity__()</strong> (ungated — re-hash guard __code__ vs __BR_GI_HASH__)
+  → snapshot_modules → verify_modules_snapshot
+  → payload (fib → 55)</code></pre>
+<p><small>Under capsule, file-integrity + loader-shape checks are gated OFF (they'd false-positive on encrypted file bytes). The runtime-attack surface is instead defended by T2 (before-load) + T3 (post-load, pre-payload).</small></p>
 </section>
 
 <!-- TAMPER -->
@@ -1352,6 +1457,54 @@ if _vm_mod.__file__ endswith .pyd/.so and _vm_exthash is valid 64-hex:
 </table>
 <div class="callout callout-danger">
 <strong>Attacker không thể ép fallback Python:</strong> với <code>--vm-fallback off</code>, xóa/tamper <code>_xvm.pyd</code> → <code>__h_poison('vm_ext_tamper', 9)</code> + <code>raise SystemExit('VM extension integrity check failed')</code>. Payload abort thay vì degrade sang pure-Python reference interpreter.
+</div>
+</section>
+
+<!-- SECURITY REVIEW -->
+<section id="sec-review">
+<h2>17½. Security review — deeper findings (post-T1/T2/T3)</h2>
+<p>A follow-up security review of the T1/T2/T3 hardening (§15½) surfaced three points that T1/T2/T3 don't fully close. Documented here as honest gaps + mitigations, <strong>not as shipped fixes</strong>.</p>
+
+<h3>1. Key lifecycle (RAM persistence, copies, dump extraction)</h3>
+<p>The capsule bootstrap (<code>bedrock_native/_binary_capsule.py:496-509</code>) holds the key, the SHA-256 keystream, and the decompressed plaintext in module globals for the duration of <code>exec()</code> — and after it, until process exit. Concretely:</p>
+<ul>
+<li><code>key</code> (32 bytes), the keystream <code>stream</code>, and <code>plain</code> (the decompressed obfuscated source) stay reachable in the capsule module's globals until the process exits.</li>
+<li>Under <code>--embed-key</code> (now double-opt-in via T1) the key is also in the file prefix — moot. Under the <strong>secure</strong> env-key path the key is read from <code>BR_CAPSULE_KEY</code> — but still copied into a module-global <code>bytes</code> object and <strong>never wiped</strong>.</li>
+<li><code>RemoveLayers</code> (the outer loader, <code>bedrock_obfuscator.py:1714</code>) does <code>del __sr_m</code> (drops its marshal alias) — but the capsule bootstrap does NOT mirror this: no <code>del key, stream, plain</code> after <code>exec()</code>.</li>
+</ul>
+<div class="callout callout-warn">
+<strong>Exposure:</strong> a memory dump of the running process (live-core dump, <code>gcore</code>, or a debugger reading the module dict) recovers the plaintext obfuscated source AND the key. The window is <strong>process-lifetime</strong>, not just the <code>exec()</code> window. This is the same residual risk the Threat Model already acknowledges (operator who can inspect decrypted source in memory); the key-lifecycle gap widens the window.
+</div>
+<div class="callout callout-info">
+<strong>Mitigation (recommended, NOT yet shipped):</strong> add <code>del key, stream, plain</code> + <code>gc.collect()</code> immediately after the <code>exec()</code> in the capsule bootstrap, mirroring the <code>del __sr_m</code> pattern in <code>RemoveLayers</code>. Shrinks the plaintext-in-RAM window from process-lifetime to the duration of <code>exec()</code>. Does NOT defeat a debugger that sets a breakpoint <em>during</em> <code>exec()</code> — that's T2/T3 + the anti-debug stack's job, and is acknowledged unbeatable for an operator with the key. Pure hygiene: minimize the window, don't claim it's closed.
+</div>
+
+<h3>2. VM / runtime integrity (bytecode verify, opcode-table tamper, interpreter patching)</h3>
+<p>Three sub-surfaces, assessed separately:</p>
+<table class="compact">
+<tr><th>Sub-surface</th><th>Defense</th><th>Status</th></tr>
+<tr><td><strong>Native BedrockVM bytecode</strong> (<code>_xvm.pyd</code>, Phase 5)</td><td>Loader verifies SHA-256 of shipped <code>.pyd</code> vs <code>__VM_EXTHASH__</code> header (§17). Bytecode blob OFB-encrypted (v2) + length/checksum guarded.</td><td><strong>Reasonably hardened.</strong> Residual: in-memory interpreter hookable (function pointers swapped) — no code-object pin for C entry point (T3 is Python-only).</td></tr>
+<tr><td><strong>Python-level opcode table / <code>dis</code> tampering</strong></td><td><code>dis.opmap</code> patching or <code>sys.settrace</code>/<code>setprofile</code> with opcode rewriting caught by <code>lock_trace</code> / anti-inject / <code>verify_metapath_snapshot</code> — but only <em>after</em> those guards fire (inside <code>_co_pl</code>).</td><td>Partial. A pre-<code>exec</code> rewrite applied to the capsule bootstrap itself is NOT caught (bootstrap is plain Python, no guards).</td></tr>
+<tr><td><strong>Interpreter patching</strong> (in-memory <code>marshal.loads</code>/<code>compile</code> rewrite)</td><td>T2: inline re-verify at L1719 + <code>compile</code> pin. Closes the Python-callable surface.</td><td>Python-callable surface hardened. <strong>C-level native-hook surface UNDEFENDED:</strong> a hook applied to <code>PyMarshal_ReadObjectFromString</code> / <code>PyEval_EvalCode</code> via ctypes/cffi before the capsule runs evades T2 (C function's <code>BuiltinFunctionType</code> identity unchanged). Defending this needs a <code>ctypes.pythonapi</code>/<code>sys.gettrace</code>-level audit — out of scope.</td></tr>
+</table>
+<div class="callout callout-warn">
+<strong>Assessment:</strong> native-VM surface is best-defended (SHA-256 <code>.pyd</code> hash + OFB bytecode). Python-callable surface hardened by T2. C-level native-hook surface (ctypes patching <code>PyMarshal_*</code> / <code>PyEval_*</code>) is a residual gap an operator-attacker with the key can exploit. The default io profile ships <code>--no-native-vm</code> (native VM OFF), so the <code>.pyd</code> integrity path is NOT exercised — the entire runtime is plain Python, leaving only the Python-callable surface (T2) as the active defense.
+</div>
+
+<h3>3. Anti-tamper fail modes (self-destruct leaks check position)</h3>
+<p>The 4 tamper modes (§16) trade stealth vs denial. The security review notes that <code>self-destruct</code> (default) and <code>fail-closed</code> both <strong>exit immediately</strong>, leaking <em>which check fired</em> to an attacker observing the process — narrowing the search for the next check to bypass. <code>poison</code> and <code>warn</code> are stealthier but have their own trade-offs:</p>
+<table class="compact">
+<tr><th>Mode</th><th>Stealth</th><th>Attacker signal</th><th>Risk</th></tr>
+<tr><td><code>self-destruct</code> (default)</td><td>low</td><td>exit + file-overwrite at the failing check → attacker learns WHICH guard fired; file destroyed</td><td>check-position leak; irrecoverable; may be undesired in CI</td></tr>
+<tr><td><code>fail-closed</code> (<code>SystemExit</code>)</td><td>low</td><td>clean exit at the failing check → same check-position leak, file intact</td><td>check-position leak</td></tr>
+<tr><td><code>poison</code></td><td><strong>high</strong></td><td>program keeps running, downstream decrypt → garbage; attacker sees "working" but wrong output</td><td>attacker may not notice → ships wrong results; harder to debug</td></tr>
+<tr><td><code>warn</code></td><td>high</td><td>prints a message, returns; program continues correctly</td><td><strong>defeats the purpose</strong> — guarded invariant not enforced</td></tr>
+</table>
+<div class="callout callout-info">
+<strong>Trade-off:</strong> <code>poison</code> is stealthiest (recommended when the goal is "attacker gets runnable but wrong program" — matches existing <code>--debug-poison</code>). <code>self-destruct</code> is most disruptive but leaks most. No single best mode — stealth (poison) vs denial (self-destruct). The <code>--tamper-mode</code> flag already lets the operator pick; the gap is the <strong>default</strong> is <code>self-destruct</code> (leaks position). A future hardening could default <code>io</code> to <code>poison</code> to avoid the leak, at the cost of silent-wrong-output.
+</div>
+<div class="callout callout-warn">
+<strong>Honest note:</strong> none of these modes defeats an attacker who has the key AND can read memory — they change the observable signal. T3's digest mismatch routes through <code>__bedrock_self_destruct__</code> by default (leaks position); routing through <code>__h_poison</code> (when <code>--debug-poison</code> is set) is already supported by the existing tamper-mode plumbing. Recommendation is documentation, not new code: tell operators <code>--debug-poison</code> makes T3 silent.
 </div>
 </section>
 
